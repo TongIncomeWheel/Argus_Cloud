@@ -26,14 +26,31 @@ def get_portfolio_key(portfolio: str = "Income Wheel") -> str:
 
 
 def load_settings() -> Dict:
-    """Load user settings from JSON file"""
+    """Load user settings from JSON file. Falls back to Google Sheets cloud
+    backup when local file is missing or empty (e.g. Streamlit Cloud restart)."""
     if PERSISTENCE_FILE.exists():
         try:
             with open(PERSISTENCE_FILE, 'r') as f:
-                return json.load(f)
+                data = json.load(f)
+                if data:
+                    return data
         except Exception as e:
             logger.warning(f"Could not load settings: {e}")
-            return {}
+
+    # Local file missing/empty — try cloud restore
+    try:
+        from config import INCOME_WHEEL_SHEET_ID
+        from gsheet_handler import GSheetHandler, load_settings_from_cloud
+        if INCOME_WHEEL_SHEET_ID:
+            handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
+            cloud_settings = load_settings_from_cloud(handler)
+            if cloud_settings:
+                logger.info("Auto-restored settings from Google Sheets cloud backup")
+                save_settings(cloud_settings)  # Cache locally
+                return cloud_settings
+    except Exception as e:
+        logger.debug(f"Cloud settings auto-load skipped: {e}")
+
     return {}
 
 

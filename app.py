@@ -594,38 +594,22 @@ def render_sidebar():
                 st.caption("🎡 Income Wheel")
         
         # Cloud Settings Sync (for Streamlit Cloud deployment)
+        # Load is automatic on startup (see persistence.py). Save button pushes to cloud.
         with st.expander("☁️ Cloud Settings Sync", expanded=False):
-            col_save, col_load = st.columns(2)
-            with col_save:
-                if st.button("💾 Save", key="cloud_save_btn", help="Save settings to Google Sheets"):
-                    try:
-                        from gsheet_handler import GSheetHandler, save_settings_to_cloud
-                        from persistence import load_settings
-                        from config import INCOME_WHEEL_SHEET_ID
-                        handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
-                        settings = load_settings()
-                        if save_settings_to_cloud(handler, settings):
-                            st.success("Saved ☁️")
-                        else:
-                            st.error("Save failed")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-            with col_load:
-                if st.button("📥 Load", key="cloud_load_btn", help="Load settings from Google Sheets"):
-                    try:
-                        from gsheet_handler import GSheetHandler, load_settings_from_cloud
-                        from persistence import save_settings
-                        from config import INCOME_WHEEL_SHEET_ID
-                        handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
-                        settings = load_settings_from_cloud(handler)
-                        if settings:
-                            save_settings(settings)
-                            st.success("Loaded ☁️")
-                            st.rerun()
-                        else:
-                            st.warning("No cloud settings found")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+            st.caption("Settings auto-load from cloud on restart. Use Save after changing settings.")
+            if st.button("💾 Save Settings to Cloud", key="cloud_save_btn", help="Backup current settings to Google Sheets"):
+                try:
+                    from gsheet_handler import GSheetHandler, save_settings_to_cloud
+                    from persistence import load_settings
+                    from config import INCOME_WHEEL_SHEET_ID
+                    handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
+                    settings = load_settings()
+                    if save_settings_to_cloud(handler, settings):
+                        st.success("Settings saved to cloud ☁️")
+                    else:
+                        st.error("Save failed")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
         # Navigation (Collapsible)
         with st.expander("🧭 Navigation", expanded=False):
