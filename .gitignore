@@ -1,0 +1,18 @@
+# Credentials — NEVER commit
+.env
+gsheet_credentials.json
+.streamlit/secrets.toml
+
+# Data (ephemeral on cloud, local-only)
+data/
+logs/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
