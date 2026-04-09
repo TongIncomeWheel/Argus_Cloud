@@ -396,7 +396,7 @@ def style_dataframe_negatives(df, currency_columns=None, number_columns=None):
         return ''
     
     # Create styled DataFrame
-    styled_df = df_styled.style.applymap(highlight_negatives, subset=currency_columns + number_columns)
+    styled_df = df_styled.style.map(highlight_negatives, subset=currency_columns + number_columns)
     
     return styled_df
 
@@ -1424,27 +1424,18 @@ def render_daily_helper():
 
             df_planner = pd.DataFrame(planner_rows)
 
-            def _style_planner(row):
-                status = row.get("Status", "")
-                if "✅" in str(status):
-                    return ["background-color: #1a3a1a"] * len(row)
-                elif "🟡" in str(status):
-                    return ["background-color: #2e2a00"] * len(row)
-                else:
-                    return ["background-color: #3a1a1a"] * len(row)
-
             st.dataframe(
-                df_planner.style.apply(_style_planner, axis=1),
+                df_planner,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "Expiry (Fri)": st.column_config.TextColumn("Expiry (Fri)", width="small"),
-                    "Existing":     st.column_config.NumberColumn("Existing",   width="small", format="%d"),
-                    "Target":       st.column_config.NumberColumn("Target",     width="small", format="%d"),
-                    "To Sell":      st.column_config.NumberColumn("To Sell",    width="small", format="%d"),
-                    "Coverage":     st.column_config.TextColumn("Coverage %",   width="small"),
-                    "Status":       st.column_config.TextColumn("Status",       width="small"),
-                    "TradeIDs":     st.column_config.TextColumn("TradeIDs",     width="large"),
+                    "Expiry (Fri)": st.column_config.TextColumn("Expiry (Fri)",  width="small"),
+                    "Existing":     st.column_config.NumberColumn("Existing",    width="small", format="%d"),
+                    "Target":       st.column_config.NumberColumn("Target",      width="small", format="%d"),
+                    "To Sell":      st.column_config.NumberColumn("To Sell",     width="small", format="%d"),
+                    "Coverage":     st.column_config.TextColumn("Coverage %",    width="small"),
+                    "Status":       st.column_config.TextColumn("Status",        width="small"),
+                    "TradeIDs":     st.column_config.TextColumn("TradeIDs",      width="large"),
                 },
             )
             st.caption(
