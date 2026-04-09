@@ -396,7 +396,7 @@ def style_dataframe_negatives(df, currency_columns=None, number_columns=None):
         return ''
     
     # Create styled DataFrame
-    styled_df = df_styled.style.applymap(highlight_negatives, subset=currency_columns + number_columns)
+    styled_df = df_styled.style.map(highlight_negatives, subset=currency_columns + number_columns)
     
     return styled_df
 
@@ -1335,114 +1335,182 @@ def render_daily_helper():
     st.divider()
 
     # ============================================================
-    # MARA CC 5-Week Coverage Planner (next five weekly expiries)
+    # CC Coverage Planner — All Tickers (next 5 weekly expiries)
     # ============================================================
-    st.subheader("🧭 MARA CC Coverage Planner (Next 5 Weekly Expiries)")
-    st.caption("Logic: for each of the next 5 Fridays, To Sell = Weekly Target (38) - Existing MARA CC contracts expiring that Friday.")
+    st.subheader("🧭 CC Coverage Planner (Next 5 Weekly Expiries)")
 
     try:
         from datetime import date as _date, timedelta as _timedelta
 
-        WEEKLY_TARGET = 38
-        today_d = _date.today()
-        # Upcoming Friday (include today if it's Friday)
-        days_until_fri = (4 - today_d.weekday()) % 7
-        upcoming_fri = today_d + _timedelta(days=days_until_fri)
-        expiry_targets = [upcoming_fri + _timedelta(days=7 * i) for i in range(5)]
+        # Derive CC-eligible tickers: any ticker that has STOCK in df_open
+        _stock_rows = df_open[df_open["TradeType"] == "STOCK"].copy()
+        _stock_rows["Shares_num"] = pd.to_numeric(_stock_rows["Quantity"], errors="coerce").fillna(0).abs()
+        _ticker_shares: dict = _stock_rows.groupby("Ticker")["Shares_num"].sum().to_dict()
+        # Also include tickers that already have CC positions even if no STOCK row
+        _cc_tickers_existing = df_open[df_open["TradeType"] == "CC"]["Ticker"].unique().tolist()
+        _cc_eligible = sorted(
+            set(list(_ticker_shares.keys()) + list(_cc_tickers_existing)),
+            key=lambda t: (0 if t in ["MARA", "CRCL", "SPY"] else 1, t),
+        )
 
-        mara_cc = df_open[(df_open["Ticker"] == "MARA") & (df_open["TradeType"] == "CC")].copy()
-        mara_cc["Expiry_Date"] = pd.to_datetime(mara_cc["Expiry_Date"], errors="coerce").dt.date
-        mara_cc["Quantity_num"] = pd.to_numeric(mara_cc["Quantity"], errors="coerce").fillna(0).abs()
+        if not _cc_eligible:
+            st.info("No CC-eligible tickers found (need STOCK or existing CC positions).")
+        else:
+            _plan_col1, _plan_col2 = st.columns([2, 5])
+            with _plan_col1:
+                _default_idx = _cc_eligible.index("MARA") if "MARA" in _cc_eligible else 0
+                _selected_planner_ticker = st.selectbox(
+                    "Select ticker",
+                    options=_cc_eligible,
+                    index=_default_idx,
+                    key="cc_planner_ticker_select",
+                    label_visibility="collapsed",
+                )
 
-        planner_rows = []
-        for exp in expiry_targets:
-            week_rows = mara_cc[mara_cc["Expiry_Date"] == exp]
-            existing_contracts = int(week_rows["Quantity_num"].sum()) if not week_rows.empty else 0
-            trade_ids = ", ".join(week_rows["TradeID"].astype(str).tolist()) if not week_rows.empty else ""
-            to_sell = max(0, WEEKLY_TARGET - existing_contracts)
-            planner_rows.append(
-                {
-                    "Expiry (Fri)": exp.strftime("%Y-%m-%d"),
-                    "Existing Contracts": existing_contracts,
-                    "Weekly Target": WEEKLY_TARGET,
-                    "To Sell": to_sell,
-                    "TradeIDs (matched)": trade_ids,
-                }
+            _stock_shares_for_ticker = _ticker_shares.get(_selected_planner_ticker, 0)
+            _weekly_target = max(1, int(round(_stock_shares_for_ticker / 4 / 100))) if _stock_shares_for_ticker > 0 else 0
+
+            with _plan_col2:
+                if _stock_shares_for_ticker > 0:
+                    st.caption(
+                        f"**{_selected_planner_ticker}** · {int(_stock_shares_for_ticker):,} shares owned · "
+                        f"Weekly target = {_weekly_target} contracts  "
+                        f"*(= shares ÷ 4 ÷ 100)*"
+                    )
+                else:
+                    st.caption(
+                        f"**{_selected_planner_ticker}** · No STOCK row found — showing CC positions only. "
+                        f"Set weekly target manually below."
+                    )
+                    _weekly_target = st.number_input(
+                        "Manual weekly target (contracts)",
+                        min_value=0, step=1, value=_weekly_target,
+                        key="cc_planner_manual_target",
+                    )
+
+            today_d = _date.today()
+            days_until_fri = (4 - today_d.weekday()) % 7
+            upcoming_fri = today_d + _timedelta(days=days_until_fri)
+            expiry_targets = [upcoming_fri + _timedelta(days=7 * i) for i in range(5)]
+
+            ticker_cc = df_open[
+                (df_open["Ticker"] == _selected_planner_ticker) & (df_open["TradeType"] == "CC")
+            ].copy()
+            ticker_cc["Expiry_Date"] = pd.to_datetime(ticker_cc["Expiry_Date"], errors="coerce").dt.date
+            ticker_cc["Quantity_num"] = pd.to_numeric(ticker_cc["Quantity"], errors="coerce").fillna(0).abs()
+
+            planner_rows = []
+            for exp in expiry_targets:
+                # Aggregate all CCs expiring Mon–Sun of this Friday's week
+                # (fixes SPY/others with non-Friday expiries being invisible)
+                week_start = exp - _timedelta(days=4)   # Monday of this Friday's week
+                week_end   = exp + _timedelta(days=2)   # Sunday of this Friday's week
+                week_rows = ticker_cc[
+                    (ticker_cc["Expiry_Date"] >= week_start) &
+                    (ticker_cc["Expiry_Date"] <= week_end)
+                ]
+                existing_contracts = int(week_rows["Quantity_num"].sum()) if not week_rows.empty else 0
+                trade_ids = ", ".join(week_rows["TradeID"].astype(str).tolist()) if not week_rows.empty else "—"
+                to_sell = max(0, _weekly_target - existing_contracts)
+                coverage_pct = (existing_contracts / _weekly_target * 100) if _weekly_target > 0 else 0
+                status = (
+                    "✅ Full" if coverage_pct >= 100
+                    else ("🟡 Partial" if coverage_pct > 0 else "🔴 Empty")
+                )
+                planner_rows.append(
+                    {
+                        "Week Ending (Fri)": exp.strftime("%Y-%m-%d"),
+                        "Existing": existing_contracts,
+                        "Target": _weekly_target,
+                        "To Sell": to_sell,
+                        "Coverage": f"{coverage_pct:.0f}%",
+                        "Status": status,
+                        "TradeIDs": trade_ids,
+                    }
+                )
+
+            df_planner = pd.DataFrame(planner_rows)
+
+            st.dataframe(
+                df_planner,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Week Ending (Fri)": st.column_config.TextColumn("Week Ending (Fri)", width="small"),
+                    "Existing":          st.column_config.NumberColumn("Existing",        width="small", format="%d"),
+                    "Target":            st.column_config.NumberColumn("Target",          width="small", format="%d"),
+                    "To Sell":           st.column_config.NumberColumn("To Sell",         width="small", format="%d"),
+                    "Coverage":          st.column_config.TextColumn("Coverage %",        width="small"),
+                    "Status":            st.column_config.TextColumn("Status",            width="small"),
+                    "TradeIDs":          st.column_config.TextColumn("TradeIDs",          width="large"),
+                },
             )
-
-        df_planner = pd.DataFrame(planner_rows)
-        st.dataframe(
-            df_planner,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Expiry (Fri)": st.column_config.TextColumn("Expiry (Fri)", width="small"),
-                "Existing Contracts": st.column_config.NumberColumn("Existing", width="small", format="%d"),
-                "Weekly Target": st.column_config.NumberColumn("Target", width="small", format="%d"),
-                "To Sell": st.column_config.NumberColumn("To Sell", width="small", format="%d"),
-                "TradeIDs (matched)": st.column_config.TextColumn("TradeIDs (matched)", width="large"),
-            },
-        )
-        st.info(
-            "Strategic options: fill near-term gaps with short-DTE sales, or build future coverage by selling longer-DTE to cover larger shortfalls further out."
-        )
+            st.caption(
+                "All CC contracts expiring Mon–Sun of each week are aggregated under that week's Friday date. "
+                "🟢 Full = at/above target · 🟡 Partial = some coverage · 🔴 Empty = nothing sold yet. "
+                "Fill near-term gaps with short-DTE, build further out with longer-DTE."
+            )
     except Exception as e:
-        st.warning(f"Could not build MARA CC coverage planner: {e}")
-    
-    # Expiring Soon
-    st.subheader(f"⏰ Expiring Within {EXPIRING_SOON_DTE} Days")
-    
-    # Calculate DTE for all positions - ONLY include options (CC, CSP), exclude STOCK and LEAP
-    # STOCK has no expiry date, LEAPs are long-term (shouldn't be in "expiring soon")
+        st.warning(f"Could not build CC coverage planner: {e}")
+
+    # Expiring Soon — All Tickers
+    st.subheader(f"⏰ Expiring Within {EXPIRING_SOON_DTE} Days — All Tickers")
+
+    # ALL tickers with options (CC or CSP) — show every one, even if nothing expiring
+    _all_option_tickers_raw = df_open[df_open['TradeType'].isin(['CC', 'CSP'])]['Ticker'].unique().tolist()
+    priority_tickers = ['MARA', 'CRCL', 'SPY']
+    _all_option_tickers = (
+        sorted([t for t in _all_option_tickers_raw if t in priority_tickers], key=lambda x: priority_tickers.index(x))
+        + sorted([t for t in _all_option_tickers_raw if t not in priority_tickers])
+    )
+
+    # Calculate DTE for all options (CC, CSP), exclude STOCK and LEAP
     df_expiring = df_open[df_open['TradeType'].isin(['CC', 'CSP'])].copy()
     df_expiring['Expiry_Date'] = pd.to_datetime(df_expiring['Expiry_Date'], errors='coerce')
-    # Filter out positions with invalid expiry dates
     df_expiring = df_expiring[df_expiring['Expiry_Date'].notna()]
-    # DTE inclusive: today + expiry day both count (e.g. 19 Feb → 20 Feb = 2 DTE)
     df_expiring['DTE_Calc'] = (df_expiring['Expiry_Date'] - pd.Timestamp.now()).dt.days + 1
     df_expiring = df_expiring[df_expiring['DTE_Calc'] <= EXPIRING_SOON_DTE]
-    
-    if df_expiring.empty:
-        st.success("✅ No positions expiring within 10 days")
+
+    if not _all_option_tickers:
+        st.success("✅ No option positions (CC/CSP) found")
     else:
-        # Add call risk
-        df_expiring = RiskCalculator.calculate_call_risk(df_expiring, live_prices)
-        
-        # Calculate distance to spot
-        df_expiring = df_expiring.copy()
-        df_expiring['Current_Price'] = df_expiring['Ticker'].map(lambda t: live_prices.get(t, 0))
-        df_expiring['Strike'] = pd.to_numeric(df_expiring['Option_Strike_Price_(USD)'], errors='coerce')
-        
-        # Distance to spot: For CC, it's (current - strike), for CSP it's (strike - current)
-        # Positive = ITM, Negative = OTM
-        df_expiring['Distance_to_Spot'] = df_expiring.apply(
-            lambda row: (row['Current_Price'] - row['Strike']) if row['TradeType'] == 'CC' 
-                       else (row['Strike'] - row['Current_Price']), 
-            axis=1
-        )
-        
-        # Group by ticker and sort (MARA, CRCL, SPY first, then others)
-        tickers_expiring = df_expiring['Ticker'].unique().tolist()
-        priority_tickers = ['MARA', 'CRCL', 'SPY']
-        sorted_tickers = sorted([t for t in tickers_expiring if t in priority_tickers], 
-                               key=lambda x: priority_tickers.index(x)) + \
-                        sorted([t for t in tickers_expiring if t not in priority_tickers])
-        
+        if not df_expiring.empty:
+            df_expiring = RiskCalculator.calculate_call_risk(df_expiring, live_prices)
+            df_expiring = df_expiring.copy()
+            df_expiring['Current_Price'] = df_expiring['Ticker'].map(lambda t: live_prices.get(t, 0))
+            df_expiring['Strike'] = pd.to_numeric(df_expiring['Option_Strike_Price_(USD)'], errors='coerce')
+            df_expiring['Distance_to_Spot'] = df_expiring.apply(
+                lambda row: (row['Current_Price'] - row['Strike']) if row['TradeType'] == 'CC'
+                           else (row['Strike'] - row['Current_Price']),
+                axis=1,
+            )
+
+        sorted_tickers = _all_option_tickers
+
         # Calculate this week's date range (Monday to Sunday) for highlighting
         today = date.today()
         start_of_week_highlight = today - timedelta(days=today.weekday())  # Monday
         end_of_week_highlight = start_of_week_highlight + timedelta(days=6)  # Sunday
-        
+
         for ticker in sorted_tickers:
-            ticker_positions = df_expiring[df_expiring['Ticker'] == ticker].copy()
-            
-            # Sort by DTE (ascending - closest expiry first), then by Distance to Spot (descending - most ITM/risky first)
+            ticker_positions = df_expiring[df_expiring['Ticker'] == ticker].copy() if not df_expiring.empty else pd.DataFrame()
+
+            # Ticker with NO expiring positions — compact banner, skip table
+            if ticker_positions.empty:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.write(f"### 📊 {ticker}")
+                with col2:
+                    st.success(f"✅ Nothing expiring within {EXPIRING_SOON_DTE}d")
+                st.divider()
+                continue
+
+            # Sort by DTE then Distance to Spot
             ticker_positions = ticker_positions.sort_values(['DTE_Calc', 'Distance_to_Spot'], ascending=[True, False])
-            
+
             # Calculate total quantity for this ticker
             total_qty = pd.to_numeric(ticker_positions['Quantity'], errors='coerce').fillna(0).abs().sum()
-            
-            # Show ticker header and quantity card (no duplication)
+
             col1, col2 = st.columns([3, 1])
             with col1:
                 st.write(f"### 📊 {ticker}")
