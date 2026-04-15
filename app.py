@@ -1401,7 +1401,14 @@ def render_daily_helper():
 
             planner_rows = []
             for exp in expiry_targets:
-                week_rows = ticker_cc[ticker_cc["Expiry_Date"] == exp]
+                # Aggregate all CCs expiring Mon–Sun of this Friday's week
+                # (fixes SPY/others with non-Friday expiries being invisible)
+                week_start = exp - _timedelta(days=4)   # Monday of this Friday's week
+                week_end   = exp + _timedelta(days=2)   # Sunday of this Friday's week
+                week_rows = ticker_cc[
+                    (ticker_cc["Expiry_Date"] >= week_start) &
+                    (ticker_cc["Expiry_Date"] <= week_end)
+                ]
                 existing_contracts = int(week_rows["Quantity_num"].sum()) if not week_rows.empty else 0
                 trade_ids = ", ".join(week_rows["TradeID"].astype(str).tolist()) if not week_rows.empty else "—"
                 to_sell = max(0, _weekly_target - existing_contracts)
@@ -1412,7 +1419,7 @@ def render_daily_helper():
                 )
                 planner_rows.append(
                     {
-                        "Expiry (Fri)": exp.strftime("%Y-%m-%d"),
+                        "Week Ending (Fri)": exp.strftime("%Y-%m-%d"),
                         "Existing": existing_contracts,
                         "Target": _weekly_target,
                         "To Sell": to_sell,
@@ -1429,16 +1436,17 @@ def render_daily_helper():
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "Expiry (Fri)": st.column_config.TextColumn("Expiry (Fri)",  width="small"),
-                    "Existing":     st.column_config.NumberColumn("Existing",    width="small", format="%d"),
-                    "Target":       st.column_config.NumberColumn("Target",      width="small", format="%d"),
-                    "To Sell":      st.column_config.NumberColumn("To Sell",     width="small", format="%d"),
-                    "Coverage":     st.column_config.TextColumn("Coverage %",    width="small"),
-                    "Status":       st.column_config.TextColumn("Status",        width="small"),
-                    "TradeIDs":     st.column_config.TextColumn("TradeIDs",      width="large"),
+                    "Week Ending (Fri)": st.column_config.TextColumn("Week Ending (Fri)", width="small"),
+                    "Existing":          st.column_config.NumberColumn("Existing",        width="small", format="%d"),
+                    "Target":            st.column_config.NumberColumn("Target",          width="small", format="%d"),
+                    "To Sell":           st.column_config.NumberColumn("To Sell",         width="small", format="%d"),
+                    "Coverage":          st.column_config.TextColumn("Coverage %",        width="small"),
+                    "Status":            st.column_config.TextColumn("Status",            width="small"),
+                    "TradeIDs":          st.column_config.TextColumn("TradeIDs",          width="large"),
                 },
             )
             st.caption(
+                "All CC contracts expiring Mon–Sun of each week are aggregated under that week's Friday date. "
                 "🟢 Full = at/above target · 🟡 Partial = some coverage · 🔴 Empty = nothing sold yet. "
                 "Fill near-term gaps with short-DTE, build further out with longer-DTE."
             )

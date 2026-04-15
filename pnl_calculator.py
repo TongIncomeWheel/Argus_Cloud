@@ -169,18 +169,20 @@ class PnLCalculator:
                 leap_cost = premium_per_share * 100 * contracts
                 
                 # Get current underlying price
-                current_price = live_prices.get(ticker, 0.0)
+                current_price = float(pd.to_numeric(live_prices.get(ticker, 0), errors='coerce') or 0)
                 if current_price == 0:
                     continue
-                
+
                 # Get strike
-                strike = DataAccess.get_trade_field(
+                strike = float(pd.to_numeric(DataAccess.get_trade_field(
                     ticker_leaps, pos_idx, 'strike', 'options', 0
-                )
-                
+                ), errors='coerce') or 0)
+
                 if strike == 0:
                     continue
-                
+
+                contracts = float(pd.to_numeric(contracts, errors='coerce') or 0)
+
                 # Calculate intrinsic value (conservative - ignores time value)
                 intrinsic_value = max(0, current_price - strike) * 100 * contracts
                 leap_pl = intrinsic_value - leap_cost
