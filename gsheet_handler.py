@@ -119,8 +119,19 @@ class GSheetHandler:
         self.backup_dir = BACKUP_DIR
         self._header_cache: Dict[str, list] = {}  # Phase 8.1: cached headers
 
-        # Authenticate & open spreadsheet
-        gc = gspread.service_account(filename=GSHEET_CREDENTIALS_PATH)
+        # Authenticate: local JSON file first, then Streamlit Cloud secrets
+        from pathlib import Path as _Path
+        _creds_path = _Path(GSHEET_CREDENTIALS_PATH)
+        if _creds_path.exists():
+            gc = gspread.service_account(filename=str(_creds_path))
+        else:
+            try:
+                import streamlit as st
+                gc = gspread.service_account_from_dict(dict(st.secrets["gsheet_credentials"]))
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"No gsheet_credentials.json and st.secrets failed: {e}"
+                )
         self.spreadsheet = gc.open_by_key(sheet_id)
         logger.info(f"Opened Google Sheet: {self.spreadsheet.title} ({sheet_id})")
 
