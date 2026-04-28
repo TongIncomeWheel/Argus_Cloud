@@ -16,26 +16,30 @@ import pandas as pd
 from config import GSHEET_CREDENTIALS_PATH, BACKUP_DIR, BACKUP_RETENTION_DAYS, LOGS_DIR
 
 # ---------------------------------------------------------------------------
-# Logging — file handler with fallback for ephemeral filesystems (cloud)
+# Logging (same pattern as excel_handler.py)
 # ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOGS_DIR / 'income_wheel.log'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    _fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    _sh = logging.StreamHandler()
-    _sh.setFormatter(_fmt)
-    logger.addHandler(_sh)
-    try:
-        _fh = logging.FileHandler(LOGS_DIR / 'income_wheel.log')
-        _fh.setFormatter(_fmt)
-        logger.addHandler(_fh)
-    except (OSError, PermissionError):
-        logger.debug("File logging unavailable — using console only")
 
 # ---------------------------------------------------------------------------
 # Date columns that need pd.to_datetime coercion
 # ---------------------------------------------------------------------------
 _DATE_COLUMNS = ['Date_open', 'Date_closed', 'Expiry_Date']
+
+# Phase 8.3: Whitelist of columns that should be numeric (not heuristic)
+_NUMERIC_COLUMNS = [
+    'Quantity', 'Open_lots', 'Option_Strike_Price_(USD)',
+    'Price_of_current_underlying_(USD)', 'OptPremium', 'Opt_Premium_%',
+    'Close_Price', 'Actual_Profit_(USD)', 'Cash_required_per_position_(USD)',
+    'AffectedQty', 'Cost_Basis', 'BTC_Price', 'Net_Credit', 'PnL',
+]
 
 
 # ---------------------------------------------------------------------------
@@ -65,18 +69,10 @@ def _records_to_dataframe(records: list, sheet_label: str = "") -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors='coerce')
 
-    # Coerce obviously-numeric columns (let pandas infer)
-    for col in df.columns:
-        if col in _DATE_COLUMNS:
-            continue
-        # Try to convert the whole column to numeric; leave non-numeric as-is
-        converted = pd.to_numeric(df[col], errors='coerce')
-        # Only accept the conversion if more than half the non-null values
-        # survived (avoids turning text columns into all-NaN).
-        non_null_original = df[col].notna().sum()
-        non_null_converted = converted.notna().sum()
-        if non_null_original > 0 and non_null_converted / non_null_original > 0.5:
-            df[col] = converted
+    # Phase 8.3: Coerce only whitelisted numeric columns (not heuristic)
+    for col in _NUMERIC_COLUMNS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
 
     # TradeID should always be a string
     if 'TradeID' in df.columns:
@@ -89,10 +85,14 @@ def _serialize_value(value):
     """Convert a Python value to something gspread/Google Sheets can accept."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return ''
+    # BUG-16 fix: catch NaT/NaT-like before strftime — pd.NaT, NaT Timestamps
+    try:
+        if pd.isna(value):
+            return ''
+    except (TypeError, ValueError):
+        pass
     if isinstance(value, (pd.Timestamp, datetime, date)):
         return value.strftime('%Y-%m-%d')
-    if isinstance(value, pd.Timestamp) and pd.isna(value):
-        return ''
     # numpy int / float -> plain Python types
     try:
         import numpy as np
@@ -117,24 +117,43 @@ class GSheetHandler:
     def __init__(self, sheet_id: str):
         self.sheet_id = sheet_id
         self.backup_dir = BACKUP_DIR
+        self._header_cache: Dict[str, list] = {}  # Phase 8.1: cached headers
 
         # Authenticate & open spreadsheet
-        # Prefer local credentials file; fall back to Streamlit Cloud secrets
-        creds_path = Path(GSHEET_CREDENTIALS_PATH)
-        if creds_path.exists():
-            gc = gspread.service_account(filename=str(creds_path))
-        else:
-            try:
-                import streamlit as st
-                creds_dict = dict(st.secrets["gsheet_credentials"])
-                gc = gspread.service_account_from_dict(creds_dict)
-            except Exception:
-                raise FileNotFoundError(
-                    "No gsheet_credentials.json found and st.secrets not configured. "
-                    "Provide credentials via file or Streamlit Cloud secrets."
-                )
+        gc = gspread.service_account(filename=GSHEET_CREDENTIALS_PATH)
         self.spreadsheet = gc.open_by_key(sheet_id)
         logger.info(f"Opened Google Sheet: {self.spreadsheet.title} ({sheet_id})")
+
+    def _get_headers(self, ws) -> list:
+        """Phase 8.1: Return cached headers for a worksheet (avoids redundant API calls)."""
+        ws_title = ws.title
+        if ws_title not in self._header_cache:
+            self._header_cache[ws_title] = ws.row_values(1)
+        return self._header_cache[ws_title]
+
+    def _invalidate_header_cache(self, ws_title: str = None):
+        """Clear header cache (call if columns are added/removed)."""
+        if ws_title:
+            self._header_cache.pop(ws_title, None)
+        else:
+            self._header_cache.clear()
+
+    @staticmethod
+    def _retry(func, *args, max_retries=3, **kwargs):
+        """Phase 8.2: Retry with exponential backoff for transient API errors."""
+        import time
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except gspread.exceptions.APIError as e:
+                if e.response.status_code == 429 and attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)
+                    logger.warning(f"Rate limited (429), retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait)
+                else:
+                    raise
+            except Exception:
+                raise
 
     # ------------------------------------------------------------------
     # Readers
@@ -204,16 +223,20 @@ class GSheetHandler:
         """
         try:
             ws = self.spreadsheet.worksheet("Data Table")
-            headers = ws.row_values(1)
+            headers = self._get_headers(ws)
 
-            # Auto-fill Sorter column with TradeID for easy sorting
+            # Phase 8: backup before append too
+            self._backup_worksheet_json(ws, "Data Table")
+
+            # Auto-fill Sorter column with numeric part of TradeID for easy sorting
             trade_id = trade_data.get('TradeID', '')
             if 'Sorter' in headers and 'Sorter' not in trade_data:
-                trade_data['Sorter'] = trade_id
+                import re as _re
+                _num_match = _re.search(r'T-(\d+)', str(trade_id))
+                trade_data['Sorter'] = int(_num_match.group(1)) if _num_match else trade_id
 
             row = [_serialize_value(trade_data.get(h, '')) for h in headers]
-            # Insert at row 2 (right after header) so newest trades are on top
-            ws.insert_row(row, index=2, value_input_option='USER_ENTERED')
+            self._retry(ws.insert_row, row, index=2, value_input_option='USER_ENTERED')
             logger.info(f"Inserted trade at top: {trade_id}")
             return True
         except Exception as e:
@@ -236,8 +259,7 @@ class GSheetHandler:
             # Create a JSON backup before destructive operation
             self._backup_worksheet_json(ws, "Data Table")
 
-            headers = ws.row_values(1)
-            # Find the row containing trade_id
+            headers = self._get_headers(ws)
             row_idx = self._find_trade_row(ws, trade_id)
             if row_idx is None:
                 raise ValueError(f"TradeID {trade_id} not found in Data Table")
@@ -254,7 +276,7 @@ class GSheetHandler:
                 )
 
             if cells_to_update:
-                ws.update_cells(cells_to_update, value_input_option='USER_ENTERED')
+                self._retry(ws.update_cells, cells_to_update, value_input_option='USER_ENTERED')
 
             logger.info(f"Updated trade: {trade_id} with {updates}")
             return True
@@ -317,10 +339,11 @@ class GSheetHandler:
         """
         try:
             ws = self.spreadsheet.worksheet("Audit_Table")
-            headers = ws.row_values(1)
+            headers = self._get_headers(ws)
+            # Phase 8: backup Audit_Table too
+            self._backup_worksheet_json(ws, "Audit_Table")
             row = [_serialize_value(audit_data.get(h, '')) for h in headers]
-            # Insert at row 2 so newest audit entries are always on top
-            ws.insert_row(row, index=2, value_input_option='USER_ENTERED')
+            self._retry(ws.insert_row, row, index=2, value_input_option='USER_ENTERED')
             logger.info(f"Inserted audit at top: {audit_data.get('Audit ID', 'Unknown')}")
             return True
         except Exception as e:
@@ -368,6 +391,63 @@ class GSheetHandler:
         except Exception as e:
             logger.error(f"Atomic transaction failed: {e}")
             raise
+
+    # ------------------------------------------------------------------
+    # Phase 5.3: Settings tab — persist user_settings to Google Sheet
+    # ------------------------------------------------------------------
+    def read_settings(self) -> dict:
+        """Read key-value settings from a 'Settings' worksheet.
+        Returns dict of {key: value}. Creates the tab if it doesn't exist.
+        """
+        try:
+            try:
+                ws = self.spreadsheet.worksheet("Settings")
+            except gspread.exceptions.WorksheetNotFound:
+                ws = self.spreadsheet.add_worksheet(title="Settings", rows=100, cols=2)
+                ws.update('A1:B1', [['Key', 'Value']])
+                return {}
+
+            records = ws.get_all_records()
+            settings = {}
+            for r in records:
+                key = r.get('Key', '')
+                val = r.get('Value', '')
+                if key:
+                    # Try to parse JSON values (for dicts/lists)
+                    try:
+                        settings[key] = json.loads(val) if isinstance(val, str) and val.startswith('{') else val
+                    except (json.JSONDecodeError, TypeError):
+                        settings[key] = val
+            return settings
+        except Exception as e:
+            logger.warning(f"Error reading Settings: {e}")
+            return {}
+
+    def write_settings(self, settings: dict) -> bool:
+        """Write key-value settings to the 'Settings' worksheet.
+        Overwrites all existing settings.
+        """
+        try:
+            try:
+                ws = self.spreadsheet.worksheet("Settings")
+            except gspread.exceptions.WorksheetNotFound:
+                ws = self.spreadsheet.add_worksheet(title="Settings", rows=100, cols=2)
+
+            rows = [['Key', 'Value']]
+            for key, val in settings.items():
+                # Serialize dicts/lists as JSON
+                if isinstance(val, (dict, list)):
+                    rows.append([key, json.dumps(val)])
+                else:
+                    rows.append([key, _serialize_value(val)])
+
+            ws.clear()
+            ws.update(f'A1:B{len(rows)}', rows, value_input_option='USER_ENTERED')
+            logger.info(f"Settings saved: {len(settings)} keys")
+            return True
+        except Exception as e:
+            logger.error(f"Error writing Settings: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -439,6 +519,10 @@ def validate_data_integrity(df_trades: pd.DataFrame, df_audit: pd.DataFrame) -> 
         List of error messages (empty if all checks pass)
     """
     errors = []
+
+    # BUG-09 fix: guard for empty DataFrames
+    if df_trades.empty or 'TradeID' not in df_trades.columns:
+        return errors
 
     # Check 1: No duplicate TradeIDs (only warn if exact duplicates, not intentional splits)
     if df_trades['TradeID'].duplicated().any():
@@ -529,59 +613,3 @@ def validate_data_integrity(df_trades: pd.DataFrame, df_audit: pd.DataFrame) -> 
         errors.append(f"Open options with no expiry: {open_no_expiry['TradeID'].tolist()}")
 
     return errors
-
-
-# ---------------------------------------------------------------------------
-# Cloud Settings — persist user_settings to a Google Sheet 'Settings' tab
-# ---------------------------------------------------------------------------
-
-def save_settings_to_cloud(handler: 'GSheetHandler', settings_dict: dict) -> bool:
-    """Save a settings dictionary to a 'Settings' worksheet as key-value pairs.
-
-    Creates the worksheet if it doesn't exist. Replaces all existing data.
-    """
-    try:
-        try:
-            ws = handler.spreadsheet.worksheet('Settings')
-        except gspread.exceptions.WorksheetNotFound:
-            ws = handler.spreadsheet.add_worksheet(title='Settings', rows=200, cols=3)
-
-        # Flatten to key-value rows
-        rows = [['key', 'value', 'updated_at']]
-        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        for k, v in settings_dict.items():
-            rows.append([str(k), json.dumps(v), ts])
-
-        ws.clear()
-        ws.update(range_name='A1', values=rows)
-        logger.info(f"Settings saved to cloud ({len(settings_dict)} keys)")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to save settings to cloud: {e}")
-        return False
-
-
-def load_settings_from_cloud(handler: 'GSheetHandler') -> Optional[dict]:
-    """Load settings from the 'Settings' worksheet. Returns None if not found."""
-    try:
-        ws = handler.spreadsheet.worksheet('Settings')
-        records = ws.get_all_records()
-        if not records:
-            return None
-        result = {}
-        for row in records:
-            key = row.get('key', '')
-            val_str = row.get('value', '')
-            if key:
-                try:
-                    result[key] = json.loads(val_str)
-                except (json.JSONDecodeError, TypeError):
-                    result[key] = val_str
-        logger.info(f"Settings loaded from cloud ({len(result)} keys)")
-        return result
-    except gspread.exceptions.WorksheetNotFound:
-        logger.info("No Settings worksheet found in cloud")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to load settings from cloud: {e}")
-        return None

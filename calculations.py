@@ -388,8 +388,8 @@ class PremiumCalculator:
                 df_open_copy = df_open.copy()
                 df_open_copy['Expiry_Date'] = pd.to_datetime(df_open_copy['Expiry_Date'], errors='coerce')
                 expiring_this_month = df_open_copy[
-                    (df_open_copy['Expiry_Date'].dt.date >= start_of_month) &
-                    (df_open_copy['Expiry_Date'].dt.date <= end_of_month) &
+                    (df_open_copy['Expiry_Date'] >= pd.Timestamp(start_of_month)) &
+                    (df_open_copy['Expiry_Date'] <= pd.Timestamp(end_of_month)) &
                     (df_open_copy['TradeType'].isin(['CC', 'CSP']))
                 ].copy()
                 expiring_this_month['OptPremium'] = pd.to_numeric(expiring_this_month['OptPremium'], errors='coerce').fillna(0)
@@ -646,7 +646,16 @@ class RiskCalculator:
             trade_type = df.loc[idx, 'TradeType']
             ticker = df.loc[idx, 'Ticker']
             strike = pd.to_numeric(df.loc[idx, 'Option_Strike_Price_(USD)'], errors='coerce')
-            dte = df.loc[idx, 'DTE']
+            # Use DTE_Calc (computed by Daily Helper) if available, else compute from Expiry_Date
+            dte = df.loc[idx].get('DTE_Calc', None)
+            if dte is None or pd.isna(dte):
+                dte = df.loc[idx].get('DTE', None)
+            if dte is None or pd.isna(dte):
+                exp = pd.to_datetime(df.loc[idx].get('Expiry_Date'), errors='coerce')
+                if pd.notna(exp):
+                    dte = (exp - pd.Timestamp.now()).days + 1
+                else:
+                    dte = None
             
             # Get current price
             current_price = live_prices.get(ticker) if live_prices else None

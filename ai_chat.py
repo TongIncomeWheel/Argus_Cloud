@@ -11,7 +11,6 @@ import re
 import json
 import numpy as np
 import logging
-from config import get_secret
 
 # Load .env file if present (local development)
 try:
@@ -285,7 +284,7 @@ You have access to:
 - TradeID: Unique trade identifier
 - Ticker: Stock symbol
 - TradeType: CC, CSP, STOCK, LEAP
-- StrategyType: WHEEL or PMCC
+- StrategyType: WHEEL, PMCC, or ActiveCore (opportunistic income from a separate $50K pot)
 - Status: Open or Closed
 - Quantity: Contracts (options) or shares (stock)
 - Option_Strike_Price_(USD): Strike price
@@ -1102,7 +1101,7 @@ def render_ai_chat(df_trades: Optional[pd.DataFrame] = None,
     
     # API Key management
     if selected_model.startswith("Gemini"):
-        api_key = get_secret("GEMINI_API_KEY")
+        api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             st.error("GEMINI_API_KEY is not set. Add it to your .env file (see .env.example).")
             st.stop()
@@ -1110,7 +1109,7 @@ def render_ai_chat(df_trades: Optional[pd.DataFrame] = None,
     else:
         # Claude API key from environment variable
         if 'claude_api_key' not in st.session_state:
-            claude_key = get_secret("CLAUDE_API_KEY")
+            claude_key = os.environ.get("CLAUDE_API_KEY")
             if not claude_key:
                 st.error("CLAUDE_API_KEY is not set. Add it to your .env file (see .env.example).")
                 st.stop()
@@ -1164,89 +1163,6 @@ def render_ai_chat(df_trades: Optional[pd.DataFrame] = None,
     
     st.caption(f"Using: {selected_model} | Ask questions about your portfolio, data, analytics, or dashboard")
     
-    # ── Daily CIO Report Generator ──────────────────────────
-    from persistence import load_daily_report, save_daily_report
-    from daily_report import generate_report
-
-    with st.expander("📋 Daily CIO Report", expanded=False):
-        # Model selector for report (independent of chat model)
-        _report_model_options = model_options  # same list built above
-        _report_model = st.selectbox(
-            "Model for report",
-            _report_model_options,
-            index=_report_model_options.index(selected_model) if selected_model in _report_model_options else 0,
-            key="report_model_selector",
-            help="Model used to generate the CIO briefing (can differ from chat model)",
-        )
-        _report_web_search = st.checkbox(
-            "Include web search (live market data)",
-            value=True,
-            key="report_web_search",
-            help="Pre-query news and market context for each held ticker before generating",
-        )
-
-        # Last report info
-        _last_report = load_daily_report()
-        if _last_report:
-            st.caption(
-                f"Last generated: **{_last_report.get('generated_at', '—')}** "
-                f"| {_last_report.get('portfolio', '—')} "
-                f"| {_last_report.get('model', '—')}"
-            )
-        else:
-            st.caption("No report generated yet.")
-
-        if st.button("🔄 Generate Report", type="primary", use_container_width=True, key="generate_report_btn"):
-            _ai_client = st.session_state.get("ai_chat_client")
-            if _ai_client is None:
-                st.error("AI client not initialised — select a model above first.")
-            else:
-                # Resolve model type for report (may differ from chat)
-                _rmt = _report_model
-                if _rmt.startswith("Gemini"):
-                    _r_api_key = os.environ.get("GEMINI_API_KEY", "")
-                    _r_mtype = "gemini-pro" if "Pro" in _rmt else "gemini-flash"
-                else:
-                    _r_api_key = st.session_state.get("claude_api_key", "")
-                    if "Sonnet" in _rmt:
-                        _r_mtype = "claude-sonnet-4.6" if "4.6" in _rmt else "claude-sonnet-4.5"
-                    elif "Opus" in _rmt:
-                        _r_mtype = "claude-opus-4.6" if "4.6" in _rmt else "claude-opus-4.5"
-                    else:
-                        _r_mtype = "claude-haiku"
-
-                # Use a fresh client if model differs from chat client
-                if _r_mtype != st.session_state.get("last_model_type"):
-                    try:
-                        _report_client = AIChat(_r_mtype, _r_api_key, _rmt)
-                    except Exception as _e:
-                        st.error(f"Could not initialise report model: {_e}")
-                        _report_client = _ai_client
-                else:
-                    _report_client = _ai_client
-
-                with st.spinner("CIO is preparing your briefing..."):
-                    _pname = st.session_state.get("current_portfolio", "Income Wheel")
-                    _rmd = generate_report(
-                        ai_chat_client=_report_client,
-                        df_open=st.session_state.get("df_open"),
-                        df_trades=st.session_state.get("df_trades"),
-                        portfolio_deposit=st.session_state.get("portfolio_deposit", 0),
-                        portfolio_name=_pname,
-                        live_prices=st.session_state.get("live_prices", {}),
-                        model_name=_r_mtype,
-                        web_search_enabled=_report_web_search,
-                    )
-                save_daily_report({
-                    "markdown":      _rmd,
-                    "generated_at":  datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "portfolio":     _pname,
-                    "model":         _rmt,
-                })
-                st.session_state["daily_report_ready"] = True
-                st.success("Report saved — navigate to 📋 CIO Report to view it.")
-                st.rerun()
-
     # Web Search Toggle
     from web_search import is_web_search_enabled, set_web_search_enabled
 
@@ -1300,14 +1216,8 @@ def render_ai_chat(df_trades: Optional[pd.DataFrame] = None,
     user_input = st.chat_input("Ask about your portfolio...")
     
     if user_input:
-        # Get strategy context (token-efficient semantic retrieval)
-        try:
-            from strategy_instructions import get_strategy_instructions
-            strategy_instructions = get_strategy_instructions()
-            strategy_context = strategy_instructions.get_relevant_context(user_input, max_chunks=3, max_chars=2000)
-        except Exception as e:
-            strategy_context = None  # Fallback if strategy module fails
-        
+        strategy_context = None  # Strategy Instructions module removed
+
         # Add user message to history
         st.session_state.ai_chat_history.append({
             'role': 'user',

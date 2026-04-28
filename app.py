@@ -13,81 +13,8 @@ st.set_page_config(
     page_title="ARGUS",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
-
-# ---------------------------------------------------------------------------
-# Mobile-responsive CSS — stacks columns vertically on narrow screens
-# ---------------------------------------------------------------------------
-st.markdown("""
-<style>
-@media (max-width: 768px) {
-    /* Stack all Streamlit columns vertically */
-    [data-testid="stHorizontalBlock"] {
-        flex-direction: column !important;
-    }
-    [data-testid="stHorizontalBlock"] > div {
-        width: 100% !important;
-        flex: 1 1 100% !important;
-    }
-    /* Collapse sidebar by default on mobile */
-    section[data-testid="stSidebar"] {
-        width: 100% !important;
-        min-width: unset !important;
-    }
-    /* Reduce padding for mobile */
-    .main .block-container {
-        padding-left: 0.5rem !important;
-        padding-right: 0.5rem !important;
-        padding-top: 1rem !important;
-        max-width: 100% !important;
-    }
-    /* Make dataframes horizontally scrollable */
-    .stDataFrame, [data-testid="stDataFrame"] {
-        overflow-x: auto !important;
-        -webkit-overflow-scrolling: touch;
-    }
-    /* Scale down metric values to fit */
-    [data-testid="stMetricValue"] {
-        font-size: 1.1rem !important;
-    }
-    [data-testid="stMetricLabel"] {
-        font-size: 0.75rem !important;
-    }
-    /* Make tabs scrollable */
-    .stTabs [data-baseweb="tab-list"] {
-        overflow-x: auto !important;
-        flex-wrap: nowrap !important;
-    }
-    /* Improve button sizing for touch */
-    .stButton > button {
-        min-height: 2.5rem;
-        font-size: 0.9rem;
-    }
-}
-</style>
-""", unsafe_allow_html=True)
-
-# ---------------------------------------------------------------------------
-# Password gate — protects the app on public Streamlit Cloud
-# Skipped when APP_PASSWORD is not configured (local development)
-# ---------------------------------------------------------------------------
-from config import get_secret
-
-_app_password = get_secret("APP_PASSWORD")
-if _app_password:
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    if not st.session_state.authenticated:
-        st.title("🔒 ARGUS — Login Required")
-        pwd = st.text_input("Enter password", type="password", key="login_pwd")
-        if st.button("Login"):
-            if pwd == _app_password:
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Incorrect password")
-        st.stop()
 
 from config import TICKERS, WEEKLY_TARGET_PCT, EXPIRING_SOON_DTE
 from gsheet_handler import GSheetHandler, validate_data_integrity
@@ -110,10 +37,10 @@ from market_data import MarketDataService as _MarketDataService
 _market_data = _MarketDataService()
 from persistence import get_portfolio_deposit, save_portfolio_deposit, get_margin_percentages, save_margin_percentages, get_capital_allocation, save_capital_allocation, get_portfolio_deposit_sgd, save_portfolio_deposit_sgd, get_fx_rate, save_fx_rate, get_pmcc_tickers, save_pmcc_tickers, get_tickers, save_tickers
 from ai_chat import render_ai_chat
-from strategy_ui import render_strategy_instructions
+# Strategy Instructions module removed in v2 cleanup
 from income_scanner_ui import render_income_scanner
 from contract_price_lookup import render_contract_price_lookup
-from daily_report import render_daily_report_panel
+# CIO Report module removed in v2 cleanup
 
 # ============================================================
 # FORMATTING HELPERS - Negative Values in Red with Parentheses
@@ -396,7 +323,7 @@ def style_dataframe_negatives(df, currency_columns=None, number_columns=None):
         return ''
     
     # Create styled DataFrame
-    styled_df = df_styled.style.map(highlight_negatives, subset=currency_columns + number_columns)
+    styled_df = df_styled.style.applymap(highlight_negatives, subset=currency_columns + number_columns)
     
     return styled_df
 
@@ -514,8 +441,6 @@ def render_sidebar():
         }
 
         function setup() {
-            // Skip drag-to-resize on mobile — sidebar is full-width overlay
-            if (window.innerWidth < 768) return;
             var sb = document.querySelector('section[data-testid="stSidebar"]');
             if (!sb) { setTimeout(setup, 200); return; }
 
@@ -593,30 +518,12 @@ def render_sidebar():
             else:
                 st.caption("🎡 Income Wheel")
         
-        # Cloud Settings Sync (for Streamlit Cloud deployment)
-        # Load is automatic on startup (see persistence.py). Save button pushes to cloud.
-        with st.expander("☁️ Cloud Settings Sync", expanded=False):
-            st.caption("Settings auto-load from cloud on restart. Use Save after changing settings.")
-            if st.button("💾 Save Settings to Cloud", key="cloud_save_btn", help="Backup current settings to Google Sheets"):
-                try:
-                    from gsheet_handler import GSheetHandler, save_settings_to_cloud
-                    from persistence import load_settings
-                    from config import INCOME_WHEEL_SHEET_ID
-                    handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
-                    settings = load_settings()
-                    if save_settings_to_cloud(handler, settings):
-                        st.success("Settings saved to cloud ☁️")
-                    else:
-                        st.error("Save failed")
-                except Exception as e:
-                    st.error(f"Error: {e}")
-
         # Navigation (Collapsible)
         with st.expander("🧭 Navigation", expanded=False):
             page = st.radio(
                 "Navigate",
-                ["📊 Dashboard", "📋 CIO Report", "📅 Daily Helper", "📝 Entry Forms",
-                 "📈 Expiry Ladder", "📊 Performance", "📋 All Positions", "⚙️ Margin Config", "📚 Strategy Instructions",
+                ["📊 Dashboard", "📅 Daily Helper", "📝 Entry Forms",
+                 "📈 Expiry Ladder", "📉 Performance", "📋 All Positions", "⚙️ Margin Config",
                  "🔍 Income Scanner", "📡 Market Data", "🔎 Contract Lookup"],
                 key="navigation_radio",
                 label_visibility="collapsed"
@@ -645,9 +552,9 @@ def render_sidebar():
             if portfolio == "🎡 Income Wheel":
                 strategy_filter = st.radio(
                     "View Strategy",
-                    ["All", "WHEEL", "PMCC"],
+                    ["All", "WHEEL", "PMCC", "ActiveCore"],
                     key="strategy_filter",
-                    help="Filter views by strategy: WHEEL (CSP + CC) or PMCC (LEAP + CC)"
+                    help="Filter by strategy: WHEEL (CSP+CC), PMCC (LEAP+CC), ActiveCore (opportunistic income)"
                 )
                 # Note: st.radio with key automatically manages st.session_state.strategy_filter
             else:
@@ -867,53 +774,56 @@ def render_dashboard():
     health = tank_data['health']
     locked = tank_data['locked']
     
-    # ----- Summary row: read across explains Total P/L = Total income + Total stock/LEAPs P/L -----
-    total_capital_used = total_stock_at_current + total_leap_sunk + total_csp_reserved  # same as total_committed
-    capital_held = total_stock_at_current + total_leap_sunk  # capital held by stock (Stock + LEAP), excluding CSP
-    # Liquid Cash = Starting Capital + Nett P/L - Capital Held by Stock (excluding CSP held)
+    # ----- Computed values for summary -----
+    total_capital_used = total_stock_at_current + total_leap_sunk + total_csp_reserved
+    # Full deployment: Stock + LEAP + CSP all count as capital used (no leverage policy)
+    capital_held = total_stock_at_current + total_leap_sunk
     liquid_cash = (portfolio_deposit + total_pl) - capital_held
-    # BP = Liquid Cash - CSP held
     bp = liquid_cash - total_csp_reserved
-    st.write("**Summary**")
-    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+    stock_and_leap_total = total_stock_at_current + total_leap_sunk
+
+    # ══════════════════════════════════════════════════════════
+    # PHASE 3.1: ALERT BANNERS (always visible, top priority)
+    # ══════════════════════════════════════════════════════════
+    # BP negative alert
+    if bp < 0:
+        st.error(f"🔴 **BUYING POWER NEGATIVE: ${bp:,.0f}** — Do NOT sell new CSPs until capital is freed.")
+
+    # Per-ticker threshold alerts
+    capital_allocation = get_capital_allocation(portfolio)
+    for ticker, ticker_data in capital_data['by_ticker'].items():
+        ticker_total = ticker_data.get('total_committed', 0)
+        ticker_cap = capital_allocation.get(ticker, 0)
+        if ticker_cap > 0 and ticker_total > ticker_cap:
+            pct = (ticker_total / ticker_cap * 100)
+            st.warning(f"⚠️ **{ticker}** exceeds soft cap: ${ticker_total:,.0f} used / ${ticker_cap:,.0f} allocated ({pct:.0f}%)")
+        # Single ticker > 30% of portfolio
+        if portfolio_deposit > 0 and ticker_total > portfolio_deposit * 0.30:
+            pct_port = (ticker_total / portfolio_deposit * 100)
+            st.warning(f"⚠️ **{ticker}** concentration: {pct_port:.0f}% of portfolio (>${30}% threshold)")
+
+    # Crypto cluster alert
+    crypto_tickers = ['MARA', 'CRCL', 'ETHA', 'SOL']
+    crypto_total = sum(capital_data['by_ticker'].get(t, {}).get('total_committed', 0) for t in crypto_tickers)
+    if portfolio_deposit > 0 and crypto_total > portfolio_deposit * 0.40:
+        crypto_pct = (crypto_total / portfolio_deposit * 100)
+        st.error(f"🔴 **Crypto cluster at {crypto_pct:.0f}%** (MARA+CRCL+ETHA+SOL) — exceeds 40% cap. Total: ${crypto_total:,.0f}")
+
+    # ══════════════════════════════════════════════════════════
+    # PHASE 3.2: SIMPLIFIED CAPITAL SUMMARY (5 metrics, not 7+3)
+    # ══════════════════════════════════════════════════════════
+    st.write("**Capital Summary**")
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
-        st.markdown("**Starting Deposit**<br>Initial Portfolio Deposit", unsafe_allow_html=True)
-        st_metric_with_negatives("", portfolio_deposit, decimals=0, is_currency=True)
+        st.metric("Deposit", f"${portfolio_deposit:,.0f}")
     with col2:
-        st.markdown("**Capital Held**<br>Stock at current + LEAP Sunk", unsafe_allow_html=True)
-        st_metric_with_negatives("", capital_held, decimals=0, is_currency=True)
+        st.metric("Capital Held", f"${capital_held:,.0f}", help="Stock at current + LEAP sunk")
     with col3:
-        st.markdown("**Total Capital Used**<br>Capital Held + CSP reserved", unsafe_allow_html=True)
-        st_metric_with_negatives("", total_capital_used, decimals=0, is_currency=True)
+        st.metric("CSP Reserved", f"${total_csp_reserved:,.0f}")
     with col4:
-        st.markdown("**Total Premium Income**<br>Premium Collected (Closed CC/CSP)", unsafe_allow_html=True)
-        st_metric_with_negatives("", total_premium_row, decimals=0, is_currency=True)
+        st_metric_with_negatives("Nett P/L", total_pl, decimals=0, is_currency=True)
     with col5:
-        st.markdown("**Nett P/L**<br>Total premium income + Total Stock/Leaps P/L", unsafe_allow_html=True)
-        st_metric_with_negatives("", total_pl, decimals=0, is_currency=True)
-    with col6:
-        st.markdown("**Liquid Cash**<br>Starting Capital + Nett P/L − Capital Held by Stock", unsafe_allow_html=True)
-        st_metric_with_negatives("", liquid_cash, decimals=0, is_currency=True)
-    with col7:
-        st.markdown("**BP**<br>Liquid Cash − CSP held", unsafe_allow_html=True)
-        st_metric_with_negatives("", bp, decimals=0, is_currency=True)
-    st.divider()
-    
-    # ----- Section 1: Total Stock, CSP reserved, Total capital used in one row -----
-    st.write("**Stock capital & LEAP/PMCC capital**")
-    
-    stock_and_leap_total = total_stock_at_current + total_leap_sunk  # Total Stock = Stock at current + LEAP sunk (PMCC/LEAP e.g. SPY = one ticker)
-    
-    cap_col1, cap_col2, cap_col3 = st.columns(3)
-    with cap_col1:
-        st.markdown("**Total Stock**<br>Total Stock", unsafe_allow_html=True)
-        st_metric_with_negatives("", stock_and_leap_total, decimals=0, is_currency=True)
-    with cap_col2:
-        st.markdown("**CSP reserved**<br>CSP reserved", unsafe_allow_html=True)
-        st_metric_with_negatives("", total_csp_reserved, decimals=0, is_currency=True)
-    with cap_col3:
-        st.markdown("**Total Capital Used**<br>Total Capital Used/Held", unsafe_allow_html=True)
-        st_metric_with_negatives("", total_capital_used, decimals=0, is_currency=True)
+        st_metric_with_negatives("Buying Power", bp, decimals=0, is_currency=True)
     
     # ----- CSP Reserved expandable: Open CSPs, Counters, Expiry, Income ladder (YTD, MTD, Next 4 weeks) -----
     with st.expander("CSP Reserved – Open CSPs, counters, expiry & income ladder (pace and deploy BP)", expanded=False):
@@ -1054,49 +964,59 @@ def render_dashboard():
     
     st.divider()
     
-    # ----- Minimizable breakdowns at bottom (Stock Capital, CSP reserved) -----
-    st.subheader("📋 Detail breakdowns")
-    stock_and_leap_tickers = [t for t, d in capital_data['by_ticker'].items() if d.get('stock_at_current_price', 0) != 0 or d.get('stock_at_buy_price', 0) != 0 or d.get('leap_sunk', 0) != 0]
-    if stock_and_leap_tickers and stock_and_leap_total > 0:
-        with st.expander("Total Stock by ticker (Stock + LEAP) with % used", expanded=False):
-            from data_access import DataAccess
-            rows = []
-            for ticker in sorted(stock_and_leap_tickers):
-                d = capital_data['by_ticker'][ticker]
-                at_cur = d.get('stock_at_current_price', 0)
-                leap_sunk = d.get('leap_sunk', 0)
-                ticker_total_stock = at_cur + leap_sunk
-                pct_used = (ticker_total_stock / stock_and_leap_total * 100) if stock_and_leap_total else 0.0
-                shares = int(DataAccess.get_stock_shares(ticker, DataAccess.filter_open_positions(df_open)))
-                rows.append({
-                    'Ticker': ticker,
-                    'Shares': shares,
-                    'Stock at current': at_cur,
-                    'LEAP sunk': leap_sunk,
-                    'Total Stock': ticker_total_stock,
-                    '% used': f"{pct_used:.1f}%"
-                })
-            if rows:
-                df_stock = pd.DataFrame(rows)
-                st.dataframe(
-                    style_dataframe_negatives(df_stock, currency_columns=['Stock at current', 'LEAP sunk', 'Total Stock']),
-                    use_container_width=True, hide_index=True
-                )
-    csp_tickers = [t for t, d in capital_data['by_ticker'].items() if d.get('csp_reserved', 0) > 0]
-    if csp_tickers:
-        with st.expander("CSP by ticker (Ticker | Contracts | Reserved)", expanded=False):
-            rows = []
-            for ticker in sorted(csp_tickers):
-                d = capital_data['by_ticker'][ticker]
-                reserved = d.get('csp_reserved', 0)
-                csp_pos = df_open[(df_open['Ticker'] == ticker) & (df_open['TradeType'] == 'CSP')] if 'Ticker' in df_open.columns and 'TradeType' in df_open.columns else pd.DataFrame()
-                contracts = int(csp_pos['Quantity'].abs().sum()) if not csp_pos.empty and 'Quantity' in csp_pos.columns else 0
-                rows.append({'Ticker': ticker, 'Contracts': contracts, 'Reserved': reserved})
-            if rows:
-                st.dataframe(
-                    style_dataframe_negatives(pd.DataFrame(rows), currency_columns=['Reserved']),
-                    use_container_width=True, hide_index=True
-                )
+    # ══════════════════════════════════════════════════════════
+    # PHASE 3.3: PER-TICKER CASH PANEL (always visible)
+    # ══════════════════════════════════════════════════════════
+    st.subheader("💰 Capital by Ticker")
+    all_cap_tickers = sorted(capital_data['by_ticker'].keys(),
+                             key=lambda t: (0 if t in ['MARA', 'CRCL', 'SPY'] else 1, t))
+    if all_cap_tickers:
+        cap_rows = []
+        for ticker in all_cap_tickers:
+            d = capital_data['by_ticker'][ticker]
+            stock_val = d.get('stock_at_current_price', 0)
+            leap_val = d.get('leap_sunk', 0)
+            csp_val = d.get('csp_reserved', 0)
+            total_val = d.get('total_committed', stock_val + leap_val + csp_val)
+            soft_cap = capital_allocation.get(ticker, 0)
+            remaining = soft_cap - total_val if soft_cap > 0 else 0
+            pct_used = (total_val / soft_cap * 100) if soft_cap > 0 else 0
+            # Status indicator
+            if soft_cap == 0:
+                status = "—"
+            elif pct_used > 100:
+                status = "🔴 Over"
+            elif pct_used > 85:
+                status = "🟡 High"
+            elif pct_used > 60:
+                status = "🟠 Mid"
+            else:
+                status = "🟢 OK"
+            cap_rows.append({
+                'Ticker': ticker,
+                'Soft Cap': f"${soft_cap:,.0f}" if soft_cap > 0 else "—",
+                'Stock': f"${stock_val:,.0f}" if stock_val else "$0",
+                'LEAP': f"${leap_val:,.0f}" if leap_val else "$0",
+                'CSP': f"${csp_val:,.0f}" if csp_val else "$0",
+                'Total': f"${total_val:,.0f}",
+                'Remaining': f"${remaining:,.0f}" if soft_cap > 0 else "—",
+                '% Used': f"{pct_used:.0f}%" if soft_cap > 0 else "—",
+                'Status': status,
+            })
+        df_cap = pd.DataFrame(cap_rows)
+        st.dataframe(df_cap, use_container_width=True, hide_index=True,
+                      column_config={
+                          "Ticker": st.column_config.TextColumn("Ticker", width="small"),
+                          "Soft Cap": st.column_config.TextColumn("Soft Cap", width="small"),
+                          "Stock": st.column_config.TextColumn("Stock", width="small"),
+                          "LEAP": st.column_config.TextColumn("LEAP", width="small"),
+                          "CSP": st.column_config.TextColumn("CSP", width="small"),
+                          "Total": st.column_config.TextColumn("Total", width="small"),
+                          "Remaining": st.column_config.TextColumn("Remaining", width="small"),
+                          "% Used": st.column_config.TextColumn("% Used", width="small"),
+                          "Status": st.column_config.TextColumn("Status", width="small"),
+                      })
+        st.caption("Soft Cap from Margin Config. Status: 🟢 <60% | 🟠 60-85% | 🟡 >85% | 🔴 >100%")
     st.divider()
     
     # Premium Stats (based on expiry dates)
@@ -1215,14 +1135,21 @@ def render_dashboard():
             else:
                 coverage_display = "N/A"
             
+            # Add CSP Reserved $ from capital_data
+            csp_reserved_val = capital_data['by_ticker'].get(ticker, {}).get('csp_reserved', 0)
+            # Uncovered alert: CSP with no stock/LEAP
+            has_underlying = counts.get('stock', 0) > 0 or counts.get('leaps', 0) > 0
+            uncovered_flag = " ⚠️ Naked" if counts['csp'] > 0 and not has_underlying else ""
             ticker_data.append({
                 'Ticker': ticker,
                 'CC': counts['cc'],
                 'CSP': counts['csp'],
+                'CSP Reserved': f"${csp_reserved_val:,.0f}" if csp_reserved_val > 0 else "$0",
                 'Stock (shares)': counts.get('stock', 0),
                 'LEAPs (shares)': counts.get('leaps', 0),
                 'Total Stock (shares)': counts.get('total_stock', counts.get('stock', 0)),
-                'CC Coverage': coverage_display
+                'CC Coverage': coverage_display,
+                'Notes': uncovered_flag
             })
         df_ticker = pd.DataFrame(ticker_data)
         
@@ -1243,20 +1170,129 @@ def render_dashboard():
                 "Ticker": st.column_config.TextColumn("Ticker", width="small"),
                 "CC": st.column_config.TextColumn("CC", width="small"),
                 "CSP": st.column_config.TextColumn("CSP", width="small"),
-                "Stock (shares)": st.column_config.TextColumn("Stock (shares)", width="medium"),
-                "LEAPs (shares)": st.column_config.TextColumn("LEAPs (shares)", width="medium"),
-                "Total Stock (shares)": st.column_config.TextColumn("Total Stock (shares)", width="medium"),
-                "CC Coverage": st.column_config.TextColumn("CC Coverage", width="medium")
+                "CSP Reserved": st.column_config.TextColumn("CSP $", width="small"),
+                "Stock (shares)": st.column_config.TextColumn("Stock", width="small"),
+                "LEAPs (shares)": st.column_config.TextColumn("LEAPs", width="small"),
+                "Total Stock (shares)": st.column_config.TextColumn("Total", width="small"),
+                "CC Coverage": st.column_config.TextColumn("Coverage", width="small"),
+                "Notes": st.column_config.TextColumn("Notes", width="small")
             }
         )
         st.caption("CC Coverage: If LEAPs exist, shows CC/LEAP ratio. Otherwise shows stock coverage % (CC shares needed / stock shares). Under 100% = fully covered ✅, Over 100% = uncovered ❌")
-    
+
     st.divider()
-    
-    
+
+    # ══════════════════════════════════════════════════════════
+    # PHASE 7.1: PORTFOLIO GREEKS (Delta, Theta, Vega)
+    # ══════════════════════════════════════════════════════════
+    st.subheader("📐 Portfolio Risk Metrics")
+
+    # Pull Greeks from cached market data (if Alpaca provided them)
+    _open_positions_data = st.session_state.get("open_positions_data", [])
+    portfolio_delta = 0.0
+    portfolio_theta = 0.0
+    portfolio_vega = 0.0
+    greeks_available = False
+
+    for contract in _open_positions_data:
+        if hasattr(contract, 'delta') and contract.delta is not None:
+            greeks_available = True
+            # Find matching open position to get quantity
+            _match = df_open[
+                (df_open['Ticker'] == contract.underlying) &
+                (df_open['TradeType'].isin(['CC', 'CSP']))
+            ]
+            for _, pos in _match.iterrows():
+                _strike = float(pd.to_numeric(pos.get('Option_Strike_Price_(USD)', 0), errors='coerce') or 0)
+                if abs(_strike - contract.strike) < 0.01:
+                    qty = abs(int(pd.to_numeric(pos.get('Quantity', 0), errors='coerce') or 0))
+                    direction = -1 if pos.get('Direction', 'Sell') == 'Sell' else 1
+                    if contract.delta is not None:
+                        portfolio_delta += contract.delta * qty * 100 * direction
+                    if hasattr(contract, 'theta') and contract.theta is not None:
+                        portfolio_theta += contract.theta * qty * 100 * direction
+                    if hasattr(contract, 'vega') and contract.vega is not None:
+                        portfolio_vega += contract.vega * qty * 100 * direction
+                    break
+
+    col_g1, col_g2, col_g3 = st.columns(3)
+    with col_g1:
+        st_metric_with_negatives("Portfolio Delta", portfolio_delta, decimals=0, is_currency=False)
+        st.caption("Net delta exposure (+ = bullish, - = bearish)")
+    with col_g2:
+        st_metric_with_negatives("Daily Theta", portfolio_theta, decimals=0, is_currency=True)
+        st.caption("Estimated daily time decay income")
+    with col_g3:
+        st_metric_with_negatives("Portfolio Vega", portfolio_vega, decimals=0, is_currency=False)
+        st.caption("Sensitivity to 1% IV change")
+
+    if not greeks_available:
+        st.caption("Greeks require Alpaca API — click 'Refresh Open Positions Data' on Market Data page to load.")
+
+    # ══════════════════════════════════════════════════════════
+    # PHASE 7.2: ASSIGNMENT EXPOSURE
+    # ══════════════════════════════════════════════════════════
+    st.subheader("⚠️ Assignment Exposure")
+
+    # For each open CSP: if ITM, calculate stock received + cost
+    _open_csps = df_open[df_open['TradeType'] == 'CSP'].copy()
+    assignment_rows = []
+    total_assignment_cost = 0.0
+    if not _open_csps.empty:
+        for _, csp in _open_csps.iterrows():
+            ticker = csp.get('Ticker', '')
+            strike = float(pd.to_numeric(csp.get('Option_Strike_Price_(USD)', 0), errors='coerce') or 0)
+            qty = abs(int(pd.to_numeric(csp.get('Quantity', 0), errors='coerce') or 0))
+            current = live_prices.get(ticker, 0)
+            if strike > 0 and current > 0 and current < strike:  # ITM
+                cost = strike * 100 * qty
+                loss = (strike - current) * 100 * qty
+                total_assignment_cost += cost
+                assignment_rows.append({
+                    'Ticker': ticker,
+                    'Strike': f"${strike:.2f}",
+                    'Spot': f"${current:.2f}",
+                    'Contracts': qty,
+                    'Shares Received': qty * 100,
+                    'Cost': f"${cost:,.0f}",
+                    'Unrealized Loss': f"(${loss:,.0f})",
+                })
+
+    if assignment_rows:
+        st.error(f"🔴 If all ITM puts assigned today: **{sum(r['Contracts'] for r in assignment_rows)} contracts** = **{sum(r['Shares Received'] for r in assignment_rows):,} shares** at **${total_assignment_cost:,.0f}** cost")
+        st.dataframe(pd.DataFrame(assignment_rows), use_container_width=True, hide_index=True)
+    else:
+        st.success("✅ No ITM CSP positions — zero assignment risk")
+
+    st.divider()
+
+
 # ============================================================
 # DAILY HELPER PAGE
 # ============================================================
+def _format_risk_label(risk: str, trade_type: str, current_price: float, strike: float) -> str:
+    """Format risk label — never say 'Safe' when ITM."""
+    emojis = {'HIGH': '🔴', 'MEDIUM': '🟡', 'LOW': '🟠', 'NONE': '🟢'}
+    emoji = emojis.get(risk, '⚪')
+
+    if risk != 'NONE':
+        return f"{emoji} {risk}"
+
+    # NONE risk — but check if actually ITM
+    try:
+        cp = float(current_price or 0)
+        st = float(strike or 0)
+        if cp > 0 and st > 0:
+            if trade_type == 'CC' and cp > st:
+                return "🟡 ITM"
+            elif trade_type == 'CSP' and cp < st:
+                return "🟡 ITM"
+    except (ValueError, TypeError):
+        pass
+
+    return f"{emoji} OTM"
+
+
 def render_daily_helper():
     """Render daily helper page"""
     st.title("📅 Daily Helper")
@@ -1286,18 +1322,20 @@ def render_daily_helper():
             wheel_mask = (
                 ~df_open['Ticker'].isin(pmcc_tickers_set) &
                 (
-                    (df_open.get('StrategyType', '') == 'Wheel') |
+                    (df_open.get('StrategyType', '') == 'WHEEL') |
                     (df_open.get('StrategyType', '').isna()) |
                     (df_open.get('StrategyType', '') == '')
                 ) &
                 (df_open['TradeType'] != 'LEAP')
             )
             df_open = df_open[wheel_mask].copy()
-        
+        elif strategy_filter == 'ActiveCore':
+            df_open = df_open[df_open.get('StrategyType', '') == 'ActiveCore'].copy()
+
         if df_open.empty:
             st.info(f"ℹ️ No open positions found for {strategy_filter} strategy.")
             return
-    
+
     # Get live prices (Yahoo Finance - always available)
     tickers = df_open['Ticker'].unique().tolist()
     
@@ -1342,11 +1380,17 @@ def render_daily_helper():
     try:
         from datetime import date as _date, timedelta as _timedelta
 
-        # Derive CC-eligible tickers: any ticker that has STOCK in df_open
+        # ── Derive CC-eligible tickers: any ticker that has STOCK in df_open ──
         _stock_rows = df_open[df_open["TradeType"] == "STOCK"].copy()
-        _stock_rows["Shares_num"] = pd.to_numeric(_stock_rows["Quantity"], errors="coerce").fillna(0).abs()
-        _ticker_shares: dict = _stock_rows.groupby("Ticker")["Shares_num"].sum().to_dict()
-        # Also include tickers that already have CC positions even if no STOCK row
+        # Use Open_lots (actual shares), NOT Quantity (contracts/lots)
+        _stock_rows["Shares_num"] = pd.to_numeric(_stock_rows["Open_lots"], errors="coerce").fillna(
+            pd.to_numeric(_stock_rows["Quantity"], errors="coerce").fillna(0).abs() * 100
+        ).abs()
+        # Per-ticker stock shares (sum in case of multiple rows)
+        _ticker_shares: dict = (
+            _stock_rows.groupby("Ticker")["Shares_num"].sum().to_dict()
+        )
+        # Also include any ticker that already has CC positions even if no STOCK row
         _cc_tickers_existing = df_open[df_open["TradeType"] == "CC"]["Ticker"].unique().tolist()
         _cc_eligible = sorted(
             set(list(_ticker_shares.keys()) + list(_cc_tickers_existing)),
@@ -1356,6 +1400,7 @@ def render_daily_helper():
         if not _cc_eligible:
             st.info("No CC-eligible tickers found (need STOCK or existing CC positions).")
         else:
+            # Ticker selector dropdown
             _plan_col1, _plan_col2 = st.columns([2, 5])
             with _plan_col1:
                 _default_idx = _cc_eligible.index("MARA") if "MARA" in _cc_eligible else 0
@@ -1367,8 +1412,9 @@ def render_daily_helper():
                     label_visibility="collapsed",
                 )
 
+            # Weekly target: total shares / 100 (contracts) / 4 (weeks of coverage)
             _stock_shares_for_ticker = _ticker_shares.get(_selected_planner_ticker, 0)
-            _weekly_target = max(1, int(round(_stock_shares_for_ticker / 4 / 100))) if _stock_shares_for_ticker > 0 else 0
+            _weekly_target = int(round(_stock_shares_for_ticker / 100 / 4)) if _stock_shares_for_ticker >= 400 else 0
 
             with _plan_col2:
                 if _stock_shares_for_ticker > 0:
@@ -1388,6 +1434,7 @@ def render_daily_helper():
                         key="cc_planner_manual_target",
                     )
 
+            # Build 5-week grid
             today_d = _date.today()
             days_until_fri = (4 - today_d.weekday()) % 7
             upcoming_fri = today_d + _timedelta(days=days_until_fri)
@@ -1412,18 +1459,27 @@ def render_daily_helper():
                 existing_contracts = int(week_rows["Quantity_num"].sum()) if not week_rows.empty else 0
                 trade_ids = ", ".join(week_rows["TradeID"].astype(str).tolist()) if not week_rows.empty else "—"
                 to_sell = max(0, _weekly_target - existing_contracts)
-                coverage_pct = (existing_contracts / _weekly_target * 100) if _weekly_target > 0 else 0
-                status = (
-                    "✅ Full" if coverage_pct >= 100
-                    else ("🟡 Partial" if coverage_pct > 0 else "🔴 Empty")
-                )
+
+                # Coverage = existing / target. Show as fraction, not inflated %
+                if _weekly_target > 0:
+                    coverage_str = f"{existing_contracts}/{_weekly_target}"
+                    if existing_contracts >= _weekly_target:
+                        status = "✅ Full"
+                    elif existing_contracts > 0:
+                        status = "🟡 Partial"
+                    else:
+                        status = "🔴 Empty"
+                else:
+                    coverage_str = f"{existing_contracts}/—"
+                    status = "—" if existing_contracts == 0 else f"{existing_contracts} open"
+
                 planner_rows.append(
                     {
                         "Week Ending (Fri)": exp.strftime("%Y-%m-%d"),
                         "Existing": existing_contracts,
                         "Target": _weekly_target,
                         "To Sell": to_sell,
-                        "Coverage": f"{coverage_pct:.0f}%",
+                        "Coverage": coverage_str,
                         "Status": status,
                         "TradeIDs": trade_ids,
                     }
@@ -1440,7 +1496,7 @@ def render_daily_helper():
                     "Existing":          st.column_config.NumberColumn("Existing",        width="small", format="%d"),
                     "Target":            st.column_config.NumberColumn("Target",          width="small", format="%d"),
                     "To Sell":           st.column_config.NumberColumn("To Sell",         width="small", format="%d"),
-                    "Coverage":          st.column_config.TextColumn("Coverage %",        width="small"),
+                    "Coverage":          st.column_config.TextColumn("Have/Need",         width="small"),
                     "Status":            st.column_config.TextColumn("Status",            width="small"),
                     "TradeIDs":          st.column_config.TextColumn("TradeIDs",          width="large"),
                 },
@@ -1452,11 +1508,11 @@ def render_daily_helper():
             )
     except Exception as e:
         st.warning(f"Could not build CC coverage planner: {e}")
-
-    # Expiring Soon — All Tickers
+    
+    # Expiring Soon
     st.subheader(f"⏰ Expiring Within {EXPIRING_SOON_DTE} Days — All Tickers")
 
-    # ALL tickers with options (CC or CSP) — show every one, even if nothing expiring
+    # ALL tickers that have options (CC or CSP) — show every one, even if nothing expiring
     _all_option_tickers_raw = df_open[df_open['TradeType'].isin(['CC', 'CSP'])]['Ticker'].unique().tolist()
     priority_tickers = ['MARA', 'CRCL', 'SPY']
     _all_option_tickers = (
@@ -1468,12 +1524,14 @@ def render_daily_helper():
     df_expiring = df_open[df_open['TradeType'].isin(['CC', 'CSP'])].copy()
     df_expiring['Expiry_Date'] = pd.to_datetime(df_expiring['Expiry_Date'], errors='coerce')
     df_expiring = df_expiring[df_expiring['Expiry_Date'].notna()]
+    # DTE inclusive: today + expiry day both count
     df_expiring['DTE_Calc'] = (df_expiring['Expiry_Date'] - pd.Timestamp.now()).dt.days + 1
     df_expiring = df_expiring[df_expiring['DTE_Calc'] <= EXPIRING_SOON_DTE]
 
     if not _all_option_tickers:
-        st.success("✅ No option positions (CC/CSP) found")
+        st.success(f"✅ No option positions (CC/CSP) found")
     else:
+        # Add call risk and distance-to-spot to the expiring subset
         if not df_expiring.empty:
             df_expiring = RiskCalculator.calculate_call_risk(df_expiring, live_prices)
             df_expiring = df_expiring.copy()
@@ -1485,17 +1543,19 @@ def render_daily_helper():
                 axis=1,
             )
 
-        sorted_tickers = _all_option_tickers
-
+        # Iterate ALL tickers, not just those with expiring positions
+        tickers_expiring = df_expiring['Ticker'].unique().tolist() if not df_expiring.empty else []
+        sorted_tickers = _all_option_tickers  # already priority-sorted above
+        
         # Calculate this week's date range (Monday to Sunday) for highlighting
         today = date.today()
         start_of_week_highlight = today - timedelta(days=today.weekday())  # Monday
         end_of_week_highlight = start_of_week_highlight + timedelta(days=6)  # Sunday
-
+        
         for ticker in sorted_tickers:
             ticker_positions = df_expiring[df_expiring['Ticker'] == ticker].copy() if not df_expiring.empty else pd.DataFrame()
 
-            # Ticker with NO expiring positions — compact banner, skip table
+            # Ticker with NO expiring positions — show a compact green row and skip the table
             if ticker_positions.empty:
                 col1, col2 = st.columns([3, 1])
                 with col1:
@@ -1505,12 +1565,13 @@ def render_daily_helper():
                 st.divider()
                 continue
 
-            # Sort by DTE then Distance to Spot
+            # Sort by DTE (ascending - closest expiry first), then by Distance to Spot (descending - most ITM/risky first)
             ticker_positions = ticker_positions.sort_values(['DTE_Calc', 'Distance_to_Spot'], ascending=[True, False])
 
             # Calculate total quantity for this ticker
             total_qty = pd.to_numeric(ticker_positions['Quantity'], errors='coerce').fillna(0).abs().sum()
 
+            # Show ticker header and quantity card
             col1, col2 = st.columns([3, 1])
             with col1:
                 st.write(f"### 📊 {ticker}")
@@ -1586,7 +1647,7 @@ def render_daily_helper():
                     'Contract P&L': pl_str,
                     'Δ': delta_str,
                     'Θ': theta_str,
-                    'Risk': f"{risk_emoji} {risk}" if risk != 'NONE' else f"{risk_emoji} Safe"
+                    'Risk': _format_risk_label(risk, row['TradeType'], row.get('Current_Price', 0), row.get('Strike', 0))
                 })
             
             df_display = pd.DataFrame(display_data)
@@ -1626,161 +1687,164 @@ def render_daily_helper():
     
     st.divider()
     
-    # Today's Selling Targets - Split into CSP (left) and CC (right)
-    st.subheader("🎯 Today's Selling Target (By Ticker)")
-    
-    # Get inventory
-    inventory = CapitalCalculator.calculate_inventory(df_open)
-    # Note: Margin % calculations temporarily disabled - keeping config table only
-    
-    # Get capital allocation from persistence
+    # ══════════════════════════════════════════════════════════
+    # PHASE 4: DAILY ACTION PLAN — Unified per-ticker cards
+    # ══════════════════════════════════════════════════════════
+    st.subheader("🎯 Daily Action Plan")
+
+    # --- Shared data ---
     portfolio = st.session_state.get('current_portfolio', 'Income Wheel')
     capital_allocation = get_capital_allocation(portfolio)
-    
-    # Get contracts sold this week by ticker and type
+    inventory = CapitalCalculator.calculate_inventory(df_open)
+
+    # Compute unified capital data (reuse from dashboard if available)
+    from unified_calculations import UnifiedCapitalCalculator
+    from persistence import get_stock_average_prices, get_pmcc_tickers
+    _stock_avg = get_stock_average_prices(portfolio)
+    _pmcc_set = set(get_pmcc_tickers(portfolio) or [])
+    _portfolio_deposit = st.session_state.get('portfolio_deposit', 0)
+    _capital_data = UnifiedCapitalCalculator.calculate_capital_by_ticker(
+        df_open, _portfolio_deposit, _stock_avg, live_prices, _pmcc_set
+    )
+
+    # BP from dashboard formula
+    _total_stock_current = _capital_data['total'].get('stock_at_current_price', 0)
+    _total_leap_sunk = _capital_data['total']['leap_sunk']
+    _total_csp_reserved = _capital_data['total']['csp_reserved']
+
+    # Need P&L for BP calc
+    from pnl_calculator import PnLCalculator
+    from persistence import get_spy_leap_pl
+    _spy_leap_pl = get_spy_leap_pl(portfolio)
+    _comp_pnl = PnLCalculator.calculate_comprehensive_pnl(
+        df_trades=st.session_state.df_trades, df_open=df_open,
+        stock_avg_prices=_stock_avg, live_prices=live_prices,
+        spy_leap_pl=_spy_leap_pl if _spy_leap_pl != 0 else None
+    )
+    _prem_by_ticker = {}
+    _closed_opts = st.session_state.df_trades[
+        (st.session_state.df_trades['Status'] == 'Closed') &
+        (st.session_state.df_trades['TradeType'].isin(['CC', 'CSP']))
+    ].copy()
+    if not _closed_opts.empty and 'Actual_Profit_(USD)' in _closed_opts.columns:
+        _closed_opts['_prem'] = pd.to_numeric(_closed_opts['Actual_Profit_(USD)'], errors='coerce').fillna(0)
+        _prem_by_ticker = _closed_opts.groupby('Ticker')['_prem'].sum().to_dict()
+    _total_premium = sum(_prem_by_ticker.values())
+    _total_stock_leap_pl = _comp_pnl['unrealized_stock_pnl']['total'] + _comp_pnl['unrealized_leap_pnl']['total']
+    _total_pl = _total_premium + _total_stock_leap_pl
+    # Full deployment: Stock + LEAP + CSP (no leverage policy)
+    _capital_held = _total_stock_current + _total_leap_sunk
+    _liquid_cash = (_portfolio_deposit + _total_pl) - _capital_held
+    _bp = _liquid_cash - _total_csp_reserved
+    _available_csp_capital = max(0, _bp)
+
+    # Contracts sold this week
     now = datetime.now()
     start_of_week = now - timedelta(days=now.weekday())
-    df_trades = st.session_state.df_trades.copy()
-    df_trades['Date_open'] = pd.to_datetime(df_trades['Date_open'], errors='coerce')
-    
-    this_week_trades = df_trades[
-        (df_trades['Date_open'] >= start_of_week) &
-        (df_trades['TradeType'].isin(['CC', 'CSP']))
+    _df_trades_copy = st.session_state.df_trades.copy()
+    _df_trades_copy['Date_open'] = pd.to_datetime(_df_trades_copy['Date_open'], errors='coerce')
+    _this_week = _df_trades_copy[
+        (_df_trades_copy['Date_open'] >= start_of_week) &
+        (_df_trades_copy['TradeType'].isin(['CC', 'CSP']))
     ].copy()
-    
-    all_tickers = sorted(df_open['Ticker'].unique().tolist())
-    
-    # Create two columns: CSP (left) and CC (right)
-    col_left, col_right = st.columns(2)
-    
-    with col_left:
-        st.markdown("#### 📉 CSP Selling Target")
-        st.caption("Based on remaining capital allocation")
-        
-        # Prepare CSP data for all tickers
-        csp_data = []
-        for ticker in all_tickers:
-            # Get capital allocated for this ticker
-            capital_allocated = capital_allocation.get(ticker, 0.0)
-            
-            # Calculate capital used for this ticker
-            capital_used = 0.0
-            ticker_positions = df_open[df_open['Ticker'] == ticker]
-            for _, pos in ticker_positions.iterrows():
-                trade_id = pos['TradeID']
-                # Margin % calculations temporarily disabled
-                # Capital used calculation removed for now
-            
-            remaining_capital = max(0.0, capital_allocated - capital_used)
-            
-            # Get live price
-            ticker_price = live_prices.get(ticker, 0.0)
-            if ticker_price == 0:
-                ticker_positions = df_open[df_open['Ticker'] == ticker]
-                if not ticker_positions.empty:
-                    price_col = ticker_positions['Price_of_current_underlying_(USD)'].iloc[0]
-                    ticker_price = pd.to_numeric(price_col, errors='coerce') or 0.0
-            
-            # Calculate targets
-            if ticker_price > 0:
-                daily_capital_target = remaining_capital / 4 / 5
-                daily_shares_target = daily_capital_target / ticker_price
-                daily_contracts_target = daily_shares_target / 100
-                weekly_capital_target = remaining_capital / 4
-                weekly_shares_target = weekly_capital_target / ticker_price
-                weekly_contracts_target = weekly_shares_target / 100
-            else:
-                daily_contracts_target = 0.0
-                weekly_contracts_target = 0.0
-            
-            # Get CSP sold this week
-            ticker_week = this_week_trades[this_week_trades['Ticker'] == ticker].copy()
-            ticker_week['Quantity'] = pd.to_numeric(ticker_week['Quantity'], errors='coerce').fillna(0).abs()
-            csp_sold = ticker_week[ticker_week['TradeType'] == 'CSP']['Quantity'].sum() or 0
-            
-            # Calculate remaining (weekly target - sold this week)
-            remaining_weekly = max(0.0, weekly_contracts_target - csp_sold)
-            
-            csp_data.append({
-                'Ticker': ticker,
-                'Capital Allocated': f"${capital_allocated:,.0f}",
-                'Capital Used': f"${capital_used:,.0f}",
-                'Remaining': f"${remaining_capital:,.0f}",
-                'Price': f"${ticker_price:.2f}",
-                'Weekly Target': f"{weekly_contracts_target:.1f}",
-                'Daily Target': f"{daily_contracts_target:.1f}",
-                'Sold This Week': f"{int(csp_sold)}",
-                'Remaining': f"{remaining_weekly:.1f}"
-            })
-        
-        # Display as table
-        if csp_data:
-            df_csp = pd.DataFrame(csp_data)
-            st.dataframe(
-                df_csp,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Ticker": st.column_config.TextColumn("Ticker", width="small"),
-                    "Capital Allocated": st.column_config.TextColumn("Allocated", width="small"),
-                    "Capital Used": st.column_config.TextColumn("Used", width="small"),
-                    "Remaining": st.column_config.TextColumn("Remaining", width="small"),
-                    "Price": st.column_config.TextColumn("Price", width="small"),
-                    "Weekly Target": st.column_config.TextColumn("Weekly", width="small"),
-                    "Daily Target": st.column_config.TextColumn("Daily", width="small"),
-                    "Sold This Week": st.column_config.TextColumn("Sold", width="small"),
-                    "Remaining": st.column_config.TextColumn("Remaining", width="small")
-                }
-            )
-    
-    with col_right:
-        st.markdown("#### 📞 CC Selling Target")
-        st.caption("Based on stock holdings")
-        
-        # Prepare CC data for all tickers
-        cc_data = []
-        for ticker in all_tickers:
-            # Get stock holdings
-            ticker_inventory = inventory['positions_by_ticker'].get(ticker, {})
-            ticker_stock_shares = ticker_inventory.get('total_stock', 0)
-            
-            # Calculate targets
-            ticker_weekly_target = ticker_stock_shares / 4 / 100 if ticker_stock_shares > 0 else 0
-            ticker_daily_target = ticker_stock_shares / 4 / 5 / 100 if ticker_stock_shares > 0 else 0
-            
-            # Get CC sold this week
-            ticker_week = this_week_trades[this_week_trades['Ticker'] == ticker].copy()
-            ticker_week['Quantity'] = pd.to_numeric(ticker_week['Quantity'], errors='coerce').fillna(0).abs()
-            cc_sold = ticker_week[ticker_week['TradeType'] == 'CC']['Quantity'].sum() or 0
-            
-            # Calculate remaining (weekly target - sold this week)
-            remaining_weekly = max(0.0, ticker_weekly_target - cc_sold)
-            
-            cc_data.append({
-                'Ticker': ticker,
-                'Stock Held': f"{int(ticker_stock_shares):,}",
-                'Weekly Target': f"{ticker_weekly_target:.1f}",
-                'Daily Target': f"{ticker_daily_target:.1f}",
-                'Sold This Week': f"{int(cc_sold)}",
-                'Remaining': f"{remaining_weekly:.1f}"
-            })
-        
-        # Display as table
-        if cc_data:
-            df_cc = pd.DataFrame(cc_data)
-            st.dataframe(
-                df_cc,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Ticker": st.column_config.TextColumn("Ticker", width="small"),
-                    "Stock Held": st.column_config.TextColumn("Stock (shares)", width="small"),
-                    "Weekly Target": st.column_config.TextColumn("Weekly", width="small"),
-                    "Daily Target": st.column_config.TextColumn("Daily", width="small"),
-                    "Sold This Week": st.column_config.TextColumn("Sold", width="small"),
-                    "Remaining": st.column_config.TextColumn("Remaining", width="small")
-                }
-            )
+    _this_week['Quantity'] = pd.to_numeric(_this_week['Quantity'], errors='coerce').fillna(0).abs()
+
+    # Remaining trading days this week (Mon=0..Fri=4)
+    _today_wd = now.weekday()
+    _remaining_days = max(1, 5 - _today_wd)
+
+    # Crypto cluster check
+    _crypto_tickers = ['MARA', 'CRCL', 'ETHA', 'SOL']
+    _crypto_total = sum(_capital_data['by_ticker'].get(t, {}).get('total_committed', 0) for t in _crypto_tickers)
+    _crypto_pct = (_crypto_total / _portfolio_deposit * 100) if _portfolio_deposit > 0 else 0
+
+    # BP status banner
+    if _bp < 0:
+        st.error(f"🔴 **Buying Power: ${_bp:,.0f}** — All CSP targets set to 0. Free capital before selling new puts.")
+    else:
+        st.success(f"🟢 **Buying Power: ${_bp:,.0f}** — Available for new CSPs: ${_available_csp_capital:,.0f}")
+
+    # Priority ticker ordering
+    all_tickers = sorted(df_open['Ticker'].unique().tolist(),
+                         key=lambda t: (0 if t in ['MARA', 'CRCL', 'SPY'] else 1, t))
+
+    # --- Per-ticker action cards ---
+    for ticker in all_tickers:
+        td = _capital_data['by_ticker'].get(ticker, {})
+        inv = inventory['positions_by_ticker'].get(ticker, {})
+        ticker_price = live_prices.get(ticker, 0)
+
+        # CSP data
+        csp_reserved = td.get('csp_reserved', 0)
+        csp_allocated = capital_allocation.get(ticker, 0)
+        csp_open_contracts = int(df_open[(df_open['Ticker'] == ticker) & (df_open['TradeType'] == 'CSP')]['Quantity'].abs().sum()) if not df_open.empty else 0
+        csp_sold_week = int(_this_week[(_this_week['Ticker'] == ticker) & (_this_week['TradeType'] == 'CSP')]['Quantity'].sum())
+
+        # CSP: how many can we sell today?
+        if _bp <= 0 or ticker_price <= 0:
+            csp_can_sell = 0
+            csp_reason = "No BP" if _bp <= 0 else "No price"
+        elif csp_allocated > 0 and csp_reserved >= csp_allocated:
+            csp_can_sell = 0
+            csp_reason = "At soft cap"
+        else:
+            # Available = min(remaining allocation, available BP) / (price * 100)
+            remaining_alloc = max(0, csp_allocated - csp_reserved) if csp_allocated > 0 else _available_csp_capital
+            csp_budget = min(remaining_alloc, _available_csp_capital)
+            csp_can_sell = int(csp_budget / (ticker_price * 100)) if ticker_price > 0 else 0
+            csp_reason = ""
+
+        # CC data
+        stock_shares = inv.get('stock', 0) + inv.get('leaps', 0)
+        cc_open = inv.get('cc', 0)
+        cc_coverage_ratio = inv.get('cc_coverage_ratio')
+        cc_coverage_pct = (cc_coverage_ratio * 100) if cc_coverage_ratio and cc_coverage_ratio > 0 else 0
+        uncovered_shares = max(0, stock_shares - (cc_open * 100))
+        cc_can_sell = int(uncovered_shares / 100)
+        cc_sold_week = int(_this_week[(_this_week['Ticker'] == ticker) & (_this_week['TradeType'] == 'CC')]['Quantity'].sum())
+
+        # Badges
+        if csp_can_sell == 0 and csp_reason:
+            csp_badge = f"🔴 {csp_reason}"
+        elif csp_can_sell == 0:
+            csp_badge = "✅ Fully deployed"
+        else:
+            csp_badge = f"🟢 Sell up to {csp_can_sell}"
+
+        if stock_shares == 0:
+            cc_badge = "— No underlying"
+        elif cc_can_sell == 0:
+            cc_badge = "✅ Fully covered"
+        else:
+            cc_badge = f"🟢 Sell up to {cc_can_sell}"
+
+        # Constraints
+        constraints = []
+        if ticker in _crypto_tickers and _crypto_pct > 40:
+            constraints.append(f"Crypto cluster: {_crypto_pct:.0f}%")
+        if _portfolio_deposit > 0 and td.get('total_committed', 0) > _portfolio_deposit * 0.30:
+            constraints.append(f"Concentration: {td['total_committed']/_portfolio_deposit*100:.0f}%")
+
+        # Render card
+        with st.container(border=True):
+            col_hdr, col_price = st.columns([3, 1])
+            with col_hdr:
+                st.markdown(f"**{ticker}**")
+            with col_price:
+                st.caption(f"${ticker_price:.2f}" if ticker_price else "—")
+
+            col_csp, col_cc = st.columns(2)
+            with col_csp:
+                deployed_pct = (csp_reserved / csp_allocated * 100) if csp_allocated > 0 else 0
+                alloc_str = f"${csp_allocated:,.0f}" if csp_allocated > 0 else "—"
+                st.markdown(f"**CSP:** ${csp_reserved:,.0f} / {alloc_str} deployed ({deployed_pct:.0f}%) | {csp_open_contracts} open")
+                st.markdown(f"Sell today: **{csp_badge}** | Sold this week: {csp_sold_week}")
+            with col_cc:
+                st.markdown(f"**CC:** {cc_coverage_pct:.0f}% covered | {cc_open} open / {int(stock_shares):,} shares")
+                st.markdown(f"Sell today: **{cc_badge}** | Sold this week: {cc_sold_week}")
+
+            if constraints:
+                st.caption("⚠️ " + " | ".join(constraints))
 
 
 def calculate_capital_breakdown(df_open: pd.DataFrame, margin_percentages: dict, live_prices: dict = None) -> dict:
@@ -2045,10 +2109,10 @@ def render_entry_forms():
         default_index = 1 if is_active_core else 0  # WHEEL for Active Core, "— Select strategy —" for Income Wheel
         strategy = st.selectbox(
             "🎯 Strategy",
-            ["— Select strategy —", "WHEEL", "PMCC"],
+            ["— Select strategy —", "WHEEL", "PMCC", "ActiveCore"],
             key=f"entry_strategy_{form_key_suffix}_{fv}",
             index=default_index,
-            help="Select strategy: WHEEL (CSP+CC) or PMCC (LEAP+CC)"
+            help="WHEEL (CSP+CC), PMCC (LEAP+CC), ActiveCore (opportunistic income)"
         )
         if is_active_core and strategy == "— Select strategy —":
             return "WHEEL"
@@ -2334,11 +2398,11 @@ def render_entry_forms():
                     
                     audit_data = {
                         'Audit ID': generate_audit_id(st.session_state.df_audit),
-                        'TImeStamp': datetime.now(),
+                        'Timestamp': datetime.now(),
                         'Action Type': 'Open',
                         'TradeID_Ref': new_trade_id,
                         'Remarks': f'Sell CC {cc_ticker} ${cc_strike} x{cc_qty}',
-                        'ScriptNAme': 'Income Wheel App',
+                        'ScriptName': 'Income Wheel App',
                         'AffectedQty': cc_qty
                     }
                     
@@ -2507,11 +2571,11 @@ def render_entry_forms():
                 }
                 audit_data = {
                     'Audit ID': generate_audit_id(st.session_state.df_audit),
-                    'TImeStamp': datetime.now(),
+                    'Timestamp': datetime.now(),
                     'Action Type': 'Open',
                     'TradeID_Ref': new_trade_id,
                     'Remarks': f'Sell CSP {csp_ticker} ${csp_strike} x{csp_qty}',
-                    'ScriptNAme': 'Income Wheel App',
+                    'ScriptName': 'Income Wheel App',
                     'AffectedQty': csp_qty
                 }
                 try:
@@ -2663,17 +2727,17 @@ def render_entry_forms():
                                 
                                 # Full close: close_qty == quantity → no split, no (A)/(B)
                                 # Partial close: close_qty < quantity and user must have confirmed with checkbox
-                                if remaining_qty > 0 and not st.session_state.get("btc_partial_confirm", False):
+                                if remaining_qty > 0 and not st.session_state.get(f"btc_partial_confirm_{fv}", False):
                                     st.error("Close Qty is less than position size. Check **Partial close — split into (A) closed and (B) open** to proceed, or set Close Qty to the full position size for a full close.")
                                 else:
                                     is_partial = remaining_qty > 0
                                     audit_data = {
                                         'Audit ID': generate_audit_id(st.session_state.df_audit),
-                                        'TImeStamp': datetime.now(),
+                                        'Timestamp': datetime.now(),
                                         'Action Type': 'BTC',
                                         'TradeID_Ref': trade_id,
                                         'Remarks': f'BTC at ${btc_price:.2f}, P&L: ${profit:.2f}' + (f' (partial: {close_qty}/{quantity})' if is_partial else ''),
-                                        'ScriptNAme': 'Income Wheel App',
+                                        'ScriptName': 'Income Wheel App',
                                         'AffectedQty': close_qty
                                     }
                                     try:
@@ -2778,7 +2842,7 @@ def render_entry_forms():
                         original = filtered[filtered['TradeID'] == old_trade_id].iloc[0]
                         quantity = int(pd.to_numeric(original['Quantity'], errors='coerce') or 0)
                         original_premium = float(pd.to_numeric(original['OptPremium'], errors='coerce') or 0.0)
-                        orig_strike = float(original['Option_Strike_Price_(USD)'])
+                        orig_strike = float(pd.to_numeric(original['Option_Strike_Price_(USD)'], errors='coerce') or 0.0)
                         st.write(f"**Rolling:** {original['TradeType']} {original['Ticker']}")
                         st.write(f"**Current Strike:** ${orig_strike:.2f}")
                         st.write(f"**Current Expiry:** {original['_expiry_str']}")
@@ -2854,55 +2918,59 @@ def render_entry_forms():
                                 st.error(f"❌ {msg}")
                             else:
                                 new_trade_id = generate_trade_id(df_trades)
-                                _qty_save = int(pd.to_numeric(original['Quantity'], errors='coerce') or 0)
+                                _qty_save = quantity_to_roll  # BUG-04 fix: use quantity_to_roll, not original['Quantity']
                                 _orig_prem = float(pd.to_numeric(original['OptPremium'], errors='coerce') or 0.0)
+                                orig_strike = float(pd.to_numeric(original['Option_Strike_Price_(USD)'], errors='coerce') or 0.0)  # BUG-06 fix: guarded conversion
                                 old_position_profit = (_orig_prem - btc_cost) * 100 * _qty_save
                                 net_credit_save = (_orig_prem + new_premium - btc_cost) * 100 * _qty_save
-                                old_updates = {
-                                    'Status': 'Closed',
-                                    'Date_closed': datetime.now(),
-                                    'Close_Price': btc_cost,
-                                    'Actual_Profit_(USD)': old_position_profit,
-                                    'Remarks': f"Rolled to {new_trade_id}"
-                                }
                                 orig_strat = original.get('StrategyType') or entry_strategy or 'WHEEL'
                                 if orig_strat == "— Select strategy —":
                                     orig_strat = 'WHEEL'
-                                new_trade = {
-                                'TradeID': new_trade_id,
-                                'Ticker': original['Ticker'],
-                                'StrategyType': orig_strat,
-                                'Direction': 'Sell',
-                                'TradeType': original['TradeType'],
-                                'Quantity': original['Quantity'],
-                                'Option_Strike_Price_(USD)': new_strike,
-                                'Price_of_current_underlying_(USD)': original['Price_of_current_underlying_(USD)'],
-                                'OptPremium': new_premium,
-                                'Date_open': datetime.now(),
-                                'Expiry_Date': new_expiry,
-                                'Status': 'Open',
-                                'Remarks': f"Rolled from {old_trade_id}",
-                                'Open_lots': original['Quantity'] * 100
-                            }
-                            
-                            audit_data = {
-                                'Audit ID': generate_audit_id(st.session_state.df_audit),
-                                'TImeStamp': datetime.now(),
-                                'Action Type': 'Roll',
-                                'TradeID_Ref': f"{old_trade_id}, {new_trade_id}",
-                                'Remarks': f"Net credit: ${net_credit_save:.2f}",
-                                'ScriptNAme': 'Income Wheel App',
-                                'AffectedQty': _qty_save
-                            }
-                            
-                            try:
-                                handler = GSheetHandler(st.session_state.current_sheet_id)
-                                handler.update_trade(old_trade_id, old_updates)  # Update old position in Data Table
-                                handler.append_trade(new_trade)  # Add new position to Data Table
-                                handler.append_audit(audit_data)  # Write to Audit Table
-                                show_success_and_clear(new_trade_id, 'roll', f"Rolled from {old_trade_id}")
-                            except Exception as e:
-                                st.error(f"❌ Error saving trade: {e}")
+
+                                try:
+                                    handler = GSheetHandler(st.session_state.current_sheet_id)
+                                    # BUG-01 fix: use atomic_transaction for all 3 operations
+                                    ops = [
+                                        {'type': 'update_trade', 'data': {
+                                            'trade_id': old_trade_id,
+                                            'updates': {
+                                                'Status': 'Closed',
+                                                'Date_closed': datetime.now(),
+                                                'Close_Price': btc_cost,
+                                                'Actual_Profit_(USD)': old_position_profit,
+                                                'Remarks': f"Rolled to {new_trade_id}"
+                                            }
+                                        }},
+                                        {'type': 'append_trade', 'data': {
+                                            'TradeID': new_trade_id,
+                                            'Ticker': original['Ticker'],
+                                            'StrategyType': orig_strat,
+                                            'Direction': 'Sell',
+                                            'TradeType': original['TradeType'],
+                                            'Quantity': _qty_save,
+                                            'Option_Strike_Price_(USD)': new_strike,
+                                            'Price_of_current_underlying_(USD)': original['Price_of_current_underlying_(USD)'],
+                                            'OptPremium': new_premium,
+                                            'Date_open': datetime.now(),
+                                            'Expiry_Date': new_expiry,
+                                            'Status': 'Open',
+                                            'Remarks': f"Rolled from {old_trade_id}",
+                                            'Open_lots': _qty_save * 100
+                                        }},
+                                        {'type': 'append_audit', 'data': {
+                                            'Audit ID': generate_audit_id(st.session_state.df_audit),
+                                            'Timestamp': datetime.now(),
+                                            'Action Type': 'Roll',
+                                            'TradeID_Ref': f"{old_trade_id}, {new_trade_id}",
+                                            'Remarks': f"Net credit: ${net_credit_save:.2f}",
+                                            'ScriptName': 'Income Wheel App',
+                                            'AffectedQty': _qty_save
+                                        }}
+                                    ]
+                                    handler.atomic_transaction(ops)
+                                    show_success_and_clear(new_trade_id, 'roll', f"Rolled from {old_trade_id}")
+                                except Exception as e:
+                                    st.error(f"❌ Error saving trade: {e}")
                                 st.error("⚠️ Trade was NOT saved. Please try again.")
     
     # ---- EXPIRE TAB ----
@@ -3107,11 +3175,11 @@ def render_entry_forms():
                                     # Audit entry (no stock positions created/closed for expire)
                                     handler.append_audit({
                                         'Audit ID': generate_audit_id(st.session_state.df_audit),
-                                        'TImeStamp': datetime.now(),
+                                        'Timestamp': datetime.now(),
                                         'Action Type': 'Expire',
                                         'TradeID_Ref': trade_id,
                                         'Remarks': f"{original['TradeType']} Expired Worthless",
-                                        'ScriptNAme': 'Income Wheel App',
+                                        'ScriptName': 'Income Wheel App',
                                         'AffectedQty': quantity
                                     })
                                     
@@ -3233,11 +3301,11 @@ def render_entry_forms():
                                 # Audit entry
                                 handler.append_audit({
                                     'Audit ID': generate_audit_id(st.session_state.df_audit),
-                                    'TImeStamp': datetime.now(),
+                                    'Timestamp': datetime.now(),
                                     'Action Type': 'Exercise',
                                     'TradeID_Ref': f"{trade_id}, {stock_trade_id}",
                                     'Remarks': "CSP Assigned - Bought stock",
-                                    'ScriptNAme': 'Income Wheel App',
+                                    'ScriptName': 'Income Wheel App',
                                     'AffectedQty': original['Quantity']
                                 })
                                 
@@ -3316,15 +3384,25 @@ def render_entry_forms():
                                 })
                                 
                                 # Close stock position
+                                stock_trade_id = None  # BUG-05 fix: init before if-block
                                 stock_positions = df_open[
                                     (df_open['Ticker'] == original['Ticker']) &
                                     (df_open['TradeType'] == 'STOCK')
                                 ]
                                 if not stock_positions.empty:
                                     stock_trade_id = stock_positions.iloc[0]['TradeID']
+                                    # BUG-10 fix: calculate and record stock P&L
+                                    strike_price = float(pd.to_numeric(original['Option_Strike_Price_(USD)'], errors='coerce') or 0)
+                                    from persistence import get_stock_average_prices
+                                    stock_avg_prices = get_stock_average_prices(st.session_state.get('current_portfolio', 'Income Wheel'))
+                                    cost_basis = float(stock_avg_prices.get(original['Ticker'], strike_price))
+                                    shares_sold = int(pd.to_numeric(original['Quantity'], errors='coerce') or 0) * 100
+                                    stock_profit = (strike_price - cost_basis) * shares_sold
                                     handler.update_trade(stock_trade_id, {
                                         'Status': 'Closed',
                                         'Date_closed': datetime.now(),
+                                        'Close_Price': strike_price,
+                                        'Actual_Profit_(USD)': stock_profit,
                                         'Remarks': f"Called away by {trade_id}"
                                     })
                                     audit_ref = f"{trade_id}, {stock_trade_id}"
@@ -3334,15 +3412,15 @@ def render_entry_forms():
                                 # Audit entry
                                 handler.append_audit({
                                     'Audit ID': generate_audit_id(st.session_state.df_audit),
-                                    'TImeStamp': datetime.now(),
+                                    'Timestamp': datetime.now(),
                                     'Action Type': 'Exercise',
                                     'TradeID_Ref': audit_ref,
                                     'Remarks': "CC Called - Sold stock",
-                                    'ScriptNAme': 'Income Wheel App',
+                                    'ScriptName': 'Income Wheel App',
                                     'AffectedQty': original['Quantity']
                                 })
                                 
-                                stock_id_msg = f"Stock position {stock_trade_id} closed" if not stock_positions.empty else "No stock position found"
+                                stock_id_msg = f"Stock position {stock_trade_id} closed (P&L: ${stock_profit:,.2f})" if stock_trade_id else "No stock position found"
                                 show_success_and_clear(trade_id, 'exercise', stock_id_msg)
                             except Exception as e:
                                 st.error(f"❌ Error saving trade: {e}")
@@ -3558,14 +3636,16 @@ def render_expiry_ladder():
                 wheel_mask = (
                     ~df_open['Ticker'].isin(pmcc_tickers_set) &
                     (
-                        (df_open.get('StrategyType', '') == 'Wheel') |
+                        (df_open.get('StrategyType', '') == 'WHEEL') |
                         (df_open.get('StrategyType', '').isna()) |
                         (df_open.get('StrategyType', '') == '')
                     ) &
                     (df_open['TradeType'] != 'LEAP')
                 )
                 df_open = df_open[wheel_mask].copy()
-        
+            elif strategy_filter == 'ActiveCore':
+                df_open = df_open[df_open.get('StrategyType', '') == 'ActiveCore'].copy()
+
         if df_trades is not None and not df_trades.empty:
             if strategy_filter == 'PMCC':
                 pmcc_mask = (
@@ -3578,14 +3658,16 @@ def render_expiry_ladder():
                 wheel_mask = (
                     ~df_trades['Ticker'].isin(pmcc_tickers_set) &
                     (
-                        (df_trades.get('StrategyType', '') == 'Wheel') |
+                        (df_trades.get('StrategyType', '') == 'WHEEL') |
                         (df_trades.get('StrategyType', '').isna()) |
                         (df_trades.get('StrategyType', '') == '')
                     ) &
                     (df_trades['TradeType'] != 'LEAP')
                 )
                 df_trades = df_trades[wheel_mask].copy()
-    
+            elif strategy_filter == 'ActiveCore':
+                df_trades = df_trades[df_trades.get('StrategyType', '') == 'ActiveCore'].copy()
+
     # Get all option positions (open + closed) for 5 years back and forward
     today = date.today()
     start_date = date(today.year - 5, 1, 1)
@@ -4139,7 +4221,7 @@ def render_performance():
             wheel_mask = (
                 ~df_trades['Ticker'].isin(pmcc_tickers_set) &
                 (
-                    (df_trades.get('StrategyType', '') == 'Wheel') |
+                    (df_trades.get('StrategyType', '') == 'WHEEL') |
                     (df_trades.get('StrategyType', '').isna()) |
                     (df_trades.get('StrategyType', '') == '')
                 ) &
@@ -4150,14 +4232,18 @@ def render_performance():
                 wheel_mask_open = (
                     ~df_open['Ticker'].isin(pmcc_tickers_set) &
                     (
-                        (df_open.get('StrategyType', '') == 'Wheel') |
+                        (df_open.get('StrategyType', '') == 'WHEEL') |
                         (df_open.get('StrategyType', '').isna()) |
                         (df_open.get('StrategyType', '') == '')
                     ) &
                     (df_open['TradeType'] != 'LEAP')
                 )
                 df_open = df_open[wheel_mask_open].copy()
-        
+        elif strategy_filter == 'ActiveCore':
+            df_trades = df_trades[df_trades.get('StrategyType', '') == 'ActiveCore'].copy()
+            if df_open is not None and not df_open.empty:
+                df_open = df_open[df_open.get('StrategyType', '') == 'ActiveCore'].copy()
+
         if df_trades.empty:
             st.info(f"ℹ️ No trades found for {strategy_filter} strategy.")
             return
@@ -4434,8 +4520,231 @@ def render_performance():
     with col2:
         st.metric("Total Stock P&L", f"${total_stock_pl:,.2f}")
     with col3:
-        st.metric("**Total Portfolio P&L**", f"**${total_pl:,.2f}**", 
+        st.metric("**Total Portfolio P&L**", f"**${total_pl:,.2f}**",
                  delta=f"${total_pl:,.2f}" if total_pl != 0 else None)
+
+    # ══════════════════════════════════════════════════════════
+    # PORTFOLIO GROWTH CHARTS
+    # ══════════════════════════════════════════════════════════
+    st.divider()
+    st.subheader("📈 Portfolio Growth")
+
+    df_closed = df_trades[
+        (df_trades['Status'].str.lower() == 'closed') &
+        (df_trades['TradeType'].isin(['CC', 'CSP']))
+    ].copy()
+
+    if not df_closed.empty and 'Date_closed' in df_closed.columns:
+        df_closed['Date_closed'] = pd.to_datetime(df_closed['Date_closed'], errors='coerce')
+        df_closed['Actual_Profit_(USD)'] = pd.to_numeric(df_closed['Actual_Profit_(USD)'], errors='coerce').fillna(0)
+        df_closed = df_closed[df_closed['Date_closed'].notna()].sort_values('Date_closed')
+
+        if not df_closed.empty:
+            # ── Time frame selector ──────────────────────────────
+            _min_date = df_closed['Date_closed'].min().date()
+            _max_date = df_closed['Date_closed'].max().date()
+            _today = date.today()
+
+            _tf_col1, _tf_col2, _tf_col3 = st.columns([2, 2, 3])
+            with _tf_col1:
+                _tf_preset = st.selectbox(
+                    "Time frame",
+                    ["All Time", "YTD", "Last 12 Months", "Last 6 Months", "Last 3 Months", "Last Month", "Custom"],
+                    key="perf_timeframe"
+                )
+            # Resolve preset to date range
+            if _tf_preset == "YTD":
+                _tf_start = date(_today.year, 1, 1)
+                _tf_end = _today
+            elif _tf_preset == "Last 12 Months":
+                _tf_start = _today - timedelta(days=365)
+                _tf_end = _today
+            elif _tf_preset == "Last 6 Months":
+                _tf_start = _today - timedelta(days=182)
+                _tf_end = _today
+            elif _tf_preset == "Last 3 Months":
+                _tf_start = _today - timedelta(days=91)
+                _tf_end = _today
+            elif _tf_preset == "Last Month":
+                _tf_start = _today - timedelta(days=30)
+                _tf_end = _today
+            elif _tf_preset == "Custom":
+                with _tf_col2:
+                    _tf_start = st.date_input("From", value=_min_date, min_value=_min_date, max_value=_max_date, key="perf_from")
+                with _tf_col3:
+                    _tf_end = st.date_input("To", value=_today, min_value=_min_date, key="perf_to")
+            else:  # All Time
+                _tf_start = _min_date
+                _tf_end = _today
+
+            # Filter to selected time frame
+            df_closed = df_closed[
+                (df_closed['Date_closed'].dt.date >= _tf_start) &
+                (df_closed['Date_closed'].dt.date <= _tf_end)
+            ].copy()
+
+            st.caption(f"Showing: **{_tf_start.strftime('%d %b %Y')}** to **{_tf_end.strftime('%d %b %Y')}** ({len(df_closed)} closed trades)")
+            import plotly.graph_objects as go
+
+            _deposit = st.session_state.get('portfolio_deposit', 0)
+            colors = {'MARA': '#f59e0b', 'CRCL': '#10b981', 'SPY': '#6366f1', 'COIN': '#ef4444'}
+
+            # ── Chart 1: Portfolio Equity Curve ──────────────────────
+            st.markdown("#### Portfolio Value Over Time")
+            st.caption("Starting from deposit, each realized P&L event moves the equity curve up or down.")
+
+            daily_pl = df_closed.groupby(df_closed['Date_closed'].dt.date)['Actual_Profit_(USD)'].sum().reset_index()
+            daily_pl.columns = ['Date', 'Daily_PL']
+            daily_pl['Cumulative_PL'] = daily_pl['Daily_PL'].cumsum()
+            daily_pl['Portfolio_Value'] = _deposit + daily_pl['Cumulative_PL']
+
+            # Add starting point (deposit day = day before first trade)
+            first_date = daily_pl['Date'].iloc[0]
+            import datetime as _dt
+            start_row = pd.DataFrame([{
+                'Date': first_date - _dt.timedelta(days=1),
+                'Daily_PL': 0, 'Cumulative_PL': 0, 'Portfolio_Value': _deposit
+            }])
+            daily_pl = pd.concat([start_row, daily_pl], ignore_index=True)
+
+            fig_equity = go.Figure()
+
+            # Portfolio value line (primary)
+            fig_equity.add_trace(go.Scatter(
+                x=daily_pl['Date'], y=daily_pl['Portfolio_Value'],
+                mode='lines+markers', name='Portfolio Value',
+                line=dict(width=3, color='#2563eb'),
+                fill='tozeroy', fillcolor='rgba(37,99,235,0.08)',
+                hovertemplate='%{x}<br>Portfolio: $%{y:,.0f}<extra></extra>'
+            ))
+
+            # Deposit baseline
+            fig_equity.add_hline(
+                y=_deposit, line_dash="dash", line_color="#94a3b8", opacity=0.7,
+                annotation_text=f"Deposit: ${_deposit:,.0f}",
+                annotation_position="bottom right"
+            )
+
+            # Colour the area above/below deposit
+            fig_equity.update_layout(
+                height=420,
+                xaxis_title="Date", yaxis_title="Portfolio Value ($)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode="x unified",
+                yaxis=dict(tickformat="$,.0f"),
+            )
+            st.plotly_chart(fig_equity, use_container_width=True)
+
+            # ── Chart 2: Cumulative P&L by Ticker ────────────────────
+            st.markdown("#### Cumulative P&L by Ticker")
+            st.caption("How each ticker has contributed to total realized P&L over time.")
+
+            fig_ticker = go.Figure()
+            for ticker in sorted(df_closed['Ticker'].unique()):
+                t_data = df_closed[df_closed['Ticker'] == ticker].copy()
+                t_daily = t_data.groupby(t_data['Date_closed'].dt.date)['Actual_Profit_(USD)'].sum().reset_index()
+                t_daily.columns = ['Date', 'PL']
+                t_daily['Cumulative'] = t_daily['PL'].cumsum()
+                fig_ticker.add_trace(go.Scatter(
+                    x=t_daily['Date'], y=t_daily['Cumulative'],
+                    mode='lines+markers', name=ticker,
+                    line=dict(width=2, color=colors.get(ticker, '#94a3b8')),
+                    hovertemplate=f'{ticker}<br>' + '%{x}<br>Cumulative: $%{y:,.0f}<extra></extra>'
+                ))
+
+            # Total line
+            total_daily = df_closed.groupby(df_closed['Date_closed'].dt.date)['Actual_Profit_(USD)'].sum().reset_index()
+            total_daily.columns = ['Date', 'PL']
+            total_daily['Cumulative'] = total_daily['PL'].cumsum()
+            fig_ticker.add_trace(go.Scatter(
+                x=total_daily['Date'], y=total_daily['Cumulative'],
+                mode='lines', name='TOTAL',
+                line=dict(width=3, color='#1e293b', dash='solid'),
+            ))
+
+            fig_ticker.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+            fig_ticker.update_layout(
+                height=380,
+                xaxis_title="Date", yaxis_title="Cumulative P&L ($)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode="x unified",
+                yaxis=dict(tickformat="$,.0f"),
+            )
+            st.plotly_chart(fig_ticker, use_container_width=True)
+
+            # ── Chart 3: Monthly P&L bars + portfolio value line ─────
+            st.markdown("#### Monthly P&L + Portfolio Growth")
+
+            df_closed['Month'] = df_closed['Date_closed'].dt.to_period('M')
+            monthly_total = df_closed.groupby('Month')['Actual_Profit_(USD)'].sum().reset_index()
+            monthly_total['Month_str'] = monthly_total['Month'].astype(str)
+            monthly_total['Cumulative'] = monthly_total['Actual_Profit_(USD)'].cumsum()
+            monthly_total['Portfolio'] = _deposit + monthly_total['Cumulative']
+
+            fig_monthly = go.Figure()
+
+            # P&L bars (green/red)
+            fig_monthly.add_trace(go.Bar(
+                x=monthly_total['Month_str'], y=monthly_total['Actual_Profit_(USD)'],
+                name='Monthly P&L',
+                marker_color=['#22c55e' if v >= 0 else '#ef4444' for v in monthly_total['Actual_Profit_(USD)']],
+                opacity=0.8,
+                yaxis='y',
+                hovertemplate='%{x}<br>P&L: $%{y:,.0f}<extra></extra>'
+            ))
+
+            # Portfolio value line on secondary axis
+            fig_monthly.add_trace(go.Scatter(
+                x=monthly_total['Month_str'], y=monthly_total['Portfolio'],
+                mode='lines+markers', name='Portfolio Value',
+                line=dict(width=3, color='#2563eb'),
+                yaxis='y2',
+                hovertemplate='%{x}<br>Portfolio: $%{y:,.0f}<extra></extra>'
+            ))
+
+            fig_monthly.update_layout(
+                height=380,
+                xaxis_title="Month",
+                yaxis=dict(title="Monthly P&L ($)", tickformat="$,.0f", side='left'),
+                yaxis2=dict(title="Portfolio Value ($)", tickformat="$,.0f", side='right', overlaying='y'),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_monthly, use_container_width=True)
+
+            # ── Chart 4: Weekly income trend ─────────────────────────
+            st.markdown("#### Weekly Income Trend")
+
+            df_closed['Week'] = df_closed['Date_closed'].dt.to_period('W')
+            weekly = df_closed.groupby('Week')['Actual_Profit_(USD)'].sum().reset_index()
+            weekly['Week_str'] = weekly['Week'].apply(lambda w: w.start_time.strftime('%Y-%m-%d'))
+            weekly['Rolling_4W'] = weekly['Actual_Profit_(USD)'].rolling(4, min_periods=1).mean()
+
+            fig_weekly = go.Figure()
+            fig_weekly.add_trace(go.Bar(
+                x=weekly['Week_str'], y=weekly['Actual_Profit_(USD)'],
+                name='Weekly P&L',
+                marker_color=['#22c55e' if v >= 0 else '#ef4444' for v in weekly['Actual_Profit_(USD)']],
+                opacity=0.7
+            ))
+            fig_weekly.add_trace(go.Scatter(
+                x=weekly['Week_str'], y=weekly['Rolling_4W'],
+                mode='lines', name='4-week avg',
+                line=dict(width=3, color='#f59e0b')
+            ))
+            fig_weekly.update_layout(
+                height=320,
+                xaxis_title="Week Starting", yaxis_title="P&L ($)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                yaxis=dict(tickformat="$,.0f"),
+            )
+            fig_weekly.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+            st.plotly_chart(fig_weekly, use_container_width=True)
+
+        else:
+            st.info("No closed trades with dates found for charting.")
+    else:
+        st.info("No closed option trades found for charts.")
 
 
 # ============================================================
@@ -4469,14 +4778,16 @@ def render_all_positions():
             wheel_mask = (
                 ~df_trades['Ticker'].isin(pmcc_tickers_set) &
                 (
-                    (df_trades.get('StrategyType', '') == 'Wheel') |
+                    (df_trades.get('StrategyType', '') == 'WHEEL') |
                     (df_trades.get('StrategyType', '').isna()) |
                     (df_trades.get('StrategyType', '') == '')
                 ) &
                 (df_trades['TradeType'] != 'LEAP')
             )
             df_trades = df_trades[wheel_mask].copy()
-        
+        elif strategy_filter == 'ActiveCore':
+            df_trades = df_trades[df_trades.get('StrategyType', '') == 'ActiveCore'].copy()
+
         if df_trades.empty:
             st.info(f"ℹ️ No trades found for {strategy_filter} strategy.")
             return
@@ -5137,22 +5448,18 @@ def main():
     # Render selected page (all pages work for both portfolios)
     if page == "📊 Dashboard":
         render_dashboard()
-    elif page == "📋 CIO Report":
-        render_daily_report_panel()
     elif page == "📅 Daily Helper":
         render_daily_helper()
     elif page == "📝 Entry Forms":
         render_entry_forms()
     elif page == "📈 Expiry Ladder":
         render_expiry_ladder()
-    elif page == "📊 Performance":
+    elif page == "📉 Performance":
         render_performance()
     elif page == "📋 All Positions":
         render_all_positions()
     elif page == "⚙️ Margin Config":
         render_margin_config()
-    elif page == "📚 Strategy Instructions":
-        render_strategy_instructions()
     elif page == "🔍 Income Scanner":
         render_income_scanner()
     elif page == "📡 Market Data":

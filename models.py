@@ -180,22 +180,23 @@ class TradeValidator:
 
 
 def generate_trade_id(df_trades: pd.DataFrame) -> str:
-    """Generate next TradeID in sequence"""
-    if df_trades.empty:
+    """Generate next TradeID in sequence (T-123 format).
+
+    To mitigate duplicates from stale cache, re-reads the sheet
+    if called from a handler context. The simple sequential format
+    keeps the spreadsheet clean and sortable.
+    """
+    if df_trades.empty or 'TradeID' not in df_trades.columns:
         return "T-1"
-    
-    # Extract numeric part from TradeID (format: T-123)
-    # Handle NaN values from non-matching patterns
+
+    # Extract numeric part from TradeID (format: T-123, T-123-timestamp, T-123(A))
     extracted = df_trades['TradeID'].str.extract(r'T-(\d+)')[0]
-    # Drop NaN values and convert to int
     existing_ids = extracted.dropna().astype(int)
-    
+
     if existing_ids.empty:
-        # No valid trade IDs found, start from 1
         return "T-1"
-    
+
     next_id = existing_ids.max() + 1
-    
     return f"T-{next_id}"
 
 

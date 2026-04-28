@@ -166,6 +166,8 @@ class UnifiedCapitalCalculator:
             by_ticker[ticker] = ticker_data
 
         total_stock_pl = total_stock_at_current - total_stock_at_buy
+        # Full deployment tracking: Stock + LEAP + CSP = total capital used
+        # No leverage policy: remaining_bp should be >= 0 at all times
         total_committed = total_stock_locked + total_csp_reserved + total_leap_sunk
         remaining_bp = portfolio_deposit - total_committed
         overleveraged = remaining_bp < 0
@@ -220,10 +222,11 @@ class UnifiedPacingCalculator:
         
         # Weekly target capital (25% of deployed)
         weekly_target_capital = total_deployed_capital * WEEKLY_TARGET_PCT
-        
-        # Estimated premium rate (2% per week - adjustable)
-        estimated_premium_pct = 0.02
-        weekly_target_premium = weekly_target_capital * estimated_premium_pct
+
+        # Phase 7.4: weekly premium target = weekly_target_capital * actual_yield
+        # Use portfolio_deposit * WEEKLY_TARGET_PCT * 0.5% as a reasonable target
+        # (0.5% of weekly capital deployed = ~25% annualized, typical for CSP income)
+        weekly_target_premium = weekly_target_capital * 0.005
         
         # Daily target
         daily_target_premium = weekly_target_premium / TRADING_DAYS_PER_WEEK
@@ -237,6 +240,8 @@ class UnifiedPacingCalculator:
         date_open_col = get_field_name('date_open', 'position')
         trade_type_col = get_field_name('trade_type', 'identity')
         
+        # Phase 8.4: use .copy() to avoid mutating caller's DataFrame
+        df_trades = df_trades.copy()
         df_trades[date_open_col] = pd.to_datetime(df_trades[date_open_col], errors='coerce')
         this_week_trades = df_trades[
             (df_trades[date_open_col].dt.date >= current_week_start) &
