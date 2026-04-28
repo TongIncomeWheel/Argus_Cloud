@@ -755,10 +755,10 @@ def render_dashboard():
         live_prices=live_prices,
         spy_leap_pl=spy_leap_pl if spy_leap_pl != 0 else None
     )
-    # Premium collected (same logic as Profit and Loss by Ticker: closed CC/CSP only)
+    # Realized P&L from all closed trades (CC, CSP, LEAP, STOCK)
     premium_collected_by_ticker = {}
     if df_trades is not None and not df_trades.empty:
-        closed_opts = df_trades[(df_trades['Status'] == 'Closed') & (df_trades['TradeType'].isin(['CC', 'CSP']))].copy()
+        closed_opts = df_trades[(df_trades['Status'] == 'Closed') & (df_trades['TradeType'].isin(['CC', 'CSP', 'LEAP', 'STOCK']))].copy()
         if not closed_opts.empty:
             if 'Actual_Profit_(USD)' in closed_opts.columns:
                 closed_opts['_prem'] = pd.to_numeric(closed_opts['Actual_Profit_(USD)'], errors='coerce').fillna(0)
@@ -907,10 +907,10 @@ def render_dashboard():
         unsafe_allow_html=True
     )
     
-    # Premium collected by ticker (from closed CC/CSP trades)
+    # Realized P&L by ticker (all closed trades: CC, CSP, LEAP, STOCK)
     premium_collected_by_ticker = {}
     if df_trades is not None and not df_trades.empty:
-        closed_opts = df_trades[(df_trades['Status'] == 'Closed') & (df_trades['TradeType'].isin(['CC', 'CSP']))].copy()
+        closed_opts = df_trades[(df_trades['Status'] == 'Closed') & (df_trades['TradeType'].isin(['CC', 'CSP', 'LEAP', 'STOCK']))].copy()
         if not closed_opts.empty:
             if 'Actual_Profit_(USD)' in closed_opts.columns:
                 closed_opts['_prem'] = pd.to_numeric(closed_opts['Actual_Profit_(USD)'], errors='coerce').fillna(0)
@@ -931,7 +931,7 @@ def render_dashboard():
         total_pl_row = total_stock_pl_row + total_leap_pl_row
         
         # One line: Premium collected by ticker + Total (before P/L)
-        st.caption("Premium collected (closed CC/CSP)")
+        st.caption("Realized P&L (closed CC/CSP/LEAP/STOCK)")
         n_cols = min(len(all_pl_tickers), 8)
         prem_cols = st.columns(n_cols + 1)
         for i, ticker in enumerate(all_pl_tickers[:n_cols]):
@@ -1724,7 +1724,7 @@ def render_daily_helper():
     _prem_by_ticker = {}
     _closed_opts = st.session_state.df_trades[
         (st.session_state.df_trades['Status'] == 'Closed') &
-        (st.session_state.df_trades['TradeType'].isin(['CC', 'CSP']))
+        (st.session_state.df_trades['TradeType'].isin(['CC', 'CSP', 'LEAP', 'STOCK']))
     ].copy()
     if not _closed_opts.empty and 'Actual_Profit_(USD)' in _closed_opts.columns:
         _closed_opts['_prem'] = pd.to_numeric(_closed_opts['Actual_Profit_(USD)'], errors='coerce').fillna(0)
@@ -4263,15 +4263,15 @@ def render_performance():
     spy_leap_pl = get_spy_leap_pl(portfolio)
     
     # ===== PREMIUM COLLECTED BY TICKER =====
-    st.subheader("💰 Premium Collected by Ticker")
-    
-    # Get all closed option trades (CC and CSP) - MUST be closed and MUST be CC or CSP
+    st.subheader("💰 Realized P&L by Ticker")
+
+    # Get all closed trades (CC, CSP, LEAP, STOCK) — include LEAP rolls/closes
     df_closed_options = df_trades[
         (df_trades['Status'].str.lower() == 'closed') &
-        (df_trades['TradeType'].isin(['CC', 'CSP']))
+        (df_trades['TradeType'].isin(['CC', 'CSP', 'LEAP', 'STOCK']))
     ].copy()
-    
-    # ALWAYS use Actual_Profit_(USD) for closed CC/CSP trades
+
+    # Use Actual_Profit_(USD) for all closed trades
     if 'Actual_Profit_(USD)' in df_closed_options.columns:
         df_closed_options['Actual_Profit_(USD)'] = pd.to_numeric(df_closed_options['Actual_Profit_(USD)'], errors='coerce').fillna(0)
         # Use Actual_Profit_(USD) directly (even if 0, as it represents the actual P&L)
@@ -4531,7 +4531,7 @@ def render_performance():
 
     df_closed = df_trades[
         (df_trades['Status'].str.lower() == 'closed') &
-        (df_trades['TradeType'].isin(['CC', 'CSP']))
+        (df_trades['TradeType'].isin(['CC', 'CSP', 'LEAP', 'STOCK']))
     ].copy()
 
     if not df_closed.empty and 'Date_closed' in df_closed.columns:
