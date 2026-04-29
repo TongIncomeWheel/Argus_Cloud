@@ -323,7 +323,7 @@ def style_dataframe_negatives(df, currency_columns=None, number_columns=None):
         return ''
     
     # Create styled DataFrame
-    styled_df = df_styled.style.applymap(highlight_negatives, subset=currency_columns + number_columns)
+    styled_df = df_styled.style.map(highlight_negatives, subset=currency_columns + number_columns)
     
     return styled_df
 
