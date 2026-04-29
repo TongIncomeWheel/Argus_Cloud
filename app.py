@@ -5343,65 +5343,95 @@ def render_margin_config():
     existing_tickers = sorted(df_open_for_alloc['Ticker'].unique().tolist()) if (df_open_for_alloc is not None and not df_open_for_alloc.empty) else []
 
     def _render_pot_allocation_editor(pot_name: str, pot_deposit: float, key_prefix: str):
-        """Render allocation editor for one pot."""
-        alloc = get_pot_capital_allocation(pot_name, portfolio).copy()
-        # Add tickers from positions if missing (only those in this pot)
-        for t in existing_tickers:
-            if t not in alloc:
-                alloc[t] = 0.0
+        """Render allocation editor for one pot.
 
-        rows = []
-        for t in sorted(alloc.keys()):
-            cap = alloc.get(t, 0.0)
-            pct = (cap / pot_deposit * 100) if pot_deposit > 0 else 0.0
-            rows.append({'Ticker': t, 'Allocation %': pct, 'Capital Allocated ($)': cap})
+        UX:
+        - Edit % directly in the table (Allocated $ is computed display, read-only)
+        - "+ Add ticker" input below the table
+        - "Remove" buttons next to each ticker
+        - "Save" button to commit changes (no auto-save)
+        """
+        # Persistent staging area in session state — survives reruns
+        stage_key = f"{key_prefix}_alloc_stage"
+        if stage_key not in st.session_state:
+            st.session_state[stage_key] = get_pot_capital_allocation(pot_name, portfolio).copy()
 
-        if not rows:
-            st.info(f"No tickers configured for {pot_name} pot. Add tickers below.")
-            rows = [{'Ticker': '', 'Allocation %': 0.0, 'Capital Allocated ($)': 0.0}]
+        alloc = st.session_state[stage_key]
 
-        df_a = pd.DataFrame(rows)
-        edited = st.data_editor(
-            df_a,
-            column_config={
-                "Ticker": st.column_config.TextColumn("Ticker", width="small"),
-                "Allocation %": st.column_config.NumberColumn("% of Pot", min_value=0.0, max_value=100.0, step=0.1, format="%.1f%%"),
-                "Capital Allocated ($)": st.column_config.NumberColumn("Allocated $", min_value=0.0, step=1000.0, format="$%d"),
-            },
-            hide_index=True, use_container_width=True, num_rows="dynamic",
-            key=f"{key_prefix}_alloc_editor"
-        )
+        if not alloc:
+            st.info(f"No tickers in {pot_name} pot. Add one below.")
+        else:
+            # Build display rows — % is editable, $ is computed
+            rows = []
+            for t in sorted(alloc.keys()):
+                cap = alloc.get(t, 0.0)
+                pct = (cap / pot_deposit * 100) if pot_deposit > 0 else 0.0
+                rows.append({'Ticker': t, '% of Pot': round(pct, 2), 'Allocated $ (computed)': round(cap, 0)})
 
-        # Process edits: if % changed, recalc $; if $ changed, recalc %
-        prev_key = f"{key_prefix}_prev_pct"
-        prev_pcts = st.session_state.get(prev_key, {t: r['Allocation %'] for t, r in zip(df_a['Ticker'], rows)})
-        updated_alloc = {}
-        for _, row in edited.iterrows():
-            t = str(row['Ticker']).strip().upper()
-            if not t:
-                continue
-            pct = float(row['Allocation %'] or 0)
-            cap = float(row['Capital Allocated ($)'] or 0)
-            prev = prev_pcts.get(t, 0.0)
-            # If % changed, $ follows
-            if abs(pct - prev) > 0.01:
-                cap = (pct / 100.0) * pot_deposit
-            updated_alloc[t] = cap
-        st.session_state[prev_key] = {t: (v / pot_deposit * 100 if pot_deposit > 0 else 0) for t, v in updated_alloc.items()}
+            df_a = pd.DataFrame(rows)
+            edited = st.data_editor(
+                df_a,
+                column_config={
+                    "Ticker": st.column_config.TextColumn("Ticker", width="small", disabled=True),
+                    "% of Pot": st.column_config.NumberColumn(
+                        "% of Pot (edit me)", min_value=0.0, max_value=100.0, step=0.5, format="%.2f"
+                    ),
+                    "Allocated $ (computed)": st.column_config.NumberColumn(
+                        "Allocated $", format="$%d", disabled=True,
+                    ),
+                },
+                hide_index=True, use_container_width=True, num_rows="fixed",
+                key=f"{key_prefix}_alloc_editor"
+            )
 
-        if updated_alloc != alloc:
-            save_pot_capital_allocation(pot_name, updated_alloc, portfolio)
-            st.toast(f"{pot_name} pot allocation saved.", icon="✅")
+            # Update staging from edits (% drives $)
+            for _, row in edited.iterrows():
+                t = str(row['Ticker']).strip().upper()
+                if t:
+                    new_pct = float(row['% of Pot'] or 0)
+                    st.session_state[stage_key][t] = (new_pct / 100.0) * pot_deposit
 
-        # Total %
-        if pot_deposit > 0:
-            total_pct = sum(v / pot_deposit * 100 for v in updated_alloc.values())
-            if total_pct > 100:
-                st.warning(f"⚠️ {pot_name} total: {total_pct:.1f}% (exceeds 100%)")
-            else:
-                st.caption(f"{pot_name} total: {total_pct:.1f}% allocated, {100-total_pct:.1f}% unallocated (OTHERS)")
+            # Per-row remove buttons
+            with st.container():
+                rm_cols = st.columns(min(len(alloc), 6) or 1)
+                for i, t in enumerate(sorted(alloc.keys())):
+                    with rm_cols[i % len(rm_cols)]:
+                        if st.button(f"❌ {t}", key=f"{key_prefix}_rm_{t}", help=f"Remove {t}", use_container_width=True):
+                            del st.session_state[stage_key][t]
+                            st.rerun()
 
-        return updated_alloc
+        # Add new ticker
+        add_col_t, add_col_pct, add_col_btn = st.columns([2, 2, 1])
+        with add_col_t:
+            new_t = st.text_input("Ticker to add", key=f"{key_prefix}_new_ticker", placeholder="e.g. AAPL").strip().upper()
+        with add_col_pct:
+            new_pct = st.number_input("% of Pot", min_value=0.0, max_value=100.0, step=1.0, value=0.0, key=f"{key_prefix}_new_pct")
+        with add_col_btn:
+            st.write("")
+            st.write("")
+            if st.button("➕ Add", key=f"{key_prefix}_add_btn", use_container_width=True):
+                if new_t:
+                    st.session_state[stage_key][new_t] = (new_pct / 100.0) * pot_deposit
+                    st.rerun()
+
+        # Save / Reset
+        save_col, reset_col, status_col = st.columns([1, 1, 3])
+        with save_col:
+            if st.button("💾 Save", key=f"{key_prefix}_save_btn", type="primary", use_container_width=True):
+                save_pot_capital_allocation(pot_name, st.session_state[stage_key], portfolio)
+                st.toast(f"{pot_name} pot saved.", icon="✅")
+                st.success(f"✅ {pot_name} pot saved!")
+        with reset_col:
+            if st.button("↺ Reset", key=f"{key_prefix}_reset_btn", use_container_width=True):
+                st.session_state[stage_key] = get_pot_capital_allocation(pot_name, portfolio).copy()
+                st.rerun()
+        with status_col:
+            if pot_deposit > 0:
+                total_pct = sum(v / pot_deposit * 100 for v in st.session_state[stage_key].values())
+                color = "🔴" if total_pct > 100 else ("🟡" if total_pct > 95 else "🟢")
+                st.caption(f"{color} **{total_pct:.1f}%** allocated · {100-total_pct:.1f}% in OTHERS bucket")
+
+        return st.session_state[stage_key]
 
     pot_alloc_col1, pot_alloc_col2 = st.columns(2)
     with pot_alloc_col1:
@@ -5411,15 +5441,15 @@ def render_margin_config():
         st.markdown(f"**⚡ Active Income Pot — ${_active_usd:,.0f}**")
         _active_alloc = _render_pot_allocation_editor('Active', _active_usd, 'active')
 
-    # Maintain backward compatibility: combined allocation = base + active
-    combined = {}
+    # Combined allocation = base + active (kept in session state only;
+    # persisted only when the user clicks Save in either pot)
+    _combined = {}
     for t, v in _base_alloc.items():
-        combined[t] = combined.get(t, 0) + v
+        _combined[t] = _combined.get(t, 0) + v
     for t, v in _active_alloc.items():
-        combined[t] = combined.get(t, 0) + v
-    save_capital_allocation(combined, portfolio)
-    st.session_state.capital_allocation = combined
-    
+        _combined[t] = _combined.get(t, 0) + v
+    st.session_state.capital_allocation = _combined
+
     st.divider()
     
     # PMCC Configuration Section
