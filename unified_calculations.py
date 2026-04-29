@@ -145,8 +145,9 @@ class UnifiedCapitalCalculator:
                 stock_at_current = shares * price_current
                 stock_pl = stock_at_current - stock_at_buy
 
-                # stock_locked = market value (current) so remaining BP and overleveraged use today's capital
-                stock_locked = stock_at_current
+                # stock_locked = cost basis (buy price) — this is the cash deployed.
+                # Market value drives unrealized P&L (separate metric), not BP.
+                stock_locked = stock_at_buy
                 csp_reserved = DataAccess.get_csp_reserved(ticker, df_open_filtered)
 
                 ticker_data = {
@@ -185,6 +186,84 @@ class UnifiedCapitalCalculator:
                 'remaining_bp': remaining_bp,
                 'overleveraged': overleveraged
             }
+        }
+
+    @staticmethod
+    def calculate_tiger_margin(df_open: pd.DataFrame, live_prices: Optional[Dict[str, float]] = None) -> Dict:
+        """
+        Estimate Tiger Brokers' actual CSP margin requirement (vs. cash-secured policy).
+
+        Tiger's formula (per their docs):
+          margin = max(30% × spot × 100 + premium × 100 − OTM_amount, 0)
+          capped at strike × 100 (i.e. cannot exceed full cash-secured)
+          Note: scales up to 100% in high vol — this is a static 30% baseline.
+
+        Returns:
+          {
+            'csp_margin': float,        # Sum across all open CSPs
+            'csp_cash_secured': float,  # Full cash-secured (strike × 100 × qty)
+            'headroom': float,          # Cash freed if Tiger margin used instead
+            'by_position': list[dict]   # Per-CSP breakdown for transparency
+          }
+        """
+        if live_prices is None:
+            live_prices = {}
+
+        df_open_filtered = DataAccess.filter_open_positions(df_open)
+        if df_open_filtered.empty:
+            return {'csp_margin': 0.0, 'csp_cash_secured': 0.0, 'headroom': 0.0, 'by_position': []}
+
+        trade_type_col = get_field_name('trade_type', 'identity')
+        ticker_col = get_field_name('ticker', 'identity')
+
+        csps = df_open_filtered[df_open_filtered[trade_type_col] == 'CSP']
+        if csps.empty:
+            return {'csp_margin': 0.0, 'csp_cash_secured': 0.0, 'headroom': 0.0, 'by_position': []}
+
+        total_tiger = 0.0
+        total_cs = 0.0
+        rows = []
+
+        for _, row in csps.iterrows():
+            ticker = row[ticker_col]
+            strike = float(pd.to_numeric(row.get('Option_Strike_Price_(USD)', 0), errors='coerce') or 0)
+            qty = abs(float(pd.to_numeric(row.get('Quantity', 0), errors='coerce') or 0))
+            premium = float(pd.to_numeric(row.get('OptPremium', 0), errors='coerce') or 0)
+            spot = float(live_prices.get(ticker, 0) or 0)
+
+            if strike <= 0 or qty <= 0:
+                continue
+
+            cs_full = strike * 100 * qty  # 100% cash-secured
+
+            if spot <= 0:
+                # No spot — fall back to cash-secured (conservative)
+                tiger = cs_full
+            else:
+                spot_value = spot * 100 * qty
+                premium_total = premium * 100 * qty
+                otm_amount = max(0.0, spot - strike) * 100 * qty
+                tiger = max(spot_value * 0.30 + premium_total - otm_amount, 0.0)
+                tiger = min(tiger, cs_full)  # cap at cash-secured
+
+            total_tiger += tiger
+            total_cs += cs_full
+            rows.append({
+                'TradeID': row.get('TradeID', ''),
+                'Ticker': ticker,
+                'Strike': strike,
+                'Spot': spot,
+                'Contracts': int(qty),
+                'CashSecured': cs_full,
+                'TigerMargin': tiger,
+                'Headroom': cs_full - tiger,
+            })
+
+        return {
+            'csp_margin': total_tiger,
+            'csp_cash_secured': total_cs,
+            'headroom': total_cs - total_tiger,
+            'by_position': rows,
         }
 
 

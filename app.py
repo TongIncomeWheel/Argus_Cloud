@@ -35,7 +35,7 @@ from models import TradeValidator, generate_trade_id, generate_audit_id
 from price_feed import PriceFeed, display_price_status, get_cached_prices
 from market_data import MarketDataService as _MarketDataService
 _market_data = _MarketDataService()
-from persistence import get_portfolio_deposit, save_portfolio_deposit, get_margin_percentages, save_margin_percentages, get_capital_allocation, save_capital_allocation, get_portfolio_deposit_sgd, save_portfolio_deposit_sgd, get_fx_rate, save_fx_rate, get_pmcc_tickers, save_pmcc_tickers, get_tickers, save_tickers
+from persistence import get_portfolio_deposit, save_portfolio_deposit, get_capital_allocation, save_capital_allocation, get_portfolio_deposit_sgd, save_portfolio_deposit_sgd, get_fx_rate, save_fx_rate, get_pmcc_tickers, save_pmcc_tickers, get_tickers, save_tickers
 from ai_chat import render_ai_chat
 # Strategy Instructions module removed in v2 cleanup
 from income_scanner_ui import render_income_scanner
@@ -621,7 +621,6 @@ def render_dashboard():
     
     # Always use current portfolio's persisted values (never stale from previous selection)
     portfolio = st.session_state.get('current_portfolio', 'Income Wheel')
-    st.session_state.margin_percentages = get_margin_percentages(portfolio)
     st.session_state.portfolio_deposit = get_portfolio_deposit(portfolio)
     portfolio_deposit = st.session_state.portfolio_deposit
     
@@ -775,12 +774,14 @@ def render_dashboard():
     locked = tank_data['locked']
     
     # ----- Computed values for summary -----
-    total_capital_used = total_stock_at_current + total_leap_sunk + total_csp_reserved
-    # Full deployment: Stock + LEAP + CSP all count as capital used (no leverage policy)
-    capital_held = total_stock_at_current + total_leap_sunk
+    # Cash-secured policy: STOCK at BUY price (not market) + LEAP sunk + CSP reserved
+    # Stock cost basis = actual cash deployed; market value drives unrealized P&L only.
+    total_stock_at_buy = capital_data['total'].get('stock_at_buy_price', 0.0)
+    total_capital_used = total_stock_at_buy + total_leap_sunk + total_csp_reserved
+    capital_held = total_stock_at_buy + total_leap_sunk
     liquid_cash = (portfolio_deposit + total_pl) - capital_held
     bp = liquid_cash - total_csp_reserved
-    stock_and_leap_total = total_stock_at_current + total_leap_sunk
+    stock_and_leap_total = total_stock_at_buy + total_leap_sunk
 
     # ══════════════════════════════════════════════════════════
     # PHASE 3.1: ALERT BANNERS (always visible, top priority)
@@ -824,7 +825,36 @@ def render_dashboard():
         st_metric_with_negatives("Nett P/L", total_pl, decimals=0, is_currency=True)
     with col5:
         st_metric_with_negatives("Buying Power", bp, decimals=0, is_currency=True)
-    
+
+    # ── Tiger Broker Margin (vs Cash-Secured Policy) ────────────
+    with st.expander("🏦 Tiger Broker Margin (vs Cash-Secured Policy)", expanded=False):
+        _tiger = UnifiedCapitalCalculator.calculate_tiger_margin(df_open, live_prices)
+        _t_col1, _t_col2, _t_col3 = st.columns(3)
+        with _t_col1:
+            st.metric("Cash-Secured Reserved (your policy)",
+                       f"${_tiger['csp_cash_secured']:,.0f}",
+                       help="Strike × 100 × contracts — full cash collateral")
+        with _t_col2:
+            st.metric("Tiger Actual Margin (estimate)",
+                       f"${_tiger['csp_margin']:,.0f}",
+                       help="30% × spot × 100 + premium − OTM amount, capped at strike")
+        with _t_col3:
+            st.metric("Headroom (cash freed if margin used)",
+                       f"${_tiger['headroom']:,.0f}",
+                       help="Difference between your 100% cash-secured policy and Tiger's actual margin")
+        st.caption(
+            "**Tiger formula:** 30% × spot × 100 + premium received − OTM amount, capped at strike. "
+            "Margin scales up to 100% in high volatility. This is a static 30% baseline estimate."
+        )
+        if _tiger['by_position']:
+            _df_tiger = pd.DataFrame(_tiger['by_position'])
+            _df_tiger['CashSecured'] = _df_tiger['CashSecured'].apply(lambda v: f"${v:,.0f}")
+            _df_tiger['TigerMargin'] = _df_tiger['TigerMargin'].apply(lambda v: f"${v:,.0f}")
+            _df_tiger['Headroom'] = _df_tiger['Headroom'].apply(lambda v: f"${v:,.0f}")
+            _df_tiger['Strike'] = _df_tiger['Strike'].apply(lambda v: f"${v:.2f}")
+            _df_tiger['Spot'] = _df_tiger['Spot'].apply(lambda v: f"${v:.2f}" if v > 0 else "—")
+            st.dataframe(_df_tiger, use_container_width=True, hide_index=True)
+
     # ----- CSP Reserved expandable: Open CSPs, Counters, Expiry, Income ladder (YTD, MTD, Next 4 weeks) -----
     with st.expander("CSP Reserved – Open CSPs, counters, expiry & income ladder (pace and deploy BP)", expanded=False):
         df_csp_open = df_open[(df_open['TradeType'] == 'CSP')].copy() if df_open is not None and not df_open.empty and 'TradeType' in df_open.columns else pd.DataFrame()
@@ -1707,8 +1737,8 @@ def render_daily_helper():
         df_open, _portfolio_deposit, _stock_avg, live_prices, _pmcc_set
     )
 
-    # BP from dashboard formula
-    _total_stock_current = _capital_data['total'].get('stock_at_current_price', 0)
+    # BP from dashboard formula (cash-secured policy: stock at BUY price)
+    _total_stock_buy = _capital_data['total'].get('stock_at_buy_price', 0)
     _total_leap_sunk = _capital_data['total']['leap_sunk']
     _total_csp_reserved = _capital_data['total']['csp_reserved']
 
@@ -1732,8 +1762,8 @@ def render_daily_helper():
     _total_premium = sum(_prem_by_ticker.values())
     _total_stock_leap_pl = _comp_pnl['unrealized_stock_pnl']['total'] + _comp_pnl['unrealized_leap_pnl']['total']
     _total_pl = _total_premium + _total_stock_leap_pl
-    # Full deployment: Stock + LEAP + CSP (no leverage policy)
-    _capital_held = _total_stock_current + _total_leap_sunk
+    # Cash-secured policy: stock at BUY price + LEAP + CSP
+    _capital_held = _total_stock_buy + _total_leap_sunk
     _liquid_cash = (_portfolio_deposit + _total_pl) - _capital_held
     _bp = _liquid_cash - _total_csp_reserved
     _available_csp_capital = max(0, _bp)
@@ -1846,214 +1876,6 @@ def render_daily_helper():
             if constraints:
                 st.caption("⚠️ " + " | ".join(constraints))
 
-
-def calculate_capital_breakdown(df_open: pd.DataFrame, margin_percentages: dict, live_prices: dict = None) -> dict:
-    """
-    Calculate capital breakdown by ticker and type
-    
-    Returns:
-        dict with:
-            - grid: DataFrame with capital by ticker and type
-            - by_trade: dict of {trade_id: {capital, margin_pct, margin_used}}
-    """
-    import pandas as pd
-    
-    # Group by ticker and type
-    breakdown = {}
-    by_trade = {}
-    
-    for _, row in df_open.iterrows():
-        trade_id = row['TradeID']
-        ticker = row['Ticker']
-        trade_type = row['TradeType']
-        
-        # Calculate capital for this position
-        if trade_type == 'CSP':
-            strike = pd.to_numeric(row.get('Option_Strike_Price_(USD)', 0), errors='coerce') or 0
-            qty = pd.to_numeric(row.get('Quantity', 0), errors='coerce') or 0
-            capital = strike * 100 * qty
-        elif trade_type == 'LEAP':
-            # LEAP capital = contract premium paid (OptPremium × Quantity)
-            # For buying LEAPs, capital is the premium paid for the contracts, not underlying stock value
-            # OptPremium is the total premium per contract (not per share), so we don't multiply by 100
-            premium = pd.to_numeric(row.get('OptPremium', 0), errors='coerce') or 0
-            qty = pd.to_numeric(row.get('Quantity', 0), errors='coerce') or 0
-            # Use absolute value for quantity (long positions)
-            if 'Direction' in row and row.get('Direction') == 'Buy':
-                qty = abs(qty)
-            capital = premium * qty
-        elif trade_type == 'STOCK':
-            if 'Open_lots' in row and pd.notna(row['Open_lots']):
-                shares = abs(pd.to_numeric(row['Open_lots'], errors='coerce') or 0)
-            else:
-                qty = pd.to_numeric(row.get('Quantity', 0), errors='coerce') or 0
-                shares = abs(qty) * 100
-            price = pd.to_numeric(row.get('Price_of_current_underlying_(USD)', 0), errors='coerce')
-            # Use live prices as fallback if price is NaN
-            if pd.isna(price) or price == 0:
-                if live_prices and ticker in live_prices and live_prices[ticker] is not None:
-                    price = live_prices[ticker]
-                else:
-                    price = 0.0
-            capital = price * shares
-        elif trade_type == 'CC':
-            # Check if this CC is part of a PMCC (LEAP + CC for same ticker)
-            ticker = row['Ticker']
-            ticker_positions = df_open[df_open['Ticker'] == ticker]
-            has_leap = (ticker_positions['TradeType'] == 'LEAP').any()
-            
-            if has_leap:
-                # PMCC CC: requires capital (strike * 100 * qty)
-                strike = pd.to_numeric(row.get('Option_Strike_Price_(USD)', 0), errors='coerce') or 0
-                qty = pd.to_numeric(row.get('Quantity', 0), errors='coerce') or 0
-                capital = strike * 100 * qty
-            else:
-                # Regular CC: doesn't use capital (covered by stock)
-                capital = 0
-        else:
-            capital = 0
-        
-        # Get margin % (by ticker_type key: "TICKER_TYPE")
-        ticker_type_key = f"{ticker}_{trade_type}"
-        if trade_type == 'CC':
-            # Check if this CC is part of a PMCC
-            ticker_positions = df_open[df_open['Ticker'] == ticker]
-            has_leap = (ticker_positions['TradeType'] == 'LEAP').any()
-            if has_leap:
-                # PMCC CC: can use margin (get from user input)
-                margin_pct = margin_percentages.get(ticker_type_key, 0.0)
-            else:
-                # Regular CC: never uses margin
-                margin_pct = 0.0
-        else:
-            margin_pct = margin_percentages.get(ticker_type_key, 0.0)
-        
-        margin_used = capital * (margin_pct / 100.0)
-        
-        # Store by trade
-        by_trade[trade_id] = {
-            'capital': capital,
-            'margin_pct': margin_pct,
-            'margin_used': margin_used
-        }
-        
-        # Group by ticker and type
-        key = (ticker, trade_type)
-        if key not in breakdown:
-            breakdown[key] = {
-                'Ticker': ticker,
-                'Type': trade_type,
-                'Capital': 0.0,
-                'Margin %': 0.0,
-                'Margin Used': 0.0
-            }
-        
-        breakdown[key]['Capital'] += capital
-        breakdown[key]['Margin Used'] += margin_used
-    
-    # Calculate weighted average margin % for each ticker/type combo
-    for key, data in breakdown.items():
-        if data['Capital'] > 0:
-            data['Margin %'] = (data['Margin Used'] / data['Capital']) * 100.0
-        else:
-            data['Margin %'] = 0.0
-    
-    # Convert to DataFrame
-    grid_data = list(breakdown.values())
-    df_grid = pd.DataFrame(grid_data)
-    
-    # Sort by ticker, then type
-    if not df_grid.empty:
-        df_grid = df_grid.sort_values(['Ticker', 'Type'])
-        # Format columns
-        df_grid['Capital'] = df_grid['Capital'].apply(lambda x: f"${x:,.0f}")
-        df_grid['Margin %'] = df_grid['Margin %'].apply(lambda x: f"{x:.1f}%")
-        df_grid['Margin Used'] = df_grid['Margin Used'].apply(lambda x: f"${x:,.0f}")
-    
-    return {
-        'grid': df_grid,
-        'by_trade': by_trade
-    }
-
-
-def calculate_margin_by_position(df_open: pd.DataFrame, margin_percentages: dict, live_prices: dict = None) -> dict:
-    """
-    Calculate total margin used based on user-entered margin percentages
-    
-    Returns:
-        dict with total_margin_used
-    """
-    total_margin_used = 0.0
-    
-    for _, row in df_open.iterrows():
-        trade_id = row['TradeID']
-        trade_type = row['TradeType']
-        
-        # CC positions: only PMCC CCs use margin
-        if trade_type == 'CC':
-            # Check if this CC is part of a PMCC
-            ticker = row['Ticker']
-            ticker_positions = df_open[df_open['Ticker'] == ticker]
-            has_leap = (ticker_positions['TradeType'] == 'LEAP').any()
-            if not has_leap:
-                # Regular CC (covered by stock): no margin
-                continue
-            # PMCC CC: continue to calculate margin below
-        
-        # Calculate capital for this position
-        if trade_type == 'CSP':
-            strike = pd.to_numeric(row.get('Option_Strike_Price_(USD)', 0), errors='coerce') or 0
-            qty = pd.to_numeric(row.get('Quantity', 0), errors='coerce') or 0
-            capital = strike * 100 * qty
-        elif trade_type == 'CC':
-            # PMCC CC: requires capital (strike * 100 * qty)
-            # (Regular CC already filtered out above with continue)
-            strike = pd.to_numeric(row.get('Option_Strike_Price_(USD)', 0), errors='coerce') or 0
-            qty = pd.to_numeric(row.get('Quantity', 0), errors='coerce') or 0
-            capital = strike * 100 * qty
-        elif trade_type == 'LEAP':
-            # LEAP capital = contract premium paid (OptPremium × Quantity)
-            # For buying LEAPs, capital is the premium paid for the contracts, not underlying stock value
-            # OptPremium is the total premium per contract (not per share), so we don't multiply by 100
-            premium = pd.to_numeric(row.get('OptPremium', 0), errors='coerce') or 0
-            qty = pd.to_numeric(row.get('Quantity', 0), errors='coerce') or 0
-            # Use absolute value for quantity (long positions)
-            if 'Direction' in row and row.get('Direction') == 'Buy':
-                qty = abs(qty)
-            capital = premium * qty
-        elif trade_type == 'STOCK':
-            if 'Open_lots' in row and pd.notna(row['Open_lots']):
-                shares = abs(pd.to_numeric(row['Open_lots'], errors='coerce') or 0)
-            else:
-                qty = pd.to_numeric(row.get('Quantity', 0), errors='coerce') or 0
-                shares = abs(qty) * 100
-            price = pd.to_numeric(row.get('Price_of_current_underlying_(USD)', 0), errors='coerce')
-            # Use live prices as fallback if price is NaN
-            if pd.isna(price) or price == 0:
-                ticker = row['Ticker']
-                if live_prices and ticker in live_prices and live_prices[ticker] is not None:
-                    price = live_prices[ticker]
-                else:
-                    price = 0.0
-            capital = price * shares
-        else:
-            capital = 0
-        
-        # Get margin % from user input (by ticker_type key: "TICKER_TYPE")
-        ticker = row['Ticker']
-        ticker_type_key = f"{ticker}_{trade_type}"
-        if trade_type == 'CC':
-            # PMCC CC: can use margin (get from user input)
-            # (Regular CC already filtered out above with continue)
-            margin_pct = margin_percentages.get(ticker_type_key, 0.0)
-        else:
-            margin_pct = margin_percentages.get(ticker_type_key, 0.0)
-        margin_used = capital * (margin_pct / 100.0)
-        total_margin_used += margin_used
-    
-    return {
-        'total_margin_used': total_margin_used
-    }
 
 
 # ============================================================
@@ -4961,7 +4783,6 @@ def render_margin_config():
     
     # Initialize session state (load from persistence) - ALWAYS load to ensure persistence
     portfolio = st.session_state.get('current_portfolio', 'Income Wheel')
-    st.session_state.margin_percentages = get_margin_percentages(portfolio)
     st.session_state.capital_allocation = get_capital_allocation(portfolio)
     st.session_state.portfolio_deposit = get_portfolio_deposit(portfolio)
     
@@ -5258,142 +5079,26 @@ def render_margin_config():
             st.rerun()
         
         if pmcc_tickers_set:
-            st.info(f"ℹ️ **PMCC Tickers:** {', '.join(sorted(pmcc_tickers_set))} - These use separate PMCC logic (to be provided later)")
+            st.info(f"ℹ️ **PMCC Tickers:** {', '.join(sorted(pmcc_tickers_set))} - LEAP cost is the only capital tied up; short CCs are covered by the LEAP (no additional margin).")
     else:
         st.info("ℹ️ No open positions found. PMCC configuration will be available once you have open positions.")
-    
+
     st.divider()
-    
-    # Margin Configuration Section
-    st.subheader("📊 Margin Percentage by Counter & Type")
-    st.write("Enter margin percentage for each counter (ticker) and trade type. Query from your broker.")
-    st.info("ℹ️ **Note:** Regular CCs (covered by stock) do NOT incur margin - set margin % to 0%. PMCC CCs (LEAP + CC) require capital and margin - set appropriate margin %.")
-    
-    if df_open is None or df_open.empty:
-        st.warning("No open positions found.")
-        return
-    
-    if df_open is None or df_open.empty:
-        st.warning("No open positions found.")
-        return
-    
-    # Get live prices for capital calculation (Yahoo Finance - always available)
-    tickers = df_open['Ticker'].unique().tolist()
-    live_prices = {}
-    try:
-        live_prices = get_cached_prices(tuple(tickers))
-        st.session_state.live_prices = live_prices
-        if live_prices:
-            prices_available = sum(1 for p in live_prices.values() if p is not None)
-            st.info(f"📊 Prices available for {prices_available}/{len(tickers)} tickers (Yahoo Finance, 10-15 min delay)")
-    except Exception as e:
-        st.warning(f"⚠️ Could not fetch prices: {e}")
-        live_prices = st.session_state.get('live_prices', {})
-    
-    # Ensure margin percentages are loaded from persistence (refresh on each page load)
-    st.session_state.margin_percentages = get_margin_percentages()
-    
-    # Get unique ticker/type combinations
-    ticker_types = df_open.groupby(['Ticker', 'TradeType']).size().reset_index()[['Ticker', 'TradeType']]
-    
-    # Calculate capital for each ticker/type combo
-    margin_data = []
-    for _, row in ticker_types.iterrows():
-        ticker = row['Ticker']
-        trade_type = row['TradeType']
-        ticker_type_key = f"{ticker}_{trade_type}"
-        
-        # Calculate total capital for this ticker/type
-        positions = df_open[(df_open['Ticker'] == ticker) & (df_open['TradeType'] == trade_type)]
-        total_capital = 0.0
-        
-        for _, pos in positions.iterrows():
-            if trade_type == 'CSP':
-                strike = pd.to_numeric(pos.get('Option_Strike_Price_(USD)', 0), errors='coerce') or 0
-                qty = pd.to_numeric(pos.get('Quantity', 0), errors='coerce') or 0
-                total_capital += strike * 100 * qty
-            elif trade_type == 'LEAP':
-                # LEAP capital = contract premium paid (OptPremium × Quantity)
-                # OptPremium is the total premium per contract (not per share), so we don't multiply by 100
-                premium = pd.to_numeric(pos.get('OptPremium', 0), errors='coerce') or 0
-                qty = pd.to_numeric(pos.get('Quantity', 0), errors='coerce') or 0
-                # Use absolute value for quantity (long positions)
-                if 'Direction' in pos and pos.get('Direction') == 'Buy':
-                    qty = abs(qty)
-                total_capital += premium * qty
-            elif trade_type == 'STOCK':
-                if 'Open_lots' in pos and pd.notna(pos['Open_lots']):
-                    shares = abs(pd.to_numeric(pos['Open_lots'], errors='coerce') or 0)
-                else:
-                    qty = pd.to_numeric(pos.get('Quantity', 0), errors='coerce') or 0
-                    shares = abs(qty) * 100
-                # Use live prices as fallback
-                price = pd.to_numeric(pos.get('Price_of_current_underlying_(USD)', 0), errors='coerce')
-                if pd.isna(price) or price == 0:
-                    if ticker in live_prices and live_prices[ticker] is not None:
-                        price = live_prices[ticker]
-                    else:
-                        price = 0.0
-                total_capital += price * shares
-        
-        # Get current margin %
-        current_margin_pct = st.session_state.margin_percentages.get(ticker_type_key, 0.0)
-        
-        margin_data.append({
-            'Ticker': ticker,
-            'Type': trade_type,
-            'Capital ($)': total_capital,
-            'Margin %': current_margin_pct,
-            'Margin Used ($)': total_capital * (current_margin_pct / 100.0)
-        })
-    
-    df_margin = pd.DataFrame(margin_data)
-    df_margin = df_margin.sort_values(['Ticker', 'Type'])
-    
-    # Check for positions with $0 capital (missing prices)
-    zero_capital = df_margin[df_margin['Capital ($)'] == 0]
-    if len(zero_capital) > 0 and not live_prices:
-        st.warning(f"⚠️ {len(zero_capital)} ticker/type combinations show $0 capital due to missing prices. Prices will be fetched from Yahoo Finance, or update prices in Google Sheets.")
-    
-    # Create editable form
-    edited_df = st.data_editor(
-        df_margin,
-        column_config={
-            "Ticker": st.column_config.TextColumn("Ticker", disabled=True),
-            "Type": st.column_config.TextColumn("Type", disabled=True),
-            "Capital ($)": st.column_config.NumberColumn("Capital ($)", format="$%d", disabled=True),
-            "Margin %": st.column_config.NumberColumn(
-                "Margin % (from broker)",
-                help="Enter margin percentage from your broker.",
-                min_value=0.0,
-                max_value=100.0,
-                step=0.1,
-                format="%.1f%%"
-            ),
-            "Margin Used ($)": st.column_config.NumberColumn("Margin Used ($)", format="$%d", disabled=True)
-        },
-        hide_index=True,
-        use_container_width=True,
-        key="margin_config_table"
+
+    # ── Capital Policy Reference ────────────────────────────────
+    st.subheader("📋 Capital Policy")
+    st.markdown(
+        "**Cash-secured policy** — capital used by position type:\n\n"
+        "- **CSP** = `strike × 100 × contracts` (full cash collateral)\n"
+        "- **STOCK** = `shares × avg_buy_price` (cost basis — what you paid)\n"
+        "- **LEAP (PMCC)** = `premium × 100 × contracts` (sunk premium)\n"
+        "- **CC on STOCK** = `$0` (covered by shares)\n"
+        "- **CC on LEAP (PMCC)** = `$0` (covered by LEAP — Tiger charges no extra margin)\n\n"
+        "**Buying Power** = Deposit + Realized P&L − (Stock at cost + LEAP sunk + CSP reserved).\n\n"
+        "See **Dashboard → Tiger Broker Margin** expander for the broker's actual margin estimate "
+        "and headroom vs your cash-secured policy."
     )
     
-    # Recalculate margin used after editing
-    edited_df['Margin Used ($)'] = edited_df['Capital ($)'] * (edited_df['Margin %'] / 100.0)
-    
-    # Update session state (no autocorrection)
-    updated_margin_percentages = {}
-    for _, row in edited_df.iterrows():
-        ticker = row['Ticker']
-        trade_type = row['Type']
-        ticker_type_key = f"{ticker}_{trade_type}"
-        updated_margin_percentages[ticker_type_key] = float(row['Margin %'])
-    
-    st.session_state.margin_percentages = updated_margin_percentages
-    portfolio = st.session_state.get('current_portfolio', 'Income Wheel')
-    save_margin_percentages(updated_margin_percentages, portfolio)  # Persist to file
-    
-    st.toast("Margin percentages saved.", icon="✅")
-    st.success("✅ Margin percentages saved! Return to Dashboard to see updated calculations.")
 
 
 # ============================================================
@@ -5429,8 +5134,6 @@ def main():
     st.session_state.current_portfolio = portfolio_name
     st.session_state.current_sheet_id = get_sheet_id(portfolio_name)
     st.session_state.portfolio_deposit = get_portfolio_deposit(portfolio_name)
-    st.session_state.margin_percentages = get_margin_percentages(portfolio_name)
-
     # Show confirmation after form submit (so user sees it after rerun and fresh data)
     if st.session_state.get('success_message'):
         msg = st.session_state.success_message

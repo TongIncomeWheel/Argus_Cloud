@@ -118,33 +118,6 @@ def save_fx_rate(fx_rate: float, portfolio: str = "Income Wheel"):
     save_settings(settings)
 
 
-def get_margin_percentages(portfolio: str = "Income Wheel") -> Dict[str, float]:
-    """
-    Get saved margin percentages for the specified portfolio
-    
-    NOTE: Margin percentages are stored but NOT USED in calculations.
-    They are kept for reference only. All margin calculations are disabled.
-    """
-    settings = load_settings()
-    portfolio_key = get_portfolio_key(portfolio)
-    key = f"{portfolio_key}_margin_percentages"
-    return settings.get(key, settings.get('margin_percentages', {}))  # Fallback to old key for backward compatibility
-
-
-def save_margin_percentages(margin_percentages: Dict[str, float], portfolio: str = "Income Wheel"):
-    """
-    Save margin percentages for the specified portfolio
-    
-    NOTE: Margin percentages are stored but NOT USED in calculations.
-    They are kept for reference only. All margin calculations are disabled.
-    """
-    settings = load_settings()
-    portfolio_key = get_portfolio_key(portfolio)
-    key = f"{portfolio_key}_margin_percentages"
-    settings[key] = margin_percentages
-    save_settings(settings)
-
-
 def get_capital_allocation(portfolio: str = "Income Wheel") -> Dict[str, float]:
     """Get saved capital allocation by ticker for the specified portfolio"""
     settings = load_settings()
