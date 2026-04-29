@@ -900,6 +900,117 @@ def render_dashboard():
         else:
             st.info("No open CSPs to display.")
 
+    # ══════════════════════════════════════════════════════════
+    # SECTION C: ALLOCATION DRILL-DOWN (% per ticker → $ → pacing)
+    # ══════════════════════════════════════════════════════════
+    st.markdown("### 🎯 Allocation Drill-Down (per ticker)")
+    st.caption("% allocations are set in **Margin Config → Capital Allocation**. "
+                "Targets below are **25% of remaining capital per week**, paced over 5 trading days.")
+
+    # Pull deployed (committed) per ticker from capital_data — already includes Stock@buy + LEAP + CSP
+    _alloc_rows = []
+    _allocated_tickers = set(capital_allocation.keys())
+    _all_position_tickers = set(capital_data['by_ticker'].keys())
+    _explicit_tickers = sorted(_allocated_tickers, key=lambda t: (0 if t in ['MARA', 'CRCL', 'SPY'] else 1, t))
+
+    _total_explicit_alloc = sum(capital_allocation.values())
+    _others_alloc = max(0, portfolio_deposit - _total_explicit_alloc)
+    _others_pct = (_others_alloc / portfolio_deposit * 100) if portfolio_deposit > 0 else 0
+
+    # Tickers with positions but NOT in explicit allocation → fall under OTHERS
+    _other_position_tickers = _all_position_tickers - _allocated_tickers
+    _others_deployed = sum(
+        capital_data['by_ticker'].get(t, {}).get('total_committed', 0)
+        for t in _other_position_tickers
+    )
+
+    for ticker in _explicit_tickers:
+        allocated = capital_allocation.get(ticker, 0)
+        pct_alloc = (allocated / portfolio_deposit * 100) if portfolio_deposit > 0 else 0
+        deployed = capital_data['by_ticker'].get(ticker, {}).get('total_committed', 0)
+        remaining = max(0, allocated - deployed)
+        pct_used = (deployed / allocated * 100) if allocated > 0 else 0
+        weekly_t = remaining * 0.25
+        daily_t = weekly_t / 5
+        if pct_used > 100:
+            status = "🔴 Over"
+        elif pct_used > 85:
+            status = "🟡 High"
+        elif pct_used > 60:
+            status = "🟠 Mid"
+        else:
+            status = "🟢 OK"
+        _alloc_rows.append({
+            'Ticker': ticker,
+            'Allocation %': f"{pct_alloc:.1f}%",
+            'Allocated $': f"${allocated:,.0f}",
+            'Deployed $': f"${deployed:,.0f}",
+            'Remaining $': f"${remaining:,.0f}",
+            '% Used': f"{pct_used:.0f}%",
+            'Weekly Target': f"${weekly_t:,.0f}",
+            'Daily Target': f"${daily_t:,.0f}",
+            'Status': status,
+        })
+
+    # OTHERS bucket
+    if _others_alloc > 0 or _others_deployed > 0:
+        _others_remaining = max(0, _others_alloc - _others_deployed)
+        _others_pct_used = (_others_deployed / _others_alloc * 100) if _others_alloc > 0 else 0
+        _others_weekly = _others_remaining * 0.25
+        _others_daily = _others_weekly / 5
+        if _others_alloc == 0 and _others_deployed > 0:
+            _others_status = "🔴 No alloc"
+        elif _others_pct_used > 100:
+            _others_status = "🔴 Over"
+        elif _others_pct_used > 85:
+            _others_status = "🟡 High"
+        elif _others_pct_used > 60:
+            _others_status = "🟠 Mid"
+        else:
+            _others_status = "🟢 OK"
+        _alloc_rows.append({
+            'Ticker': f'OTHERS ({", ".join(sorted(_other_position_tickers)) if _other_position_tickers else "—"})',
+            'Allocation %': f"{_others_pct:.1f}%",
+            'Allocated $': f"${_others_alloc:,.0f}",
+            'Deployed $': f"${_others_deployed:,.0f}",
+            'Remaining $': f"${_others_remaining:,.0f}",
+            '% Used': f"{_others_pct_used:.0f}%" if _others_alloc > 0 else "—",
+            'Weekly Target': f"${_others_weekly:,.0f}",
+            'Daily Target': f"${_others_daily:,.0f}",
+            'Status': _others_status,
+        })
+
+    # TOTAL row
+    _total_deployed = sum(d.get('total_committed', 0) for d in capital_data['by_ticker'].values())
+    _total_remaining = max(0, portfolio_deposit - _total_deployed)
+    _total_pct_used = (_total_deployed / portfolio_deposit * 100) if portfolio_deposit > 0 else 0
+    _alloc_rows.append({
+        'Ticker': '**TOTAL**',
+        'Allocation %': '100.0%',
+        'Allocated $': f"${portfolio_deposit:,.0f}",
+        'Deployed $': f"${_total_deployed:,.0f}",
+        'Remaining $': f"${_total_remaining:,.0f}",
+        '% Used': f"{_total_pct_used:.0f}%",
+        'Weekly Target': f"${_total_remaining * 0.25:,.0f}",
+        'Daily Target': f"${_total_remaining * 0.25 / 5:,.0f}",
+        'Status': '—',
+    })
+
+    df_alloc = pd.DataFrame(_alloc_rows)
+    st.dataframe(df_alloc, use_container_width=True, hide_index=True,
+                  column_config={
+                      "Ticker": st.column_config.TextColumn("Ticker", width="medium"),
+                      "Allocation %": st.column_config.TextColumn("Alloc %", width="small"),
+                      "Allocated $": st.column_config.TextColumn("Allocated", width="small"),
+                      "Deployed $": st.column_config.TextColumn("Deployed", width="small"),
+                      "Remaining $": st.column_config.TextColumn("Remaining", width="small"),
+                      "% Used": st.column_config.TextColumn("% Used", width="small"),
+                      "Weekly Target": st.column_config.TextColumn("Week", width="small"),
+                      "Daily Target": st.column_config.TextColumn("Day", width="small"),
+                      "Status": st.column_config.TextColumn("Status", width="small"),
+                  })
+    st.caption("Status: 🟢 <60% | 🟠 60-85% | 🟡 85-100% | 🔴 >100% (over allocation)")
+
     # ----- CSP Reserved expandable: Open CSPs, Counters, Expiry, Income ladder (YTD, MTD, Next 4 weeks) -----
     with st.expander("CSP Reserved – Open CSPs, counters, expiry & income ladder (pace and deploy BP)", expanded=False):
         df_csp_open = df_open[(df_open['TradeType'] == 'CSP')].copy() if df_open is not None and not df_open.empty and 'TradeType' in df_open.columns else pd.DataFrame()
