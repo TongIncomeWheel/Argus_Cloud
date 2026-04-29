@@ -813,38 +813,81 @@ def render_dashboard():
     # ══════════════════════════════════════════════════════════
     # PHASE 3.2: SIMPLIFIED CAPITAL SUMMARY (5 metrics, not 7+3)
     # ══════════════════════════════════════════════════════════
-    st.write("**Capital Summary**")
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
-        st.metric("Deposit", f"${portfolio_deposit:,.0f}")
-    with col2:
-        st.metric("Capital Held", f"${capital_held:,.0f}", help="Stock at current + LEAP sunk")
-    with col3:
-        st.metric("CSP Reserved", f"${total_csp_reserved:,.0f}")
-    with col4:
-        st_metric_with_negatives("Nett P/L", total_pl, decimals=0, is_currency=True)
-    with col5:
-        st_metric_with_negatives("Buying Power", bp, decimals=0, is_currency=True)
+    # ══════════════════════════════════════════════════════════
+    # SECTION A: ACCOUNT VALUE (live mark-to-market)
+    # ══════════════════════════════════════════════════════════
+    # NAV = Deposit + Realized P&L + Unrealized P&L
+    nav = portfolio_deposit + total_pl
+    nav_delta = nav - portfolio_deposit
+    nav_delta_pct = (nav_delta / portfolio_deposit * 100) if portfolio_deposit > 0 else 0
 
-    # ── Tiger Broker Margin (vs Cash-Secured Policy) ────────────
-    with st.expander("🏦 Tiger Broker Margin (vs Cash-Secured Policy)", expanded=False):
-        _tiger = UnifiedCapitalCalculator.calculate_tiger_margin(df_open, live_prices)
-        _t_col1, _t_col2, _t_col3 = st.columns(3)
-        with _t_col1:
-            st.metric("Cash-Secured Reserved (your policy)",
-                       f"${_tiger['csp_cash_secured']:,.0f}",
-                       help="Strike × 100 × contracts — full cash collateral")
-        with _t_col2:
-            st.metric("Tiger Actual Margin (estimate)",
-                       f"${_tiger['csp_margin']:,.0f}",
-                       help="30% × spot × 100 + premium − OTM amount, capped at strike")
-        with _t_col3:
-            st.metric("Headroom (cash freed if margin used)",
-                       f"${_tiger['headroom']:,.0f}",
-                       help="Difference between your 100% cash-secured policy and Tiger's actual margin")
+    # MMF cash estimate: what's actually sitting at broker after real margin held
+    # NAV - stock at market - LEAP cost - Tiger actual CSP margin
+    _tiger_for_mmf = UnifiedCapitalCalculator.calculate_tiger_margin(df_open, live_prices)
+    cash_idle_mmf = nav - total_stock_at_current - total_leap_sunk - _tiger_for_mmf['csp_margin']
+    cash_idle_mmf = max(0, cash_idle_mmf)
+    mmf_yield_annual = cash_idle_mmf * 0.05  # ~5% MMF yield estimate
+
+    st.markdown("### 📈 Account Value (live)")
+    nav_col1, nav_col2, nav_col3, nav_col4 = st.columns(4)
+    with nav_col1:
+        st.metric("Net Account Value",
+                   f"${nav:,.0f}",
+                   delta=f"{nav_delta_pct:+.1f}% vs deposit",
+                   help="Deposit + Realized P&L + Unrealized P&L (Stock + LEAP at live prices)")
+    with nav_col2:
+        st.metric("Stock at Market",
+                   f"${total_stock_at_current:,.0f}",
+                   help="Current market value of stock holdings")
+    with nav_col3:
+        st.metric("LEAP at Cost",
+                   f"${total_leap_sunk:,.0f}",
+                   help="Premium paid for LEAPs (intrinsic-only valuation)")
+    with nav_col4:
+        st.metric("Cash idle (MMF est.)",
+                   f"${cash_idle_mmf:,.0f}",
+                   delta=f"~${mmf_yield_annual:,.0f}/yr at 5%",
+                   help="NAV − Stock@market − LEAP − Tiger margin held. Estimated cash earning yield in MMF. Golden figure is in your Tiger account.")
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════
+    # SECTION B: SELLING CAPACITY (how much can I deploy)
+    # ══════════════════════════════════════════════════════════
+    _tiger = UnifiedCapitalCalculator.calculate_tiger_margin(df_open, live_prices)
+    # Tiger BP = if you used broker margin instead of cash-secured for CSPs
+    tiger_bp = bp + _tiger['headroom']  # cash-secured BP + headroom freed by using broker margin
+    weekly_target_pct = 0.25  # 25% of available BP per week
+    weekly_pacing = max(0, bp) * weekly_target_pct
+    daily_pacing = weekly_pacing / 5
+
+    st.markdown("### 💼 How Much Can I Sell?")
+    bp_col1, bp_col2, bp_col3 = st.columns(3)
+    with bp_col1:
+        st_metric_with_negatives("Cash-Secured BP", bp, decimals=0, is_currency=True,
+                                  help_text="Your discipline: max new CSPs without using broker margin")
+        st.caption("**Your policy ceiling**")
+    with bp_col2:
+        st.metric("Tiger Margin BP (FYI)",
+                   f"${tiger_bp:,.0f}",
+                   help="Broker would allow this much, but charges ~6-8% interest on margin used")
+        st.caption("Reference only — interest cost applies if used")
+    with bp_col3:
+        st.metric("This Week Target (25%)",
+                   f"${weekly_pacing:,.0f}",
+                   delta=f"~${daily_pacing:,.0f}/day",
+                   help="25% of cash-secured BP deployed per week, paced over 5 trading days")
+        st.caption("Conservative pacing")
+
+    if bp < 0:
+        st.error(f"🔴 **Buying Power negative ({'-' if bp < 0 else ''}${abs(bp):,.0f})** — "
+                  "You're past your cash-secured ceiling. Free capital before opening new CSPs.")
+
+    # Tiger margin per-position breakdown (collapsed for detail)
+    with st.expander("📊 Tiger margin breakdown by position", expanded=False):
         st.caption(
             "**Tiger formula:** 30% × spot × 100 + premium received − OTM amount, capped at strike. "
-            "Margin scales up to 100% in high volatility. This is a static 30% baseline estimate."
+            "Margin scales up to 100% in high volatility. Static 30% baseline estimate."
         )
         if _tiger['by_position']:
             _df_tiger = pd.DataFrame(_tiger['by_position'])
@@ -854,6 +897,8 @@ def render_dashboard():
             _df_tiger['Strike'] = _df_tiger['Strike'].apply(lambda v: f"${v:.2f}")
             _df_tiger['Spot'] = _df_tiger['Spot'].apply(lambda v: f"${v:.2f}" if v > 0 else "—")
             st.dataframe(_df_tiger, use_container_width=True, hide_index=True)
+        else:
+            st.info("No open CSPs to display.")
 
     # ----- CSP Reserved expandable: Open CSPs, Counters, Expiry, Income ladder (YTD, MTD, Next 4 weeks) -----
     with st.expander("CSP Reserved – Open CSPs, counters, expiry & income ladder (pace and deploy BP)", expanded=False):
