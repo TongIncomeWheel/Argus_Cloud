@@ -639,7 +639,13 @@ def render_dashboard():
         df_open = filter_by_pot(df_open, POT_BASE)
         df_trades = filter_by_pot(df_trades, POT_BASE)
         portfolio_deposit = get_pot_deposit(POT_BASE, portfolio)
+        # Fallback: if Base pot not set yet, use legacy deposit (everything was Base before pots)
+        if portfolio_deposit == 0:
+            portfolio_deposit = get_portfolio_deposit(portfolio)
         capital_allocation_for_view = get_pot_capital_allocation(POT_BASE, portfolio)
+        # Fallback: if no Base allocation yet, use legacy combined allocation
+        if not capital_allocation_for_view:
+            capital_allocation_for_view = get_capital_allocation(portfolio)
         pot_label = "Base Pot"
     elif pot_view == "⚡ Active Income Pot":
         df_open = filter_by_pot(df_open, POT_ACTIVE)
@@ -661,6 +667,9 @@ def render_dashboard():
             capital_allocation_for_view[t] = capital_allocation_for_view.get(t, 0) + v
         for t, v in active_alloc.items():
             capital_allocation_for_view[t] = capital_allocation_for_view.get(t, 0) + v
+        # Fallback: if neither pot has allocations, use legacy
+        if not capital_allocation_for_view:
+            capital_allocation_for_view = get_capital_allocation(portfolio)
         pot_label = "All Pots"
 
     # Defensive: if pot has no positions, bail gracefully
@@ -5081,6 +5090,22 @@ def render_margin_config():
         st.session_state.sgd_usd_fx_rate = sgd_usd_fx_rate
         save_fx_rate(sgd_usd_fx_rate, portfolio)
 
+    # Auto-migrate: if pot deposits are unset but legacy deposit exists, seed Base pot
+    _existing_base_sgd = get_pot_deposit_sgd('Base', portfolio)
+    _existing_base_usd = get_pot_deposit('Base', portfolio)
+    _existing_active_sgd = get_pot_deposit_sgd('Active', portfolio)
+    _existing_active_usd = get_pot_deposit('Active', portfolio)
+    if _existing_base_sgd == 0 and _existing_active_sgd == 0:
+        # Migrate from legacy
+        _legacy_sgd = get_portfolio_deposit_sgd(portfolio)
+        _legacy_usd = get_portfolio_deposit(portfolio)
+        if _legacy_sgd > 0 or _legacy_usd > 0:
+            save_pot_deposit_sgd('Base', _legacy_sgd, portfolio)
+            save_pot_deposit('Base', _legacy_usd, portfolio)
+            _existing_base_sgd = _legacy_sgd
+            _existing_base_usd = _legacy_usd
+            st.info(f"ℹ️ Migrated legacy portfolio deposit (${_legacy_usd:,.0f}) into Base Pot. Adjust splits below.")
+
     # Two-column layout: Base | Active
     pot_col_base, pot_col_active = st.columns(2)
 
@@ -5089,7 +5114,7 @@ def render_margin_config():
         _base_sgd = st.number_input(
             "Base Pot (SGD)",
             min_value=0.0,
-            value=float(get_pot_deposit_sgd('Base', portfolio)),
+            value=float(_existing_base_sgd),
             step=1000.0,
             help="Cash deposited into the Base Pot (Wheel + PMCC)",
             key="pot_base_sgd_input"
@@ -5107,7 +5132,7 @@ def render_margin_config():
         _active_sgd = st.number_input(
             "Active Pot (SGD)",
             min_value=0.0,
-            value=float(get_pot_deposit_sgd('Active', portfolio)),
+            value=float(_existing_active_sgd),
             step=1000.0,
             help="Cash deposited into the Active Income Pot (ActiveCore)",
             key="pot_active_sgd_input"
@@ -5127,11 +5152,11 @@ def render_margin_config():
                delta=f"SGD {total_deposit_sgd:,.0f}",
                help="Sum of both pots — drives all dashboard calculations")
 
-    # Maintain backward compatibility: write total to legacy keys so existing code still works
-    if total_deposit_usd != st.session_state.get('portfolio_deposit', 0):
+    # Maintain backward compatibility: write total to legacy keys (only if non-zero, never wipe)
+    if total_deposit_usd > 0 and total_deposit_usd != st.session_state.get('portfolio_deposit', 0):
         st.session_state.portfolio_deposit = total_deposit_usd
         save_portfolio_deposit(total_deposit_usd, portfolio)
-    if total_deposit_sgd != st.session_state.get('portfolio_deposit_sgd', 0):
+    if total_deposit_sgd > 0 and total_deposit_sgd != st.session_state.get('portfolio_deposit_sgd', 0):
         st.session_state.portfolio_deposit_sgd = total_deposit_sgd
         save_portfolio_deposit_sgd(total_deposit_sgd, portfolio)
 
