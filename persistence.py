@@ -135,6 +135,61 @@ def save_capital_allocation(capital_allocation: Dict[str, float], portfolio: str
     save_settings(settings)
 
 
+# ─────────────────────────────────────────────
+# POT-BASED PERSISTENCE (Base Pot / Active Income Pot)
+# StrategyType derives the pot: ActiveCore -> Active, else -> Base
+# ─────────────────────────────────────────────
+def get_pot_deposit(pot: str, portfolio: str = "Income Wheel") -> float:
+    """Get USD deposit for a specific pot ('Base' or 'Active')."""
+    settings = load_settings()
+    portfolio_key = get_portfolio_key(portfolio)
+    key = f"{portfolio_key}_pot_{pot.lower()}_deposit_usd"
+    return float(settings.get(key, 0.0))
+
+
+def save_pot_deposit(pot: str, usd_value: float, portfolio: str = "Income Wheel"):
+    """Save USD deposit for a specific pot."""
+    settings = load_settings()
+    portfolio_key = get_portfolio_key(portfolio)
+    key = f"{portfolio_key}_pot_{pot.lower()}_deposit_usd"
+    settings[key] = usd_value
+    save_settings(settings)
+
+
+def get_pot_deposit_sgd(pot: str, portfolio: str = "Income Wheel") -> float:
+    """Get SGD deposit for a specific pot."""
+    settings = load_settings()
+    portfolio_key = get_portfolio_key(portfolio)
+    key = f"{portfolio_key}_pot_{pot.lower()}_deposit_sgd"
+    return float(settings.get(key, 0.0))
+
+
+def save_pot_deposit_sgd(pot: str, sgd_value: float, portfolio: str = "Income Wheel"):
+    """Save SGD deposit for a specific pot."""
+    settings = load_settings()
+    portfolio_key = get_portfolio_key(portfolio)
+    key = f"{portfolio_key}_pot_{pot.lower()}_deposit_sgd"
+    settings[key] = sgd_value
+    save_settings(settings)
+
+
+def get_pot_capital_allocation(pot: str, portfolio: str = "Income Wheel") -> Dict[str, float]:
+    """Get per-ticker $ allocation for a specific pot."""
+    settings = load_settings()
+    portfolio_key = get_portfolio_key(portfolio)
+    key = f"{portfolio_key}_pot_{pot.lower()}_capital_allocation"
+    return settings.get(key, {})
+
+
+def save_pot_capital_allocation(pot: str, allocation: Dict[str, float], portfolio: str = "Income Wheel"):
+    """Save per-ticker $ allocation for a specific pot."""
+    settings = load_settings()
+    portfolio_key = get_portfolio_key(portfolio)
+    key = f"{portfolio_key}_pot_{pot.lower()}_capital_allocation"
+    settings[key] = allocation
+    save_settings(settings)
+
+
 def get_stock_average_prices(portfolio: str = "Income Wheel") -> Dict[str, float]:
     """Get saved stock average prices by ticker for the specified portfolio"""
     settings = load_settings()

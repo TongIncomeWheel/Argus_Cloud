@@ -611,18 +611,64 @@ def render_sidebar():
 def render_dashboard():
     """Render main dashboard"""
     st.title("📊 Dashboard")
-    
+
     df_open = st.session_state.df_open
     df_trades = st.session_state.df_trades
-    
+
     if df_open is None or df_open.empty:
         st.warning("No open positions found.")
         return
-    
+
     # Always use current portfolio's persisted values (never stale from previous selection)
     portfolio = st.session_state.get('current_portfolio', 'Income Wheel')
-    st.session_state.portfolio_deposit = get_portfolio_deposit(portfolio)
-    portfolio_deposit = st.session_state.portfolio_deposit
+
+    # ── POT SELECTOR ────────────────────────────────────────────
+    from unified_calculations import filter_by_pot, POT_BASE, POT_ACTIVE
+    from persistence import get_pot_deposit, get_pot_capital_allocation
+    _pot_col, _ = st.columns([2, 5])
+    with _pot_col:
+        pot_view = st.radio(
+            "Pot View",
+            ["All Pots", "🏛️ Base Pot", "⚡ Active Income Pot"],
+            horizontal=True,
+            key="dashboard_pot_view"
+        )
+
+    # Determine pot scope
+    if pot_view == "🏛️ Base Pot":
+        df_open = filter_by_pot(df_open, POT_BASE)
+        df_trades = filter_by_pot(df_trades, POT_BASE)
+        portfolio_deposit = get_pot_deposit(POT_BASE, portfolio)
+        capital_allocation_for_view = get_pot_capital_allocation(POT_BASE, portfolio)
+        pot_label = "Base Pot"
+    elif pot_view == "⚡ Active Income Pot":
+        df_open = filter_by_pot(df_open, POT_ACTIVE)
+        df_trades = filter_by_pot(df_trades, POT_ACTIVE)
+        portfolio_deposit = get_pot_deposit(POT_ACTIVE, portfolio)
+        capital_allocation_for_view = get_pot_capital_allocation(POT_ACTIVE, portfolio)
+        pot_label = "Active Income Pot"
+    else:
+        # All Pots: total of both deposits
+        portfolio_deposit = get_pot_deposit(POT_BASE, portfolio) + get_pot_deposit(POT_ACTIVE, portfolio)
+        if portfolio_deposit == 0:
+            # Fallback to legacy single deposit
+            portfolio_deposit = get_portfolio_deposit(portfolio)
+        # Combined allocation = base + active
+        base_alloc = get_pot_capital_allocation(POT_BASE, portfolio)
+        active_alloc = get_pot_capital_allocation(POT_ACTIVE, portfolio)
+        capital_allocation_for_view = {}
+        for t, v in base_alloc.items():
+            capital_allocation_for_view[t] = capital_allocation_for_view.get(t, 0) + v
+        for t, v in active_alloc.items():
+            capital_allocation_for_view[t] = capital_allocation_for_view.get(t, 0) + v
+        pot_label = "All Pots"
+
+    # Defensive: if pot has no positions, bail gracefully
+    if df_open is None or df_open.empty:
+        st.info(f"No open positions in {pot_label}.")
+        return
+
+    st.session_state.portfolio_deposit = portfolio_deposit
     
     # Get live prices for capital calculation (Yahoo Finance - always available)
     tickers = df_open['Ticker'].unique().tolist()
@@ -790,8 +836,8 @@ def render_dashboard():
     if bp < 0:
         st.error(f"🔴 **BUYING POWER NEGATIVE: ${bp:,.0f}** — Do NOT sell new CSPs until capital is freed.")
 
-    # Per-ticker threshold alerts
-    capital_allocation = get_capital_allocation(portfolio)
+    # Per-ticker threshold alerts (use pot-scoped allocation)
+    capital_allocation = capital_allocation_for_view
     for ticker, ticker_data in capital_data['by_ticker'].items():
         ticker_total = ticker_data.get('total_committed', 0)
         ticker_cap = capital_allocation.get(ticker, 0)
@@ -5002,197 +5048,179 @@ def render_margin_config():
     
     st.divider()
     
-    # Portfolio Deposit Section
-    st.subheader("💰 Portfolio Deposit")
-    st.write("Enter portfolio deposit in SGD and FX rate. USD amount is auto-calculated for capital calculations.")
-    
-    # Load SGD and FX rate from persistence (already loaded above, but ensure they're set)
-    if 'portfolio_deposit_sgd' not in st.session_state:
-        st.session_state.portfolio_deposit_sgd = get_portfolio_deposit_sgd(portfolio)
+    # ── POT DEPOSITS (Base + Active Income) ──────────────────────
+    st.subheader("💰 Pot Deposits")
+    st.caption(
+        "Two pots: **Base** (WHEEL/PMCC strategies) and **Active Income** (ActiveCore strategy). "
+        "Pot is auto-derived from StrategyType on each trade. Total = sum of both pots."
+    )
+
+    from persistence import (
+        get_pot_deposit, save_pot_deposit,
+        get_pot_deposit_sgd, save_pot_deposit_sgd,
+        get_pot_capital_allocation, save_pot_capital_allocation,
+    )
+
     if 'sgd_usd_fx_rate' not in st.session_state:
         st.session_state.sgd_usd_fx_rate = get_fx_rate(portfolio)
-    
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        portfolio_deposit_sgd = st.number_input(
-            "Portfolio Deposit (SGD)", 
-            min_value=0.0, 
-            value=float(st.session_state.portfolio_deposit_sgd),
-            step=1000.0,
-            help="Total cash deposited in portfolio in SGD",
-            key="portfolio_deposit_sgd_input"
-        )
-    
-    with col2:
+
+    # FX rate input (shared)
+    _fx_col, _ = st.columns([1, 3])
+    with _fx_col:
         sgd_usd_fx_rate = st.number_input(
-            "SGD/USD FX Rate", 
-            min_value=0.01, 
+            "SGD/USD FX Rate",
+            min_value=0.01,
             value=float(st.session_state.sgd_usd_fx_rate),
             step=0.01,
             format="%.4f",
-            help="Exchange rate: 1 USD = X SGD (e.g., 1.35 means 1 USD = 1.35 SGD)",
+            help="1 USD = X SGD (e.g., 1.35)",
             key="sgd_usd_fx_rate_input"
         )
-    
-    # Calculate USD amount: USD = SGD / FX_RATE
-    # If FX rate is 1.35, it means 1 USD = 1.35 SGD, so USD = SGD / 1.35
-    portfolio_deposit_usd = portfolio_deposit_sgd / sgd_usd_fx_rate if sgd_usd_fx_rate > 0 else 0.0
-    
-    with col3:
-        st.metric("Portfolio Deposit (USD)", f"${portfolio_deposit_usd:,.0f}", 
-                  help="Auto-calculated: SGD ÷ FX Rate. This USD amount is used for all capital calculations.")
-    
-    # Save if values changed
-    portfolio = st.session_state.get('current_portfolio', 'Income Wheel')
-    if portfolio_deposit_sgd != st.session_state.portfolio_deposit_sgd:
-        st.session_state.portfolio_deposit_sgd = portfolio_deposit_sgd
-        save_portfolio_deposit_sgd(portfolio_deposit_sgd, portfolio)
-    
+
     if sgd_usd_fx_rate != st.session_state.sgd_usd_fx_rate:
         st.session_state.sgd_usd_fx_rate = sgd_usd_fx_rate
         save_fx_rate(sgd_usd_fx_rate, portfolio)
-    
-    # Always save USD amount (recalculated)
-    if portfolio_deposit_usd != st.session_state.portfolio_deposit:
-        st.session_state.portfolio_deposit = portfolio_deposit_usd
-        save_portfolio_deposit(portfolio_deposit_usd, portfolio)
-        st.toast("Portfolio deposit saved.", icon="✅")
-        st.success("✅ Portfolio deposit saved!")
-    
+
+    # Two-column layout: Base | Active
+    pot_col_base, pot_col_active = st.columns(2)
+
+    with pot_col_base:
+        st.markdown("**🏛️ Base Pot** (WHEEL + PMCC)")
+        _base_sgd = st.number_input(
+            "Base Pot (SGD)",
+            min_value=0.0,
+            value=float(get_pot_deposit_sgd('Base', portfolio)),
+            step=1000.0,
+            help="Cash deposited into the Base Pot (Wheel + PMCC)",
+            key="pot_base_sgd_input"
+        )
+        _base_usd = _base_sgd / sgd_usd_fx_rate if sgd_usd_fx_rate > 0 else 0.0
+        st.metric("Base Pot (USD)", f"${_base_usd:,.0f}")
+        # Save if changed
+        if _base_sgd != get_pot_deposit_sgd('Base', portfolio):
+            save_pot_deposit_sgd('Base', _base_sgd, portfolio)
+        if _base_usd != get_pot_deposit('Base', portfolio):
+            save_pot_deposit('Base', _base_usd, portfolio)
+
+    with pot_col_active:
+        st.markdown("**⚡ Active Income Pot** (ActiveCore)")
+        _active_sgd = st.number_input(
+            "Active Pot (SGD)",
+            min_value=0.0,
+            value=float(get_pot_deposit_sgd('Active', portfolio)),
+            step=1000.0,
+            help="Cash deposited into the Active Income Pot (ActiveCore)",
+            key="pot_active_sgd_input"
+        )
+        _active_usd = _active_sgd / sgd_usd_fx_rate if sgd_usd_fx_rate > 0 else 0.0
+        st.metric("Active Pot (USD)", f"${_active_usd:,.0f}")
+        if _active_sgd != get_pot_deposit_sgd('Active', portfolio):
+            save_pot_deposit_sgd('Active', _active_sgd, portfolio)
+        if _active_usd != get_pot_deposit('Active', portfolio):
+            save_pot_deposit('Active', _active_usd, portfolio)
+
+    # Total
+    total_deposit_usd = _base_usd + _active_usd
+    total_deposit_sgd = _base_sgd + _active_sgd
+    st.metric("**Total Portfolio (USD)**",
+               f"${total_deposit_usd:,.0f}",
+               delta=f"SGD {total_deposit_sgd:,.0f}",
+               help="Sum of both pots — drives all dashboard calculations")
+
+    # Maintain backward compatibility: write total to legacy keys so existing code still works
+    if total_deposit_usd != st.session_state.get('portfolio_deposit', 0):
+        st.session_state.portfolio_deposit = total_deposit_usd
+        save_portfolio_deposit(total_deposit_usd, portfolio)
+    if total_deposit_sgd != st.session_state.get('portfolio_deposit_sgd', 0):
+        st.session_state.portfolio_deposit_sgd = total_deposit_sgd
+        save_portfolio_deposit_sgd(total_deposit_sgd, portfolio)
+
     st.divider()
-    
-    # Capital Allocation Section
-    st.subheader("💵 Capital Allocation by Counter")
-    st.write("Enter percentage allocation for each counter (ticker). Capital allocated in $ is auto-calculated from portfolio deposit. You can add or remove counters.")
-    
-    # Ensure capital allocation is loaded from persistence (refresh on each page load)
-    portfolio = st.session_state.get('current_portfolio', 'Income Wheel')
-    st.session_state.capital_allocation = get_capital_allocation(portfolio)
-    capital_allocation = st.session_state.capital_allocation.copy()
-    
-    # Get portfolio deposit for calculation
-    portfolio_deposit = st.session_state.portfolio_deposit
-    
-    # Get all unique tickers from open positions
-    df_open = st.session_state.df_open
-    if df_open is not None and not df_open.empty:
-        existing_tickers = sorted(df_open['Ticker'].unique().tolist())
-    else:
-        existing_tickers = []
-    
-    # Add existing tickers to allocation if not present
-    for ticker in existing_tickers:
-        if ticker not in capital_allocation:
-            capital_allocation[ticker] = 0.0
-    
-    # Calculate percentages from current allocations
-    allocation_percentages = {}
-    for ticker, capital in capital_allocation.items():
-        if portfolio_deposit > 0:
-            allocation_percentages[ticker] = (capital / portfolio_deposit) * 100
-        else:
-            allocation_percentages[ticker] = 0.0
-    
-    # Display current allocations
-    allocation_data = []
-    for ticker in sorted(capital_allocation.keys()):
-        pct = allocation_percentages.get(ticker, 0.0)
-        capital = capital_allocation.get(ticker, 0.0)
-        allocation_data.append({
-            'Ticker': ticker,
-            'Allocation %': pct,
-            'Capital Allocated ($)': capital
-        })
-    
-    if allocation_data:
-        df_allocation = pd.DataFrame(allocation_data)
-        
-        # Editable table
-        edited_allocation = st.data_editor(
-            df_allocation,
+
+    # ── PER-POT CAPITAL ALLOCATION ──────────────────────────────
+    st.subheader("💵 Capital Allocation by Pot & Ticker")
+    st.caption("Each pot has its own allocation. % is of that pot's deposit. Add tickers as needed.")
+
+    df_open_for_alloc = st.session_state.df_open
+    existing_tickers = sorted(df_open_for_alloc['Ticker'].unique().tolist()) if (df_open_for_alloc is not None and not df_open_for_alloc.empty) else []
+
+    def _render_pot_allocation_editor(pot_name: str, pot_deposit: float, key_prefix: str):
+        """Render allocation editor for one pot."""
+        alloc = get_pot_capital_allocation(pot_name, portfolio).copy()
+        # Add tickers from positions if missing (only those in this pot)
+        for t in existing_tickers:
+            if t not in alloc:
+                alloc[t] = 0.0
+
+        rows = []
+        for t in sorted(alloc.keys()):
+            cap = alloc.get(t, 0.0)
+            pct = (cap / pot_deposit * 100) if pot_deposit > 0 else 0.0
+            rows.append({'Ticker': t, 'Allocation %': pct, 'Capital Allocated ($)': cap})
+
+        if not rows:
+            st.info(f"No tickers configured for {pot_name} pot. Add tickers below.")
+            rows = [{'Ticker': '', 'Allocation %': 0.0, 'Capital Allocated ($)': 0.0}]
+
+        df_a = pd.DataFrame(rows)
+        edited = st.data_editor(
+            df_a,
             column_config={
                 "Ticker": st.column_config.TextColumn("Ticker", width="small"),
-                "Allocation %": st.column_config.NumberColumn(
-                    "Allocation %",
-                    min_value=0.0,
-                    max_value=100.0,
-                    step=0.1,
-                    format="%.1f%%",
-                    help="Enter percentage allocation for this counter"
-                ),
-                "Capital Allocated ($)": st.column_config.NumberColumn(
-                    "Capital Allocated ($)",
-                    min_value=0.0,
-                    step=1000.0,
-                    format="$%d",
-                    help="Auto-calculated from percentage × portfolio deposit. You can manually override this value."
-                )
+                "Allocation %": st.column_config.NumberColumn("% of Pot", min_value=0.0, max_value=100.0, step=0.1, format="%.1f%%"),
+                "Capital Allocated ($)": st.column_config.NumberColumn("Allocated $", min_value=0.0, step=1000.0, format="$%d"),
             },
-            hide_index=True,
-            use_container_width=True,
-            key="capital_allocation_table",
-            num_rows="dynamic"  # Allow adding/removing rows
+            hide_index=True, use_container_width=True, num_rows="dynamic",
+            key=f"{key_prefix}_alloc_editor"
         )
-        
-        # Auto-update capital allocated when percentage changes
-        # Store previous values to detect changes
-        if 'prev_allocation_pct' not in st.session_state:
-            st.session_state.prev_allocation_pct = allocation_percentages.copy()
-        
-        # Update capital based on percentage changes
-        updated_df = edited_allocation.copy()
-        for idx, row in updated_df.iterrows():
-            ticker = str(row['Ticker']).strip().upper()
-            if ticker:
-                pct = float(row['Allocation %'])
-                calculated_capital = (pct / 100.0) * portfolio_deposit if portfolio_deposit > 0 else 0.0
-                current_capital = float(row['Capital Allocated ($)'])
-                
-                # Check if percentage changed from previous value
-                prev_pct = st.session_state.prev_allocation_pct.get(ticker, 0.0)
-                
-                # If percentage changed, update capital to calculated value
-                if abs(pct - prev_pct) > 0.01:  # Percentage changed
-                    updated_df.at[idx, 'Capital Allocated ($)'] = calculated_capital
-                # If capital was manually edited (doesn't match calculated from current %), keep it
-                elif abs(current_capital - calculated_capital) > 10.0:  # User manually overrode
-                    # Keep the manually entered value
-                    pass
-                else:
-                    # Update to match current percentage (in case portfolio deposit changed)
-                    updated_df.at[idx, 'Capital Allocated ($)'] = calculated_capital
-        
-        # Update session state with new percentages
-        new_allocation_pct = {}
-        for _, row in updated_df.iterrows():
-            ticker = str(row['Ticker']).strip().upper()
-            if ticker:
-                new_allocation_pct[ticker] = float(row['Allocation %'])
-        st.session_state.prev_allocation_pct = new_allocation_pct
-        
-        # Update capital allocation from edited table
-        updated_allocation = {}
-        for _, row in updated_df.iterrows():
-            ticker = str(row['Ticker']).strip().upper()
-            if ticker:
-                updated_allocation[ticker] = float(row['Capital Allocated ($)'])
-        
-        if updated_allocation != capital_allocation:
-            st.session_state.capital_allocation = updated_allocation
-            portfolio = st.session_state.get('current_portfolio', 'Income Wheel')
-            save_capital_allocation(updated_allocation, portfolio)
-            st.toast("Capital allocation saved.", icon="✅")
-            st.success("✅ Capital allocation saved!")
-        
-        # Show auto-calculation info
-        if portfolio_deposit > 0:
-            total_pct = updated_df['Allocation %'].sum()
-            if total_pct > 100.0:
-                st.warning(f"⚠️ Total allocation percentage is {total_pct:.1f}% (exceeds 100%)")
-            elif total_pct < 100.0:
-                st.info(f"ℹ️ Total allocation percentage is {total_pct:.1f}% (remaining: {100.0 - total_pct:.1f}%)")
+
+        # Process edits: if % changed, recalc $; if $ changed, recalc %
+        prev_key = f"{key_prefix}_prev_pct"
+        prev_pcts = st.session_state.get(prev_key, {t: r['Allocation %'] for t, r in zip(df_a['Ticker'], rows)})
+        updated_alloc = {}
+        for _, row in edited.iterrows():
+            t = str(row['Ticker']).strip().upper()
+            if not t:
+                continue
+            pct = float(row['Allocation %'] or 0)
+            cap = float(row['Capital Allocated ($)'] or 0)
+            prev = prev_pcts.get(t, 0.0)
+            # If % changed, $ follows
+            if abs(pct - prev) > 0.01:
+                cap = (pct / 100.0) * pot_deposit
+            updated_alloc[t] = cap
+        st.session_state[prev_key] = {t: (v / pot_deposit * 100 if pot_deposit > 0 else 0) for t, v in updated_alloc.items()}
+
+        if updated_alloc != alloc:
+            save_pot_capital_allocation(pot_name, updated_alloc, portfolio)
+            st.toast(f"{pot_name} pot allocation saved.", icon="✅")
+
+        # Total %
+        if pot_deposit > 0:
+            total_pct = sum(v / pot_deposit * 100 for v in updated_alloc.values())
+            if total_pct > 100:
+                st.warning(f"⚠️ {pot_name} total: {total_pct:.1f}% (exceeds 100%)")
+            else:
+                st.caption(f"{pot_name} total: {total_pct:.1f}% allocated, {100-total_pct:.1f}% unallocated (OTHERS)")
+
+        return updated_alloc
+
+    pot_alloc_col1, pot_alloc_col2 = st.columns(2)
+    with pot_alloc_col1:
+        st.markdown(f"**🏛️ Base Pot — ${_base_usd:,.0f}**")
+        _base_alloc = _render_pot_allocation_editor('Base', _base_usd, 'base')
+    with pot_alloc_col2:
+        st.markdown(f"**⚡ Active Income Pot — ${_active_usd:,.0f}**")
+        _active_alloc = _render_pot_allocation_editor('Active', _active_usd, 'active')
+
+    # Maintain backward compatibility: combined allocation = base + active
+    combined = {}
+    for t, v in _base_alloc.items():
+        combined[t] = combined.get(t, 0) + v
+    for t, v in _active_alloc.items():
+        combined[t] = combined.get(t, 0) + v
+    save_capital_allocation(combined, portfolio)
+    st.session_state.capital_allocation = combined
     
     st.divider()
     

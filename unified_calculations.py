@@ -11,6 +11,35 @@ from data_schema import get_field_name
 from config import WEEKLY_TARGET_PCT, TRADING_DAYS_PER_WEEK
 
 
+# ─────────────────────────────────────────────
+# POT MAPPING — derived from StrategyType
+# Base Pot:   WHEEL, PMCC, blank/NaN
+# Active Pot: ActiveCore
+# ─────────────────────────────────────────────
+POT_BASE = "Base"
+POT_ACTIVE = "Active"
+
+
+def get_pot_for_strategy(strategy_type) -> str:
+    """Return 'Base' or 'Active' based on StrategyType value."""
+    if strategy_type is None:
+        return POT_BASE
+    s = str(strategy_type).strip()
+    if s.lower() in ('activecore', 'active', 'active core'):
+        return POT_ACTIVE
+    return POT_BASE
+
+
+def filter_by_pot(df: pd.DataFrame, pot: str) -> pd.DataFrame:
+    """Filter a trades DataFrame to a single pot ('Base' or 'Active')."""
+    if df is None or df.empty or 'StrategyType' not in df.columns:
+        return df
+    if pot == POT_ACTIVE:
+        return df[df['StrategyType'].astype(str).str.strip().str.lower().isin(['activecore', 'active', 'active core'])].copy()
+    else:  # Base
+        return df[~df['StrategyType'].astype(str).str.strip().str.lower().isin(['activecore', 'active', 'active core'])].copy()
+
+
 class UnifiedCapitalCalculator:
     """Single source of truth for all capital calculations"""
     
