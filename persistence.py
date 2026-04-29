@@ -25,9 +25,13 @@ def get_portfolio_key(portfolio: str = "Income Wheel") -> str:
     return portfolio_key_map.get(portfolio, portfolio.lower().replace(" ", "_"))
 
 
+_SETTINGS_CACHE = None  # in-memory cache to avoid repeated GSheet reads
+
 def load_settings() -> Dict:
     """Load user settings from JSON file. Falls back to Google Sheets cloud
     backup when local file is missing or empty (e.g. Streamlit Cloud restart)."""
+    global _SETTINGS_CACHE
+
     if PERSISTENCE_FILE.exists():
         try:
             with open(PERSISTENCE_FILE, 'r') as f:
@@ -37,17 +41,39 @@ def load_settings() -> Dict:
         except Exception as e:
             logger.warning(f"Could not load settings: {e}")
 
-    # Local file missing/empty — try cloud restore
+    # Use in-memory cache if already loaded from cloud (avoids repeated API calls)
+    if _SETTINGS_CACHE is not None:
+        return _SETTINGS_CACHE
+
+    # Local file missing/empty — try cloud restore from Settings tab
     try:
         from config import INCOME_WHEEL_SHEET_ID
-        from gsheet_handler import GSheetHandler, load_settings_from_cloud
+        from gsheet_handler import GSheetHandler
         if INCOME_WHEEL_SHEET_ID:
             handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
-            cloud_settings = load_settings_from_cloud(handler)
-            if cloud_settings:
-                logger.info("Auto-restored settings from Google Sheets cloud backup")
-                save_settings(cloud_settings)  # Cache locally
-                return cloud_settings
+            cloud_raw = handler.read_settings()
+            if cloud_raw:
+                # Settings tab stores keys without portfolio prefix.
+                # Promote to income_wheel_* prefix so persistence functions find them.
+                normalized = {}
+                portfolio_key = 'income_wheel'
+                for k, v in cloud_raw.items():
+                    # Already prefixed?
+                    if k.startswith(f'{portfolio_key}_') or k.startswith('active_core_'):
+                        normalized[k] = v
+                    else:
+                        # Map raw -> prefixed
+                        normalized[f'{portfolio_key}_{k}'] = v
+                        # Also keep raw for backward compat
+                        normalized[k] = v
+                _SETTINGS_CACHE = normalized
+                logger.info(f"Auto-restored {len(normalized)} settings from Google Sheets")
+                # Try to save locally (may fail on read-only Cloud filesystem — that's OK)
+                try:
+                    save_settings(normalized)
+                except Exception:
+                    pass
+                return normalized
     except Exception as e:
         logger.debug(f"Cloud settings auto-load skipped: {e}")
 
@@ -55,14 +81,18 @@ def load_settings() -> Dict:
 
 
 def save_settings(settings: Dict):
-    """Save user settings to JSON file"""
+    """Save user settings to JSON file (and GSheet on Cloud)."""
+    global _SETTINGS_CACHE
+    _SETTINGS_CACHE = settings  # always update in-memory cache
+
+    # Try local file write (fails silently on read-only Cloud filesystem)
     try:
         PERSISTENCE_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(PERSISTENCE_FILE, 'w') as f:
             json.dump(settings, f, indent=2)
         logger.info(f"Settings saved to {PERSISTENCE_FILE}")
     except Exception as e:
-        logger.error(f"Could not save settings: {e}")
+        logger.warning(f"Local settings save failed (may be Cloud filesystem): {e}")
 
 
 def get_portfolio_deposit(portfolio: str = "Income Wheel") -> float:
