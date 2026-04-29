@@ -494,30 +494,10 @@ def render_sidebar():
     st.markdown(sidebar_css, unsafe_allow_html=True)
     
     with st.sidebar:
-        # Portfolio Selector (Collapsible)
-        with st.expander("📊 Portfolio Selection", expanded=False):
-            portfolio = st.radio(
-                "Select Portfolio",
-                ["🎡 Income Wheel", "⭐ Active Core"],
-                key="portfolio_selector",
-                label_visibility="collapsed"
-            )
-            
-            # Update session state
-            if 'selected_portfolio' not in st.session_state:
-                st.session_state.selected_portfolio = portfolio
-            elif st.session_state.selected_portfolio != portfolio:
-                st.session_state.selected_portfolio = portfolio
-                # Clear cache when switching portfolios
-                st.cache_data.clear()
-                st.session_state.data_loaded = False
-            
-            # Portfolio-specific title
-            if portfolio == "⭐ Active Core":
-                st.caption("⭐ Active Core")
-            else:
-                st.caption("🎡 Income Wheel")
-        
+        # Single portfolio (Income Wheel) — Active Core retired in favor of two-pot architecture
+        portfolio = "🎡 Income Wheel"
+        st.session_state.selected_portfolio = portfolio
+
         # Navigation (Collapsible)
         with st.expander("🧭 Navigation", expanded=False):
             page = st.radio(
