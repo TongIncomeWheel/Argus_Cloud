@@ -408,7 +408,8 @@ class GSheetHandler:
     # ------------------------------------------------------------------
     def read_settings(self) -> dict:
         """Read key-value settings from a 'Settings' worksheet.
-        Returns dict of {key: value}. Creates the tab if it doesn't exist.
+        All values are stored as JSON-encoded strings on write. We try to
+        parse every value as JSON; if it fails, we keep it as a string.
         """
         try:
             try:
@@ -418,17 +419,24 @@ class GSheetHandler:
                 ws.update('A1:B1', [['Key', 'Value']])
                 return {}
 
-            records = ws.get_all_records()
+            # Read raw values to avoid get_all_records() type coercion
+            all_vals = ws.get_all_values()
             settings = {}
-            for r in records:
-                key = r.get('Key', '')
-                val = r.get('Value', '')
-                if key:
-                    # Try to parse JSON values (for dicts/lists)
-                    try:
-                        settings[key] = json.loads(val) if isinstance(val, str) and val.startswith('{') else val
-                    except (json.JSONDecodeError, TypeError):
-                        settings[key] = val
+            for i, row in enumerate(all_vals):
+                if i == 0:
+                    continue  # header
+                if not row or len(row) < 2:
+                    continue
+                key = str(row[0]).strip()
+                val = str(row[1]) if row[1] is not None else ''
+                if not key or key.lower() == 'key':
+                    continue
+                # Try JSON parse for any value (dicts, lists, numbers, bools, null)
+                try:
+                    settings[key] = json.loads(val)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    # Not JSON — keep as string
+                    settings[key] = val
             return settings
         except Exception as e:
             logger.warning(f"Error reading Settings: {e}")
@@ -436,7 +444,8 @@ class GSheetHandler:
 
     def write_settings(self, settings: dict) -> bool:
         """Write key-value settings to the 'Settings' worksheet.
-        Overwrites all existing settings.
+        ALL values written as JSON-encoded strings to prevent Sheets from
+        auto-interpreting numbers as dates, etc. Read path mirrors this.
         """
         try:
             try:
@@ -446,14 +455,17 @@ class GSheetHandler:
 
             rows = [['Key', 'Value']]
             for key, val in settings.items():
-                # Serialize dicts/lists as JSON
-                if isinstance(val, (dict, list)):
-                    rows.append([key, json.dumps(val)])
-                else:
-                    rows.append([key, _serialize_value(val)])
+                if isinstance(val, set):
+                    val = list(val)  # JSON can't serialize sets
+                try:
+                    encoded = json.dumps(val)
+                except (TypeError, ValueError):
+                    encoded = json.dumps(str(val))
+                rows.append([key, encoded])
 
             ws.clear()
-            ws.update(f'A1:B{len(rows)}', rows, value_input_option='USER_ENTERED')
+            # RAW prevents Sheets from auto-interpreting strings (e.g. "495703.8" as date)
+            ws.update(values=rows, range_name=f'A1:B{len(rows)}', value_input_option='RAW')
             logger.info(f"Settings saved: {len(settings)} keys")
             return True
         except Exception as e:
