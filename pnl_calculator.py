@@ -123,84 +123,107 @@ class PnLCalculator:
     def calculate_unrealized_leap_pnl(
         df_open: pd.DataFrame,
         live_prices: Dict[str, float],
-        spy_leap_pl: Optional[float] = None
+        spy_leap_pl: Optional[float] = None,
+        live_options: Optional[list] = None,
     ) -> Dict[str, float]:
         """
-        Calculate unrealized P&L for LEAP positions
-        
+        Calculate unrealized P&L for LEAP positions using live mark-to-market
+        when Alpaca data is available, falling back to intrinsic-only.
+
+        Priority order per LEAP:
+          1. Live mid-price from Alpaca (if `live_options` has a match) — TRUE MTM
+          2. Manual spy_leap_pl override (SPY only) — kept for back-compat
+          3. Intrinsic value: max(0, spot - strike) * 100 * qty — conservative
+
         Args:
             df_open: Open positions DataFrame
             live_prices: Current market prices by ticker
-            spy_leap_pl: Manual SPY LEAP P&L entry (if available)
-        
+            spy_leap_pl: Manual SPY LEAP P&L entry (back-compat)
+            live_options: List of OptionsContract objects from Alpaca
+                          (passed via st.session_state.open_positions_data)
+
         Returns:
             Dict with 'total', 'by_ticker' keys
         """
         if df_open is None or df_open.empty:
             return {'total': 0.0, 'by_ticker': {}}
-        
-        # Filter to LEAP positions only
+
         trade_type_col = get_field_name('trade_type', 'identity')
         leap_positions = df_open[df_open[trade_type_col] == 'LEAP'].copy()
-        
+
         if leap_positions.empty:
             return {'total': 0.0, 'by_ticker': {}}
-        
+
+        # Build live-options lookup: (ticker, strike, right, expiry) -> mid_price
+        live_lookup = {}
+        if live_options:
+            for c in live_options:
+                try:
+                    mid = c.last_price if c.last_price > 0 else (c.bid + c.ask) / 2
+                    if mid > 0:
+                        key = (c.underlying, float(c.strike), c.right, str(c.expiry))
+                        live_lookup[key] = mid
+                except Exception:
+                    continue
+
         by_ticker = {}
         total_unrealized = 0.0
-        
-        # Group by ticker
+
         ticker_col = get_field_name('ticker', 'identity')
         for ticker in leap_positions[ticker_col].unique():
             ticker_leaps = leap_positions[leap_positions[ticker_col] == ticker]
-            
-            # Special handling for SPY LEAP (use manual entry if available)
-            if ticker == 'SPY' and spy_leap_pl is not None:
-                by_ticker[ticker] = spy_leap_pl
-                total_unrealized += spy_leap_pl
-                continue
-            
-            # Calculate LEAP P&L for other tickers
             ticker_leap_pl = 0.0
+            used_live_mtm_for_ticker = False
+
             for idx in ticker_leaps.index:
                 pos_idx = ticker_leaps.index.get_loc(idx)
-                
-                # Get LEAP cost
+
                 premium_per_share = DataAccess.get_trade_field(
                     ticker_leaps, pos_idx, 'premium_per_share', 'options', 0
                 )
                 contracts = DataAccess.get_contracts_for_option(ticker_leaps, pos_idx)
-                
+
                 if premium_per_share == 0 or contracts == 0:
-                    # Missing premium data - can't calculate
-                    continue
-                
-                leap_cost = premium_per_share * 100 * contracts
-                
-                # Get current underlying price
-                current_price = float(pd.to_numeric(live_prices.get(ticker, 0), errors='coerce') or 0)
-                if current_price == 0:
                     continue
 
-                # Get strike
+                leap_cost = premium_per_share * 100 * contracts
+                contracts = float(pd.to_numeric(contracts, errors='coerce') or 0)
+
                 strike = float(pd.to_numeric(DataAccess.get_trade_field(
                     ticker_leaps, pos_idx, 'strike', 'options', 0
                 ), errors='coerce') or 0)
-
                 if strike == 0:
                     continue
 
-                contracts = float(pd.to_numeric(contracts, errors='coerce') or 0)
+                # Try Alpaca live mid-price first (LEAPs are long calls)
+                expiry_raw = DataAccess.get_trade_field(ticker_leaps, pos_idx, 'expiry_date', 'options', None)
+                expiry_str = pd.to_datetime(expiry_raw, errors='coerce').strftime('%Y-%m-%d') if pd.notna(pd.to_datetime(expiry_raw, errors='coerce')) else ''
+                live_key = (ticker, strike, 'C', expiry_str)
+                live_mid = live_lookup.get(live_key)
 
-                # Calculate intrinsic value (conservative - ignores time value)
-                intrinsic_value = max(0, current_price - strike) * 100 * contracts
-                leap_pl = intrinsic_value - leap_cost
+                if live_mid and live_mid > 0:
+                    # TRUE mark-to-market
+                    leap_mtm_value = live_mid * 100 * contracts
+                    leap_pl = leap_mtm_value - leap_cost
+                    used_live_mtm_for_ticker = True
+                else:
+                    # Fallback to intrinsic
+                    current_price = float(pd.to_numeric(live_prices.get(ticker, 0), errors='coerce') or 0)
+                    if current_price == 0:
+                        continue
+                    intrinsic_value = max(0, current_price - strike) * 100 * contracts
+                    leap_pl = intrinsic_value - leap_cost
+
                 ticker_leap_pl += leap_pl
-            
+
+            # If user provided manual spy_leap_pl AND we couldn't compute MTM, honor it
+            if ticker == 'SPY' and not used_live_mtm_for_ticker and spy_leap_pl is not None and spy_leap_pl != 0:
+                ticker_leap_pl = spy_leap_pl
+
             if ticker_leap_pl != 0:
                 by_ticker[ticker] = ticker_leap_pl
                 total_unrealized += ticker_leap_pl
-        
+
         return {
             'total': total_unrealized,
             'by_ticker': by_ticker
@@ -212,7 +235,8 @@ class PnLCalculator:
         df_open: pd.DataFrame,
         stock_avg_prices: Dict[str, float],
         live_prices: Dict[str, float],
-        spy_leap_pl: Optional[float] = None
+        spy_leap_pl: Optional[float] = None,
+        live_options: Optional[list] = None,
     ) -> Dict:
         """
         Calculate comprehensive P&L breakdown
@@ -234,9 +258,9 @@ class PnLCalculator:
             df_open, stock_avg_prices, live_prices
         )
         
-        # Unrealized LEAP P&L
+        # Unrealized LEAP P&L (pass live_options for true MTM via Alpaca)
         unrealized_leap = PnLCalculator.calculate_unrealized_leap_pnl(
-            df_open, live_prices, spy_leap_pl
+            df_open, live_prices, spy_leap_pl, live_options
         )
         
         # Total unrealized

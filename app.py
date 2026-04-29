@@ -816,12 +816,15 @@ def render_dashboard():
     from pnl_calculator import PnLCalculator
     from persistence import get_spy_leap_pl
     spy_leap_pl = get_spy_leap_pl(portfolio)
+    # Pass live options data (Alpaca) so LEAP P&L uses TRUE mark-to-market
+    _live_options = st.session_state.get("open_positions_data", [])
     comprehensive_pnl = PnLCalculator.calculate_comprehensive_pnl(
         df_trades=df_trades,
         df_open=df_open,
         stock_avg_prices=stock_avg_prices,
         live_prices=live_prices,
-        spy_leap_pl=spy_leap_pl if spy_leap_pl != 0 else None
+        spy_leap_pl=spy_leap_pl if spy_leap_pl != 0 else None,
+        live_options=_live_options,
     )
     # Realized P&L from all closed trades (CC, CSP, LEAP, STOCK)
     premium_collected_by_ticker = {}
@@ -915,9 +918,22 @@ def render_dashboard():
                    f"${total_stock_at_current:,.0f}",
                    help="Current market value of stock holdings")
     with nav_col3:
-        st.metric("LEAP at Cost",
-                   f"${total_leap_sunk:,.0f}",
-                   help="Premium paid for LEAPs (intrinsic-only valuation)")
+        # LEAP MTM = LEAP cost + LEAP unrealized P&L. If live options data
+        # was fetched from Alpaca, this is TRUE market value. Otherwise it's
+        # cost basis with intrinsic-only adjustment.
+        _leap_unrealized = comprehensive_pnl['unrealized_leap_pnl']['total']
+        leap_mtm = total_leap_sunk + _leap_unrealized
+        _has_alpaca = bool(st.session_state.get("open_positions_data"))
+        leap_label = "LEAP at Market" if _has_alpaca else "LEAP at Cost"
+        leap_help = (
+            "Live mid-price × 100 × contracts (Alpaca MTM)"
+            if _has_alpaca else
+            "Cost basis (premium paid). Click 'Refresh Open Positions' on Market Data page for live MTM."
+        )
+        st.metric(leap_label,
+                   f"${leap_mtm:,.0f}",
+                   delta=f"{_leap_unrealized:+,.0f} unrealized" if _leap_unrealized != 0 else None,
+                   help=leap_help)
     with nav_col4:
         st.metric("Cash idle (MMF est.)",
                    f"${cash_idle_mmf:,.0f}",
@@ -1980,7 +1996,8 @@ def render_daily_helper():
     _comp_pnl = PnLCalculator.calculate_comprehensive_pnl(
         df_trades=st.session_state.df_trades, df_open=df_open,
         stock_avg_prices=_stock_avg, live_prices=live_prices,
-        spy_leap_pl=_spy_leap_pl if _spy_leap_pl != 0 else None
+        spy_leap_pl=_spy_leap_pl if _spy_leap_pl != 0 else None,
+        live_options=st.session_state.get("open_positions_data", []),
     )
     _prem_by_ticker = {}
     _closed_opts = st.session_state.df_trades[
