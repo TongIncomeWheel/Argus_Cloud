@@ -898,12 +898,18 @@ def render_dashboard():
     mmf_yield_annual = cash_idle_mmf * 0.05  # ~5% MMF yield estimate
 
     st.markdown("### 📈 Account Value (live)")
+    # FX rate for SGD display
+    from persistence import get_fx_rate
+    _fx = get_fx_rate(portfolio) or 1.35
+    nav_sgd = nav * _fx
+
     nav_col1, nav_col2, nav_col3, nav_col4 = st.columns(4)
     with nav_col1:
         st.metric("Net Account Value",
                    f"${nav:,.0f}",
                    delta=f"{nav_delta_pct:+.1f}% vs deposit",
                    help="Deposit + Realized P&L + Unrealized P&L (Stock + LEAP at live prices)")
+        st.caption(f"≈ SGD {nav_sgd:,.0f} (at {_fx:.4f})")
     with nav_col2:
         st.metric("Stock at Market",
                    f"${total_stock_at_current:,.0f}",
