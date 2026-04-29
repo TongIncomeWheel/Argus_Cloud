@@ -88,18 +88,27 @@ class PnLCalculator:
             if total_shares == 0:
                 continue
             
-            # Get cost basis (average inventory price)
-            cost_basis = stock_avg_prices.get(ticker, 0.0)
+            # Get cost basis (average inventory price) — guard against None/string
+            try:
+                cost_basis = float(stock_avg_prices.get(ticker, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                cost_basis = 0.0
             if cost_basis == 0:
-                # Fallback to live price (no P/L if no cost basis)
                 continue
-            
-            # Get current market price
-            current_price = live_prices.get(ticker, 0.0)
+
+            # Get current market price — guard against None/string
+            try:
+                current_price = float(live_prices.get(ticker, 0.0) or 0.0)
+            except (TypeError, ValueError):
+                current_price = 0.0
             if current_price == 0:
-                # Can't calculate P/L without current price
                 continue
-            
+
+            try:
+                total_shares = float(total_shares or 0)
+            except (TypeError, ValueError):
+                total_shares = 0.0
+
             # Calculate unrealized P&L
             unrealized_pl = (current_price - cost_basis) * total_shares
             by_ticker[ticker] = unrealized_pl

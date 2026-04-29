@@ -683,22 +683,56 @@ def render_dashboard():
     tickers = df_open['Ticker'].unique().tolist()
     live_prices = {}
     try:
-        live_prices = get_cached_prices(tuple(tickers))
+        live_prices = get_cached_prices(tuple(tickers)) or {}
         st.session_state.live_prices = live_prices
-        
+
         # Save current prices to persistent storage (for LLM reference and future API integration)
         from persistence import update_current_price
         for ticker, price in live_prices.items():
             if price is not None:
                 update_current_price(ticker, price, source='yahoo', portfolio=portfolio)
-        
-        if live_prices:
-            prices_count = sum(1 for p in live_prices.values() if p is not None)
-            if prices_count > 0:
-                st.info(f"📊 Prices loaded for {prices_count}/{len(tickers)} tickers (Yahoo Finance, 10-15 min delay)")
     except Exception as e:
-        st.warning(f"⚠️ Could not fetch live prices: {e}")
-        live_prices = st.session_state.get('live_prices', {})
+        st.warning(f"⚠️ Yahoo Finance unavailable: {e}")
+        live_prices = st.session_state.get('live_prices', {}) or {}
+
+    # Cloud fallback: yfinance often fails on Streamlit Cloud (rate-limit/blocked).
+    # Backfill missing prices from the Data Table's Price_of_current_underlying_(USD)
+    # and from previously-cached prices in user_settings.
+    missing_tickers = [t for t in tickers if not live_prices.get(t)]
+    if missing_tickers:
+        from persistence import load_settings
+        _settings = load_settings()
+        _stored = _settings.get(f"{portfolio.lower().replace(' ', '_')}_current_prices", {})
+        for t in list(missing_tickers):
+            # Try stored cache first
+            stored_data = _stored.get(t)
+            if isinstance(stored_data, dict):
+                p = stored_data.get('price')
+            else:
+                p = stored_data
+            if p:
+                try:
+                    live_prices[t] = float(p)
+                    missing_tickers.remove(t)
+                    continue
+                except (TypeError, ValueError):
+                    pass
+            # Try sheet column fallback
+            ticker_rows = df_open[df_open['Ticker'] == t]
+            if not ticker_rows.empty:
+                sheet_prices = pd.to_numeric(ticker_rows['Price_of_current_underlying_(USD)'], errors='coerce').dropna()
+                if not sheet_prices.empty:
+                    live_prices[t] = float(sheet_prices.iloc[0])
+                    missing_tickers.remove(t)
+
+    # Coerce all prices to float, drop None
+    live_prices = {t: float(p) for t, p in live_prices.items() if p is not None and p != 0}
+
+    if live_prices:
+        prices_count = len(live_prices)
+        st.info(f"📊 Prices loaded for {prices_count}/{len(tickers)} tickers")
+    if missing_tickers:
+        st.warning(f"⚠️ Missing prices for {missing_tickers} — using $0 (some metrics will be incomplete)")
     
     # Get PMCC tickers for CSP Tank calculation
     pmcc_tickers = get_pmcc_tickers(portfolio)
