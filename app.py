@@ -943,17 +943,29 @@ def render_dashboard():
     # ── LEAP P&L TRANSPARENCY (drill-down per position) ─────────
     _leaps_in_view = df_open[df_open['TradeType'] == 'LEAP'].copy() if 'TradeType' in df_open.columns else pd.DataFrame()
     if not _leaps_in_view.empty:
-        with st.expander(f"🔍 LEAP P&L breakdown ({len(_leaps_in_view)} positions) — click to verify each line vs broker", expanded=False):
-            if not _has_alpaca:
-                st.warning(
-                    "⚠️ Using **intrinsic-only** valuation (no time value). "
-                    "Click 'Refresh Open Positions Data' on the **Market Data** page to fetch live Alpaca mid-prices for true MTM."
-                )
-            else:
-                st.success("✅ Using **live Alpaca mid-prices** for true mark-to-market valuation.")
+        with st.expander(f"🔍 LEAP P&L breakdown ({len(_leaps_in_view)} positions) — click to verify each line vs broker", expanded=True):
+            # Inline Alpaca refresh button (no need to navigate to Market Data)
+            _refresh_col, _status_col = st.columns([1, 4])
+            with _refresh_col:
+                if st.button("🔄 Fetch Alpaca live mid-prices", key="leap_alpaca_refresh", use_container_width=True):
+                    try:
+                        df_options_open = df_open[df_open['TradeType'].isin(['CC', 'CSP', 'LEAP'])].copy()
+                        if not df_options_open.empty:
+                            with st.spinner("Fetching Alpaca options data..."):
+                                fresh = _market_data.get_open_positions_data(df_options_open)
+                                st.session_state.open_positions_data = fresh
+                                st.toast(f"Loaded {len(fresh)} live contracts", icon="✅")
+                                st.rerun()
+                    except Exception as e:
+                        st.error(f"Alpaca fetch failed: {e}")
 
-            # Build breakdown
-            _leap_rows = []
+            with _status_col:
+                if not _has_alpaca:
+                    st.warning("⚠️ Using **intrinsic-only** valuation. Click ← to fetch Alpaca live mid-prices for true MTM.")
+                else:
+                    st.success(f"✅ Using **live Alpaca mid-prices** for {len(_live_options)} contracts.")
+
+            # Build live-options lookup
             _live_lookup = {}
             for c in _live_options:
                 try:
@@ -963,6 +975,10 @@ def render_dashboard():
                 except Exception:
                     continue
 
+            # Build breakdown — rows are the SOURCE OF TRUTH for totals
+            _leap_rows = []
+            _running_cost = 0.0
+            _running_mtm = 0.0
             for _, r in _leaps_in_view.iterrows():
                 tid = r.get('TradeID', '')
                 ticker = r.get('Ticker', '')
@@ -974,21 +990,21 @@ def render_dashboard():
                 spot = float(live_prices.get(ticker, 0) or 0)
 
                 cost = premium * 100 * qty
+                _running_cost += cost
 
                 # Try Alpaca mid first
                 live_data = _live_lookup.get((ticker, strike, 'C', expiry_str))
                 if live_data:
                     mid, bid, ask, last = live_data
-                    mtm_value = mid * 100 * qty
-                    valuation_source = f"Alpaca live (bid/ask {bid:.2f}/{ask:.2f}, last {last:.2f})"
                     contract_value = mid
+                    valuation_source = f"Alpaca: bid {bid:.2f} / ask {ask:.2f} / last {last:.2f}"
                 else:
                     # Intrinsic fallback
-                    intrinsic = max(0, spot - strike) if spot > 0 else 0
-                    mtm_value = intrinsic * 100 * qty
-                    valuation_source = f"Intrinsic (spot {spot:.2f} − strike {strike:.2f})"
-                    contract_value = intrinsic
+                    contract_value = max(0, spot - strike) if spot > 0 else 0
+                    valuation_source = f"Intrinsic only: max(0, {spot:.2f} − {strike:.2f})"
 
+                mtm_value = contract_value * 100 * qty
+                _running_mtm += mtm_value
                 pl = mtm_value - cost
                 dte = (expiry_dt - pd.Timestamp.now()).days if pd.notna(expiry_dt) else 0
 
@@ -1010,19 +1026,17 @@ def render_dashboard():
             df_leap_breakdown = pd.DataFrame(_leap_rows)
             st.dataframe(df_leap_breakdown, use_container_width=True, hide_index=True)
 
-            # Totals
-            _total_cost = sum(float(pd.to_numeric(r.get('OptPremium', 0), errors='coerce') or 0) * 100 * abs(int(pd.to_numeric(r.get('Quantity', 0), errors='coerce') or 0)) for _, r in _leaps_in_view.iterrows())
-            _total_mtm = total_leap_sunk + comprehensive_pnl['unrealized_leap_pnl']['total']
-            _total_pl = _total_mtm - _total_cost
+            # Totals — derived from rows above (guaranteed match)
+            _total_pl = _running_mtm - _running_cost
             tcol1, tcol2, tcol3 = st.columns(3)
-            tcol1.metric("Total LEAP Cost", f"${_total_cost:,.0f}")
-            tcol2.metric("Total LEAP MTM", f"${_total_mtm:,.0f}")
+            tcol1.metric("Total LEAP Cost (Σ rows)", f"${_running_cost:,.0f}")
+            tcol2.metric("Total LEAP MTM (Σ rows)", f"${_running_mtm:,.0f}")
             tcol3.metric("Total Unrealized P&L", f"${_total_pl:+,.0f}")
 
             st.caption(
-                "**Compare each row to your Tiger broker:** the P&L column should match. "
-                "If not, the broker has live tick prices and we have 15-min delayed mid-prices — small drift normal. "
-                "Big drift = something else (cost basis wrong, missing roll, wrong expiry)."
+                "Totals computed by summing the rows above — guaranteed to match. "
+                "**Compare each row to your Tiger broker:** P&L column should be very close. "
+                "Big drift = wrong cost basis, missing roll, or wrong expiry in the GSheet."
             )
 
     st.divider()
