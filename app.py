@@ -843,8 +843,61 @@ def render_dashboard():
     from pnl_calculator import PnLCalculator
     from persistence import get_spy_leap_pl
     spy_leap_pl = get_spy_leap_pl(portfolio)
-    # Pass live options data (Alpaca) so LEAP P&L uses TRUE mark-to-market
     _live_options = st.session_state.get("open_positions_data", [])
+
+    # ── SINGLE SOURCE OF TRUTH for LEAP MTM ─────────────────────
+    # Compute per-row LEAP MTM here, then BOTH the dashboard card and
+    # the breakdown table read from `_leap_breakdown_rows`. No drift.
+    _leap_breakdown_rows = []
+    _leap_live_lookup = {}
+    for c in (_live_options or []):
+        try:
+            mid = c.last_price if c.last_price > 0 else (c.bid + c.ask) / 2
+            if mid > 0:
+                _leap_live_lookup[(c.underlying, float(c.strike), c.right, str(c.expiry))] = (mid, c.bid, c.ask, c.last_price)
+        except Exception:
+            continue
+
+    _leaps_df = df_open[df_open['TradeType'] == 'LEAP'].copy() if 'TradeType' in df_open.columns else pd.DataFrame()
+    for _, r in _leaps_df.iterrows():
+        _strike = float(pd.to_numeric(r.get('Option_Strike_Price_(USD)', 0), errors='coerce') or 0)
+        _premium = float(pd.to_numeric(r.get('OptPremium', 0), errors='coerce') or 0)
+        _qty = abs(int(pd.to_numeric(r.get('Quantity', 0), errors='coerce') or 0))
+        _expiry_dt = pd.to_datetime(r.get('Expiry_Date'), errors='coerce')
+        _expiry_str = _expiry_dt.strftime('%Y-%m-%d') if pd.notna(_expiry_dt) else ''
+        _ticker_l = r.get('Ticker', '')
+        _spot = float(live_prices.get(_ticker_l, 0) or 0)
+        _cost = _premium * 100 * _qty
+        _live_data = _leap_live_lookup.get((_ticker_l, _strike, 'C', _expiry_str))
+        if _live_data:
+            _mid, _bid, _ask, _last = _live_data
+            _contract_value = _mid
+            _source = f"Alpaca: bid {_bid:.2f} / ask {_ask:.2f} / last {_last:.2f}"
+        else:
+            _contract_value = max(0, _spot - _strike) if _spot > 0 else 0
+            _source = f"Intrinsic only: max(0, {_spot:.2f} − {_strike:.2f})"
+        _mtm_value = _contract_value * 100 * _qty
+        _leap_breakdown_rows.append({
+            'TradeID': r.get('TradeID', ''),
+            'Ticker': _ticker_l,
+            'Strike': _strike,
+            'Expiry': _expiry_str,
+            'DTE': (_expiry_dt - pd.Timestamp.now()).days if pd.notna(_expiry_dt) else 0,
+            'Qty': _qty,
+            'Premium': _premium,
+            'Cost': _cost,
+            'Spot': _spot,
+            'ContractValue': _contract_value,
+            'MTMValue': _mtm_value,
+            'PL': _mtm_value - _cost,
+            'Source': _source,
+        })
+
+    # Authoritative LEAP totals — these drive everything downstream
+    _leap_total_cost = sum(r['Cost'] for r in _leap_breakdown_rows)
+    _leap_total_mtm = sum(r['MTMValue'] for r in _leap_breakdown_rows)
+    _leap_total_pl = _leap_total_mtm - _leap_total_cost
+
     comprehensive_pnl = PnLCalculator.calculate_comprehensive_pnl(
         df_trades=df_trades,
         df_open=df_open,
@@ -853,6 +906,8 @@ def render_dashboard():
         spy_leap_pl=spy_leap_pl if spy_leap_pl != 0 else None,
         live_options=_live_options,
     )
+    # Override LEAP totals with our breakdown-row truth (same per-row logic as the table)
+    comprehensive_pnl['unrealized_leap_pnl']['total'] = _leap_total_pl
     # Realized P&L from all closed trades (CC, CSP, LEAP, STOCK)
     premium_collected_by_ticker = {}
     if df_trades is not None and not df_trades.empty:
@@ -968,10 +1023,8 @@ def render_dashboard():
                    help="NAV − Stock@market − LEAP − Tiger margin held. Estimated cash earning yield in MMF. Golden figure is in your Tiger account.")
 
     # ── LEAP P&L TRANSPARENCY (drill-down per position) ─────────
-    _leaps_in_view = df_open[df_open['TradeType'] == 'LEAP'].copy() if 'TradeType' in df_open.columns else pd.DataFrame()
-    if not _leaps_in_view.empty:
-        with st.expander(f"🔍 LEAP P&L breakdown ({len(_leaps_in_view)} positions) — click to verify each line vs broker", expanded=True):
-            # Inline Alpaca refresh button (no need to navigate to Market Data)
+    if _leap_breakdown_rows:
+        with st.expander(f"🔍 LEAP P&L breakdown ({len(_leap_breakdown_rows)} positions) — click to verify each line vs broker", expanded=True):
             _refresh_col, _status_col = st.columns([1, 4])
             with _refresh_col:
                 if st.button("🔄 Fetch Alpaca live mid-prices", key="leap_alpaca_refresh", use_container_width=True):
@@ -988,82 +1041,39 @@ def render_dashboard():
 
             with _status_col:
                 if not _has_alpaca:
-                    st.warning("⚠️ Using **intrinsic-only** valuation. Click ← to fetch Alpaca live mid-prices for true MTM.")
+                    st.warning(f"⚠️ Using **intrinsic-only** valuation. Spy_leap_pl override (${spy_leap_pl:,.0f}) is **ignored** — breakdown is the source of truth. Click ← for Alpaca live MTM.")
                 else:
                     st.success(f"✅ Using **live Alpaca mid-prices** for {len(_live_options)} contracts.")
 
-            # Build live-options lookup
-            _live_lookup = {}
-            for c in _live_options:
-                try:
-                    mid = c.last_price if c.last_price > 0 else (c.bid + c.ask) / 2
-                    if mid > 0:
-                        _live_lookup[(c.underlying, float(c.strike), c.right, str(c.expiry))] = (mid, c.bid, c.ask, c.last_price)
-                except Exception:
-                    continue
-
-            # Build breakdown — rows are the SOURCE OF TRUTH for totals
-            _leap_rows = []
-            _running_cost = 0.0
-            _running_mtm = 0.0
-            for _, r in _leaps_in_view.iterrows():
-                tid = r.get('TradeID', '')
-                ticker = r.get('Ticker', '')
-                strike = float(pd.to_numeric(r.get('Option_Strike_Price_(USD)', 0), errors='coerce') or 0)
-                premium = float(pd.to_numeric(r.get('OptPremium', 0), errors='coerce') or 0)
-                qty = abs(int(pd.to_numeric(r.get('Quantity', 0), errors='coerce') or 0))
-                expiry_dt = pd.to_datetime(r.get('Expiry_Date'), errors='coerce')
-                expiry_str = expiry_dt.strftime('%Y-%m-%d') if pd.notna(expiry_dt) else ''
-                spot = float(live_prices.get(ticker, 0) or 0)
-
-                cost = premium * 100 * qty
-                _running_cost += cost
-
-                # Try Alpaca mid first
-                live_data = _live_lookup.get((ticker, strike, 'C', expiry_str))
-                if live_data:
-                    mid, bid, ask, last = live_data
-                    contract_value = mid
-                    valuation_source = f"Alpaca: bid {bid:.2f} / ask {ask:.2f} / last {last:.2f}"
-                else:
-                    # Intrinsic fallback
-                    contract_value = max(0, spot - strike) if spot > 0 else 0
-                    valuation_source = f"Intrinsic only: max(0, {spot:.2f} − {strike:.2f})"
-
-                mtm_value = contract_value * 100 * qty
-                _running_mtm += mtm_value
-                pl = mtm_value - cost
-                dte = (expiry_dt - pd.Timestamp.now()).days if pd.notna(expiry_dt) else 0
-
-                _leap_rows.append({
-                    'TradeID': tid,
-                    'Strike': f"${strike:,.2f}",
-                    'Expiry': expiry_str,
-                    'DTE': dte,
-                    'Qty': qty,
-                    'Cost/contract': f"${premium:,.2f}",
-                    'Total Cost': f"${cost:,.0f}",
-                    'Spot': f"${spot:,.2f}" if spot else "—",
-                    'Current/contract': f"${contract_value:,.2f}",
-                    'MTM Value': f"${mtm_value:,.0f}",
-                    'P&L': f"{'+' if pl >= 0 else ''}${pl:,.0f}",
-                    'Source': valuation_source,
+            # Render rows from the pre-computed authoritative data
+            _display_rows = []
+            for r in _leap_breakdown_rows:
+                _display_rows.append({
+                    'TradeID': r['TradeID'],
+                    'Strike': f"${r['Strike']:,.2f}",
+                    'Expiry': r['Expiry'],
+                    'DTE': r['DTE'],
+                    'Qty': r['Qty'],
+                    'Cost/contract': f"${r['Premium']:,.2f}",
+                    'Total Cost': f"${r['Cost']:,.0f}",
+                    'Spot': f"${r['Spot']:,.2f}" if r['Spot'] else "—",
+                    'Current/contract': f"${r['ContractValue']:,.2f}",
+                    'MTM Value': f"${r['MTMValue']:,.0f}",
+                    'P&L': f"{'+' if r['PL'] >= 0 else ''}${r['PL']:,.0f}",
+                    'Source': r['Source'],
                 })
 
-            df_leap_breakdown = pd.DataFrame(_leap_rows)
-            st.dataframe(df_leap_breakdown, use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(_display_rows), use_container_width=True, hide_index=True)
 
-            # Totals — derived from rows above (guaranteed match)
-            _total_pl = _running_mtm - _running_cost
+            # Totals — guaranteed to match the LEAP card upstairs
             tcol1, tcol2, tcol3 = st.columns(3)
-            tcol1.metric("Total LEAP Cost (Σ rows)", f"${_running_cost:,.0f}")
-            tcol2.metric("Total LEAP MTM (Σ rows)", f"${_running_mtm:,.0f}")
-            tcol3.metric("Total Unrealized P&L", f"${_total_pl:+,.0f}")
+            tcol1.metric("Total LEAP Cost (Σ rows)", f"${_leap_total_cost:,.0f}")
+            tcol2.metric("Total LEAP MTM (Σ rows)", f"${_leap_total_mtm:,.0f}")
+            tcol3.metric("Total Unrealized P&L", f"${_leap_total_pl:+,.0f}")
 
             st.caption(
-                "Totals computed by summing the rows above — guaranteed to match. "
-                "**Compare each row to your Tiger broker:** P&L column should be very close. "
-                "Big drift = wrong cost basis, missing roll, or wrong expiry in the GSheet."
+                "Totals here = sum of rows = LEAP card on top. **Single source of truth.** "
+                "Compare each row to Tiger broker. Big drift = wrong cost basis, missing roll, or wrong expiry in the GSheet."
             )
 
     st.divider()
