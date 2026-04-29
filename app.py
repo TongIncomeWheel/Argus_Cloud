@@ -509,7 +509,34 @@ def render_sidebar():
                 label_visibility="collapsed"
             )
             st.session_state.current_page = page
-        
+
+        # Quick refresh — fetch live Alpaca options data (Greeks + LEAP MTM)
+        if st.button("🔄 Refresh Live Market Data", key="sidebar_refresh_market", use_container_width=True,
+                     help="Fetches Alpaca live mid-prices, Greeks, and LEAP MTM for all open options."):
+            df_open_local = st.session_state.get('df_open')
+            if df_open_local is not None and not df_open_local.empty:
+                df_options_open = df_open_local[df_open_local['TradeType'].isin(['CC', 'CSP', 'LEAP'])].copy()
+                if not df_options_open.empty:
+                    try:
+                        with st.spinner(f"Fetching {len(df_options_open)} live contracts from Alpaca..."):
+                            fresh = _market_data.get_open_positions_data(df_options_open)
+                            st.session_state.open_positions_data = fresh
+                            st.toast(f"Loaded {len(fresh)} live contracts", icon="✅")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Alpaca fetch failed: {e}")
+                else:
+                    st.warning("No open options to refresh.")
+            else:
+                st.warning("No positions loaded yet.")
+
+        # Show last refresh time if available
+        _last_refresh_count = len(st.session_state.get("open_positions_data", []))
+        if _last_refresh_count > 0:
+            st.caption(f"✅ Live data: {_last_refresh_count} contracts loaded")
+        else:
+            st.caption("⚠️ Click above to load live MTM (LEAPs use intrinsic until refreshed)")
+
         st.divider()
         
         # AI Chat (persistent across all pages) - AFTER portfolio/page selection for proper context
