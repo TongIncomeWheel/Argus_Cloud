@@ -928,22 +928,50 @@ def render_dashboard():
     health = tank_data['health']
     locked = tank_data['locked']
     
-    # ----- Computed values for summary -----
-    # Cash-secured policy: STOCK at BUY price (not market) + LEAP sunk + CSP reserved
-    # Stock cost basis = actual cash deployed; market value drives unrealized P&L only.
+    # ----- Computed values for cash-secured policy -----
+    # User's definition: Portfolio cash (dynamic to P&L) is 100% deployed to
+    # support STOCK INVENTORY + PMCC LEAPs + Naked option CSPs.
+    #
+    # Portfolio Cash has 3 layers:
+    #   Layer 1: Pot Deposits                    (static)
+    #   Layer 2: Realized P&L from closed trades (closed positions)
+    #   Layer 3: Premium received on OPEN shorts (cash already in Tiger account
+    #                                             from current open CCs/CSPs)
+    #
+    # Deployed = stock_cost + leap_sunk + csp_reserved
+    # Headroom = Portfolio Cash - Deployed     (target ≈ 0)
+    #
+    # Negative headroom = using broker margin (over-deployed past the policy).
     total_stock_at_buy = capital_data['total'].get('stock_at_buy_price', 0.0)
     total_capital_used = total_stock_at_buy + total_leap_sunk + total_csp_reserved
-    capital_held = total_stock_at_buy + total_leap_sunk
-    liquid_cash = (portfolio_deposit + total_pl) - capital_held
-    bp = liquid_cash - total_csp_reserved
     stock_and_leap_total = total_stock_at_buy + total_leap_sunk
+
+    # Layer 3: premium received on OPEN short options (cash sitting in Tiger acct)
+    _df_open_shorts = df_open[df_open['TradeType'].isin(['CC', 'CSP'])].copy()
+    if not _df_open_shorts.empty:
+        _df_open_shorts['_premium'] = pd.to_numeric(_df_open_shorts['OptPremium'], errors='coerce').fillna(0)
+        _df_open_shorts['_qty'] = pd.to_numeric(_df_open_shorts['Quantity'], errors='coerce').fillna(0)
+        open_premium_received = float((_df_open_shorts['_premium'] * _df_open_shorts['_qty'] * 100).sum())
+    else:
+        open_premium_received = 0.0
+
+    portfolio_cash = portfolio_deposit + total_pl + open_premium_received  # 3-layer dynamic
+    deployed = total_stock_at_buy + total_leap_sunk + total_csp_reserved
+    headroom = portfolio_cash - deployed
+    bp = headroom  # back-compat alias for downstream code that reads `bp`
+    liquid_cash = portfolio_cash - stock_and_leap_total  # cash before CSP reserve
 
     # ══════════════════════════════════════════════════════════
     # PHASE 3.1: ALERT BANNERS (always visible, top priority)
     # ══════════════════════════════════════════════════════════
-    # BP negative alert
-    if bp < 0:
-        st.error(f"🔴 **BUYING POWER NEGATIVE: ${bp:,.0f}** — Do NOT sell new CSPs until capital is freed.")
+    # Over-deployed alert — clearer message than the old "BUYING POWER NEGATIVE"
+    if headroom < -1000:  # ignore rounding noise
+        st.error(
+            f"🔴 **Over-deployed by ${abs(headroom):,.0f}** — your cash-secured policy "
+            f"requires Portfolio Cash ≥ Deployed. You're using broker margin for the gap. "
+            f"Either close positions OR update Pot Deposits in Margin Config if your "
+            f"cumulative deposits are higher than recorded."
+        )
 
     # Per-ticker threshold alerts (use pot-scoped allocation)
     capital_allocation = capital_allocation_for_view
@@ -983,23 +1011,27 @@ def render_dashboard():
     cash_idle_mmf = max(0, cash_idle_mmf)
     mmf_yield_annual = cash_idle_mmf * 0.05  # ~5% MMF yield estimate
 
-    st.markdown("### 📈 Account Value (live)")
-    # FX rate for SGD display
+    st.markdown("### 📈 Account Value — USD (live)")
+    # FX rate for SGD reference. Canonical currency throughout ARGUS is USD.
+    # SGD shown ONLY as a derived reference at the top, not as a separate metric.
     from persistence import get_fx_rate
     _fx = get_fx_rate(portfolio) or 1.35
     nav_sgd = nav * _fx
+    st.caption(
+        f"All figures in **USD**. SGD reference: **≈ S${nav_sgd:,.0f}** at FX 1 USD = {_fx:.4f} SGD "
+        f"(set in Margin Config). Tiger broker reports in USD only."
+    )
 
     nav_col1, nav_col2, nav_col3, nav_col4 = st.columns(4)
     with nav_col1:
         st.metric("Net Account Value",
                    f"${nav:,.0f}",
                    delta=f"{nav_delta_pct:+.1f}% vs deposit",
-                   help="Deposit + Realized P&L + Unrealized P&L (Stock + LEAP at live prices)")
-        st.caption(f"≈ SGD {nav_sgd:,.0f} (at {_fx:.4f})")
+                   help="USD. Deposit + Realized P&L + Unrealized P&L (Stock + LEAP at live prices)")
     with nav_col2:
         st.metric("Stock at Market",
                    f"${total_stock_at_current:,.0f}",
-                   help="Current market value of stock holdings")
+                   help="USD. Current market value of stock holdings")
     with nav_col3:
         # LEAP MTM = LEAP cost + LEAP unrealized P&L. If live options data
         # was fetched from Alpaca, this is TRUE market value. Otherwise it's
@@ -1009,9 +1041,9 @@ def render_dashboard():
         _has_alpaca = bool(st.session_state.get("open_positions_data"))
         leap_label = "LEAP at Market" if _has_alpaca else "LEAP at Cost"
         leap_help = (
-            "Live mid-price × 100 × contracts (Alpaca MTM)"
+            "USD. Live mid-price × 100 × contracts (Alpaca MTM)"
             if _has_alpaca else
-            "Cost basis (premium paid). Click 'Refresh Open Positions' on Market Data page for live MTM."
+            "USD. Cost basis (premium paid). Click 'Refresh Open Positions' on Market Data page for live MTM."
         )
         st.metric(leap_label,
                    f"${leap_mtm:,.0f}",
@@ -1021,7 +1053,7 @@ def render_dashboard():
         st.metric("Cash idle (MMF est.)",
                    f"${cash_idle_mmf:,.0f}",
                    delta=f"~${mmf_yield_annual:,.0f}/yr at 5%",
-                   help="NAV − Stock@market − LEAP − Tiger margin held. Estimated cash earning yield in MMF. Golden figure is in your Tiger account.")
+                   help="USD. NAV − Stock@market − LEAP − Tiger margin held. Estimated cash earning yield in MMF. Golden figure is in your Tiger account.")
 
     # ── LEAP P&L TRANSPARENCY (drill-down per position) ─────────
     if _leap_breakdown_rows:
@@ -1080,36 +1112,80 @@ def render_dashboard():
     st.divider()
 
     # ══════════════════════════════════════════════════════════
-    # SECTION B: SELLING CAPACITY (how much can I deploy)
+    # SECTION B: CASH-SECURED POLICY STATUS
+    # Your discipline: Portfolio Cash should equal what's deployed across
+    # Stock Inventory + PMCC LEAPs + Naked CSPs. Positive headroom = idle
+    # cash. Negative headroom = using broker margin.
     # ══════════════════════════════════════════════════════════
     _tiger = UnifiedCapitalCalculator.calculate_tiger_margin(df_open, live_prices)
-    # Tiger BP = if you used broker margin instead of cash-secured for CSPs
-    tiger_bp = bp + _tiger['headroom']  # cash-secured BP + headroom freed by using broker margin
-    weekly_target_pct = 0.25  # 25% of available BP per week
-    weekly_pacing = max(0, bp) * weekly_target_pct
-    daily_pacing = weekly_pacing / 5
 
-    st.markdown("### 💼 How Much Can I Sell?")
-    bp_col1, bp_col2, bp_col3 = st.columns(3)
-    with bp_col1:
-        st_metric_with_negatives("Cash-Secured BP", bp, decimals=0, is_currency=True,
-                                  help_text="Your discipline: max new CSPs without using broker margin")
-        st.caption("**Your policy ceiling**")
-    with bp_col2:
-        st.metric("Tiger Margin BP (FYI)",
-                   f"${tiger_bp:,.0f}",
-                   help="Broker would allow this much, but charges ~6-8% interest on margin used")
-        st.caption("Reference only — interest cost applies if used")
-    with bp_col3:
-        st.metric("This Week Target (25%)",
-                   f"${weekly_pacing:,.0f}",
-                   delta=f"~${daily_pacing:,.0f}/day",
-                   help="25% of cash-secured BP deployed per week, paced over 5 trading days")
-        st.caption("Conservative pacing")
+    st.markdown("### 💼 Cash-Secured Policy")
+    st.caption(
+        "Your discipline: Portfolio Cash should equal everything Deployed (Stock + PMCC LEAPs + "
+        "Naked CSP collateral). Target headroom ≈ $0 (100% deployed)."
+    )
+    cs_col1, cs_col2, cs_col3 = st.columns(3)
+    with cs_col1:
+        st.metric(
+            "Portfolio Cash (USD)",
+            f"${portfolio_cash:,.0f}",
+            help=(
+                f"Layer 1 — Pot Deposits:           ${portfolio_deposit:,.0f}\n"
+                f"Layer 2 — Realized P&L (closed):  {'+' if total_pl >= 0 else ''}${total_pl:,.0f}\n"
+                f"Layer 3 — Premium on open shorts: +${open_premium_received:,.0f}\n"
+                f"───────────────────────────────────\n"
+                f"Total:                            ${portfolio_cash:,.0f}\n\n"
+                f"Layer 3 = cash you've already received from currently-open CCs/CSPs "
+                f"that's sitting in your Tiger account."
+            ),
+        )
+        st.caption(
+            f"${portfolio_deposit/1000:.0f}k deposits · "
+            f"{'+' if total_pl >= 0 else ''}{total_pl/1000:.1f}k realized · "
+            f"+{open_premium_received/1000:.1f}k open premium"
+        )
+    with cs_col2:
+        st.metric(
+            "Deployed (USD)",
+            f"${deployed:,.0f}",
+            help=(
+                f"Stock inventory @ cost:  ${total_stock_at_buy:,.0f}\n"
+                f"PMCC LEAPs @ cost:       ${total_leap_sunk:,.0f}\n"
+                f"Naked CSP collateral:    ${total_csp_reserved:,.0f}\n"
+                f"───────────────────────────\n"
+                f"Total deployed:          ${deployed:,.0f}"
+            ),
+        )
+        st.caption(
+            f"${total_stock_at_buy/1000:.0f}k stock · "
+            f"${total_leap_sunk/1000:.0f}k LEAPs · "
+            f"${total_csp_reserved/1000:.0f}k CSPs"
+        )
+    with cs_col3:
+        if headroom >= 0:
+            st_metric_label = "Idle Cash (USD)"
+            st_metric_caption = "Within policy — room to deploy"
+        else:
+            st_metric_label = "Margin Used (USD)"
+            st_metric_caption = "Over policy — using broker margin"
+        st_metric_with_negatives(
+            st_metric_label, headroom, decimals=0, is_currency=True,
+            help_text=(
+                f"Portfolio Cash (${portfolio_cash:,.0f}) - Deployed (${deployed:,.0f}) "
+                f"= ${headroom:,.0f}. Target ≈ $0 means 100% of cash is deployed. "
+                f"Negative = using broker margin to fund the gap."
+            ),
+        )
+        st.caption(st_metric_caption)
 
-    if bp < 0:
-        st.error(f"🔴 **Buying Power negative ({'-' if bp < 0 else ''}${abs(bp):,.0f})** — "
-                  "You're past your cash-secured ceiling. Free capital before opening new CSPs.")
+    # FYI sub-metric: Tiger broker's actual margin requirement on your CSPs
+    # (Tiger uses ~30% × spot × 100 + premium - OTM, not full strike collateral)
+    st.caption(
+        f"ℹ️ **Broker reality** — Tiger's actual CSP margin requirement is "
+        f"**${_tiger['csp_margin']:,.0f}** (vs your ${total_csp_reserved:,.0f} cash-secured policy). "
+        f"Even if your headroom is negative, Tiger has $300k+ of available margin before any "
+        f"liquidation risk."
+    )
 
     # Tiger margin per-position breakdown (collapsed for detail)
     with st.expander("📊 Tiger margin breakdown by position", expanded=False):
@@ -5307,46 +5383,46 @@ def render_margin_config():
 
     with pot_col_base:
         st.markdown("**🏛️ Base Pot** (WHEEL + PMCC)")
-        _base_sgd = st.number_input(
-            "Base Pot (SGD)",
+        _base_usd = st.number_input(
+            "Base Pot (USD) — primary",
             min_value=0.0,
-            value=float(_existing_base_sgd),
+            value=float(_existing_base_usd),
             step=1000.0,
-            help="Cash deposited into the Base Pot (Wheel + PMCC)",
-            key="pot_base_sgd_input"
+            help="Cumulative USD deposited into the Base Pot (Wheel + PMCC). Tiger reports in USD; this is the canonical figure.",
+            key="pot_base_usd_input"
         )
-        _base_usd = _base_sgd / sgd_usd_fx_rate if sgd_usd_fx_rate > 0 else 0.0
-        st.metric("Base Pot (USD)", f"${_base_usd:,.0f}")
+        _base_sgd = _base_usd * sgd_usd_fx_rate
+        st.caption(f"≈ S${_base_sgd:,.0f} (at FX 1 USD = {sgd_usd_fx_rate:.4f} SGD)")
         # Save if changed
-        if _base_sgd != get_pot_deposit_sgd('Base', portfolio):
-            save_pot_deposit_sgd('Base', _base_sgd, portfolio)
         if _base_usd != get_pot_deposit('Base', portfolio):
             save_pot_deposit('Base', _base_usd, portfolio)
+        if _base_sgd != get_pot_deposit_sgd('Base', portfolio):
+            save_pot_deposit_sgd('Base', _base_sgd, portfolio)
 
     with pot_col_active:
         st.markdown("**⚡ Active Income Pot** (ActiveCore)")
-        _active_sgd = st.number_input(
-            "Active Pot (SGD)",
+        _active_usd = st.number_input(
+            "Active Pot (USD) — primary",
             min_value=0.0,
-            value=float(_existing_active_sgd),
+            value=float(_existing_active_usd),
             step=1000.0,
-            help="Cash deposited into the Active Income Pot (ActiveCore)",
-            key="pot_active_sgd_input"
+            help="Cumulative USD deposited into the Active Income Pot (ActiveCore).",
+            key="pot_active_usd_input"
         )
-        _active_usd = _active_sgd / sgd_usd_fx_rate if sgd_usd_fx_rate > 0 else 0.0
-        st.metric("Active Pot (USD)", f"${_active_usd:,.0f}")
-        if _active_sgd != get_pot_deposit_sgd('Active', portfolio):
-            save_pot_deposit_sgd('Active', _active_sgd, portfolio)
+        _active_sgd = _active_usd * sgd_usd_fx_rate
+        st.caption(f"≈ S${_active_sgd:,.0f} (at FX 1 USD = {sgd_usd_fx_rate:.4f} SGD)")
         if _active_usd != get_pot_deposit('Active', portfolio):
             save_pot_deposit('Active', _active_usd, portfolio)
+        if _active_sgd != get_pot_deposit_sgd('Active', portfolio):
+            save_pot_deposit_sgd('Active', _active_sgd, portfolio)
 
-    # Total
+    # Total — USD primary, SGD as derived reference only
     total_deposit_usd = _base_usd + _active_usd
     total_deposit_sgd = _base_sgd + _active_sgd
     st.metric("**Total Portfolio (USD)**",
                f"${total_deposit_usd:,.0f}",
-               delta=f"SGD {total_deposit_sgd:,.0f}",
-               help="Sum of both pots — drives all dashboard calculations")
+               help="USD is the canonical figure. Drives all dashboard calculations.")
+    st.caption(f"≈ S${total_deposit_sgd:,.0f} (SGD reference only — derived from FX rate above)")
 
     # Maintain backward compatibility: write total to legacy keys (only if non-zero, never wipe)
     if total_deposit_usd > 0 and total_deposit_usd != st.session_state.get('portfolio_deposit', 0):
