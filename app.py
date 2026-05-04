@@ -504,7 +504,8 @@ def render_sidebar():
                 "Navigate",
                 ["📊 Dashboard", "📅 Daily Helper", "📝 Entry Forms",
                  "📈 Expiry Ladder", "📉 Performance", "📋 All Positions", "⚙️ Margin Config",
-                 "🔍 Income Scanner", "📡 Market Data", "🔎 Contract Lookup"],
+                 "🔍 Income Scanner", "📡 Market Data", "🔎 Contract Lookup",
+                 "🐅 Tiger Import"],
                 key="navigation_radio",
                 label_visibility="collapsed"
             )
@@ -2584,6 +2585,7 @@ def render_entry_forms():
                 if valid:
                     new_trade_id = generate_trade_id(df_trades)
                     strategy_cc = entry_strategy or "WHEEL"
+                    from tiger_to_argus import derive_pot
                     trade_data = {
                         'TradeID': new_trade_id,
                         'Ticker': cc_ticker,
@@ -2594,12 +2596,15 @@ def render_entry_forms():
                         'Option_Strike_Price_(USD)': cc_strike,
                         'Price_of_current_underlying_(USD)': cc_underlying,
                         'OptPremium': cc_premium,
-                        'Opt_Premium_%': (cc_premium / cc_strike) if cc_strike else 0,
                         'Date_open': datetime.now(),
                         'Expiry_Date': cc_expiry,
                         'Remarks': cc_remarks,
                         'Status': 'Open',
-                        'Open_lots': cc_qty * 100
+                        'Open_lots': cc_qty * 100,
+                        # New schema fields (post-Tiger-ETL)
+                        'Fee': 0,
+                        'Pot': derive_pot(strategy_cc),
+                        'Tiger_Row_Hash': '',  # Manual entry, no Tiger source
                     }
                     
                     audit_data = {
@@ -2757,6 +2762,7 @@ def render_entry_forms():
             else:
                 new_trade_id = generate_trade_id(df_trades)
                 strategy_csp = entry_strategy or "WHEEL"
+                from tiger_to_argus import derive_pot
                 trade_data = {
                     'TradeID': new_trade_id,
                     'Ticker': csp_ticker,
@@ -2767,13 +2773,15 @@ def render_entry_forms():
                     'Option_Strike_Price_(USD)': csp_strike,
                     'Price_of_current_underlying_(USD)': csp_underlying,
                     'OptPremium': csp_premium,
-                    'Opt_Premium_%': (csp_premium / csp_strike) if csp_strike else 0,
                     'Date_open': datetime.now(),
                     'Expiry_Date': csp_expiry,
                     'Remarks': csp_remarks,
                     'Status': 'Open',
-                    'Cash_required_per_position_(USD)': cash_required,
-                    'Open_lots': csp_qty * 100
+                    'Open_lots': csp_qty * 100,
+                    # New schema fields (post-Tiger-ETL)
+                    'Fee': 0,
+                    'Pot': derive_pot(strategy_csp),
+                    'Tiger_Row_Hash': '',
                 }
                 audit_data = {
                     'Audit ID': generate_audit_id(st.session_state.df_audit),
@@ -2976,6 +2984,11 @@ def render_entry_forms():
                                             row_b.pop('Actual_Profit_(USD)', None)
                                             if 'Date_open' in row_b and pd.isna(row_b.get('Date_open')):
                                                 row_b['Date_open'] = original.get('Date_open')
+                                            # New schema fields — inherit Pot, reset Fee, clear Tiger_Row_Hash
+                                            # (the partial-open row is a NEW lifecycle, not a duplicate of the Tiger source).
+                                            row_b['Fee'] = 0
+                                            row_b['Pot'] = original.get('Pot') or ('Active' if str(original.get('StrategyType', '')).strip() == 'ActiveCore' else 'Base')
+                                            row_b['Tiger_Row_Hash'] = ''  # New row, not from Tiger
                                             handler.append_trade(row_b)
                                             show_success_and_clear(trade_id_a, 'btc', f"Closed {trade_id_a}; {trade_id_b} open with {remaining_qty} contract(s)")
                                         else:
@@ -3161,7 +3174,11 @@ def render_entry_forms():
                                             'Expiry_Date': new_expiry,
                                             'Status': 'Open',
                                             'Remarks': f"Rolled from {old_trade_id}",
-                                            'Open_lots': _qty_save * 100
+                                            'Open_lots': _qty_save * 100,
+                                            # New schema fields — inherit Pot from original or derive from strategy
+                                            'Fee': 0,
+                                            'Pot': original.get('Pot') or ('Active' if orig_strat == 'ActiveCore' else 'Base'),
+                                            'Tiger_Row_Hash': '',
                                         }},
                                         {'type': 'append_audit', 'data': {
                                             'Audit ID': generate_audit_id(st.session_state.df_audit),
@@ -3489,10 +3506,12 @@ def render_entry_forms():
                                 
                                 # Create stock position
                                 stock_trade_id = generate_trade_id(df_trades)
+                                _stk_strategy = entry_strategy or original.get('StrategyType') or 'WHEEL'
+                                _stk_pot = original.get('Pot') or ('Active' if _stk_strategy == 'ActiveCore' else 'Base')
                                 stock_trade = {
                                     'TradeID': stock_trade_id,
                                     'Ticker': original['Ticker'],
-                                    'StrategyType': entry_strategy or 'WHEEL',
+                                    'StrategyType': _stk_strategy,
                                     'Direction': 'Buy',
                                     'TradeType': 'STOCK',
                                     'Quantity': original['Quantity'] * 100,
@@ -3500,7 +3519,12 @@ def render_entry_forms():
                                     'Price_of_current_underlying_(USD)': original['Option_Strike_Price_(USD)'],
                                     'Date_open': datetime.now(),
                                     'Status': 'Open',
-                                    'Remarks': f"Assigned from {trade_id}"
+                                    'Remarks': f"Assigned from {trade_id}",
+                                    # New schema fields
+                                    'Fee': 0,
+                                    'Pot': _stk_pot,
+                                    'Tiger_Row_Hash': '',
+                                    'Open_lots': int(original['Quantity']) * 100,
                                 }
                                 handler.append_trade(stock_trade)
                                 
@@ -3733,44 +3757,43 @@ def render_entry_forms():
                 merged['Quantity'] = ''
                 merged['Option_Strike_Price_(USD)'] = ''
             
-            # Select columns to display (include Ticker, Qty, Strike)
+            # Select columns to display (include Ticker, Qty, Strike).
+            # Track which CANONICAL display names are used so we don't add
+            # two source columns that both rename to the same target (which would
+            # cause a Streamlit "Duplicate column names" ValueError).
             display_cols = []
             col_mapping = {}
+            used_canonical = set()
+            def _claim(canonical: str, col: str):
+                if canonical in used_canonical:
+                    return  # already have a column for this target
+                display_cols.append(col)
+                col_mapping[col] = canonical
+                used_canonical.add(canonical)
             for col in merged.columns:
                 col_lower = col.lower()
                 if 'audit id' in col_lower:
-                    display_cols.append(col)
-                    col_mapping[col] = 'Audit ID'
+                    _claim('Audit ID', col)
                 elif 'tradeid' in col_lower and 'ref' in col_lower:
-                    display_cols.append(col)
-                    col_mapping[col] = 'Trade ID'
+                    _claim('Trade ID', col)
                 elif col == 'Ticker':
-                    display_cols.append(col)
-                    col_mapping[col] = 'Ticker'
+                    _claim('Ticker', col)
                 elif col == 'Quantity':
-                    display_cols.append(col)
-                    col_mapping[col] = 'Qty'
+                    _claim('Qty', col)
                 elif col == 'Option_Strike_Price_(USD)':
-                    display_cols.append(col)
-                    col_mapping[col] = 'Strike ($)'
+                    _claim('Strike ($)', col)
                 elif 'affectedqty' in col_lower or 'affected_qty' in col_lower:
-                    display_cols.append(col)
-                    col_mapping[col] = 'Affected Qty'
+                    _claim('Affected Qty', col)
                 elif 'tradetype' in col_lower:
-                    display_cols.append(col)
-                    col_mapping[col] = 'Trade Type'
+                    _claim('Trade Type', col)
                 elif 'direction' in col_lower:
-                    display_cols.append(col)
-                    col_mapping[col] = 'Direction'
+                    _claim('Direction', col)
                 elif 'remarks' in col_lower or 'comments' in col_lower:
-                    display_cols.append(col)
-                    col_mapping[col] = 'Comments'
+                    _claim('Comments', col)
                 elif 'action' in col_lower and 'type' in col_lower:
-                    display_cols.append(col)
-                    col_mapping[col] = 'Action'
+                    _claim('Action', col)
                 elif timestamp_col and col == timestamp_col:
-                    display_cols.append(col)
-                    col_mapping[col] = 'Timestamp'
+                    _claim('Timestamp', col)
             if display_cols:
                 df_display = merged[display_cols].copy()
                 df_display = df_display.rename(columns=col_mapping)
@@ -5581,6 +5604,207 @@ def main():
         render_market_data_panel()
     elif page == "🔎 Contract Lookup":
         render_contract_price_lookup()
+    elif page == "🐅 Tiger Import":
+        render_tiger_import()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Tiger Import — Update & Reconcile UI
+# ─────────────────────────────────────────────────────────────────
+def render_tiger_import():
+    """Streamlit page: upload a fresh Tiger Activity Statement CSV; preview the
+    additive diff against the existing Data Table; apply on user approval.
+
+    See docs/plans/2026-05-04-update-reconcile-and-test-plan.md for the spec.
+    """
+    import pandas as _pd
+    from tiger_etl_update import (
+        run_update, compute_update_plan, apply_update_plan, _hash_filelike_or_path,
+    )
+    from tiger_parser import parse_file as _parse_file
+
+    st.title("🐅 Tiger Import")
+    st.caption(
+        "Upload a fresh Tiger Activity Statement CSV. The system will diff it against "
+        "the existing Data Table and propose only the new trades, closes, rolls, and "
+        "fee/NAV reconciliation. Idempotent — re-uploading the same file is a no-op."
+    )
+
+    uploaded_files = st.file_uploader(
+        "Drop one or more Tiger CSV files",
+        type=['csv'],
+        accept_multiple_files=True,
+        key="tiger_import_uploader",
+        help="Tiger Activity Statement export. Multi-file supported.",
+    )
+
+    if not uploaded_files:
+        st.info("⬆️ Upload a Tiger CSV to see the proposed update plan.")
+        # Show recent imports for reference
+        try:
+            handler = GSheetHandler(st.session_state.current_sheet_id)
+            ws = handler.spreadsheet.worksheet('Tiger Imports')
+            rows = ws.get_all_values()
+            if rows and len(rows) > 1:
+                st.subheader("📜 Recent imports")
+                df_log = _pd.DataFrame(rows[1:], columns=rows[0])
+                df_log = df_log.sort_values('Imported_At', ascending=False).head(10)
+                st.dataframe(df_log, use_container_width=True)
+        except Exception:
+            pass
+        return
+
+    # ── Build plans for all uploaded files ──
+    handler = GSheetHandler(st.session_state.current_sheet_id)
+    plans_with_stmts = []
+    with st.spinner(f"Parsing {len(uploaded_files)} file(s) and diffing against Data Table..."):
+        df_argus_cached = handler.read_data_table()
+        for uf in uploaded_files:
+            try:
+                fhash = _hash_filelike_or_path(uf)
+                stmt = _parse_file(uf, source_name=uf.name)
+                plan = compute_update_plan(stmt, df_argus_cached, uf.name, fhash, handler=handler)
+                plans_with_stmts.append((uf, plan, stmt))
+            except Exception as e:
+                st.error(f"❌ Failed to parse {uf.name}: {e}")
+                return
+
+    # ── Show one block per file ──
+    for uf, plan, stmt in plans_with_stmts:
+        st.markdown("---")
+        if plan.already_imported:
+            st.success(f"✅ **{uf.name}** — already imported. " + (plan.notes[0] if plan.notes else ''))
+            continue
+
+        # Header card
+        s = plan.summary
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("New trades", s.get('new_trades_in_csv', 0))
+        c2.metric("Inserts", s.get('inserts', 0))
+        c3.metric("Updates", s.get('updates', 0))
+        c4.metric("Rolls", s.get('roll_pairs', 0))
+        c5.metric("Orphans", s.get('orphans', 0),
+                  delta="⚠️ review" if s.get('orphans', 0) > 0 else None)
+
+        st.markdown(f"### Diff for `{uf.name}`")
+
+        tab_summary, tab_inserts, tab_updates, tab_rolls, tab_orphans, tab_cash = st.tabs(
+            ["📊 Summary", "➕ New Trades", "🔄 Updates", "♻️ Rolls", "⚠️ Orphans", "💰 Cash & Margin"]
+        )
+
+        with tab_summary:
+            st.json(s)
+            for note in plan.notes:
+                st.caption(f"ℹ️ {note}")
+
+        with tab_inserts:
+            if plan.inserts:
+                rows_disp = []
+                for ins in plan.inserts:
+                    rows_disp.append({
+                        'Source': ins.source,
+                        'Ticker': ins.fields.get('Ticker'),
+                        'Type': ins.fields.get('TradeType'),
+                        'Direction': ins.fields.get('Direction'),
+                        'Strike': ins.fields.get('Option_Strike_Price_(USD)'),
+                        'Expiry': ins.fields.get('Expiry_Date'),
+                        'Qty': ins.fields.get('Quantity'),
+                        'Premium': ins.fields.get('OptPremium'),
+                        'Date_open': ins.fields.get('Date_open'),
+                        'Status': ins.fields.get('Status'),
+                        'Pot': ins.fields.get('Pot'),
+                        'Tiger_Hash': ins.tiger_row_hash[:14] if ins.tiger_row_hash else '',
+                    })
+                st.dataframe(_pd.DataFrame(rows_disp), use_container_width=True)
+            else:
+                st.info("No new rows to insert.")
+
+        with tab_updates:
+            if plan.updates:
+                rows_disp = []
+                for u in plan.updates:
+                    diff_str = ' | '.join(
+                        f"{k}: {u.before.get(k, '?')} → {v}" for k, v in u.updates.items()
+                    )
+                    rows_disp.append({
+                        'TradeID': u.trade_id,
+                        'Source': u.source,
+                        'Changes': diff_str[:140],
+                    })
+                st.dataframe(_pd.DataFrame(rows_disp), use_container_width=True)
+            else:
+                st.info("No existing rows to update.")
+
+        with tab_rolls:
+            if plan.roll_pairs:
+                rows_disp = []
+                for rp in plan.roll_pairs:
+                    rows_disp.append({
+                        'Closed TradeID (old)': rp.get('close_old_argus_tid'),
+                        'Close hash': rp.get('close_tiger_hash', '')[:14],
+                        'New open hash': rp.get('new_open_tiger_hash', '')[:14],
+                    })
+                st.dataframe(_pd.DataFrame(rows_disp), use_container_width=True)
+            else:
+                st.info("No rolls detected.")
+
+        with tab_orphans:
+            if plan.orphans:
+                st.warning(f"⚠️ {len(plan.orphans)} orphan close/exercise event(s) — these have no matching open in ARGUS. Review before applying.")
+                st.dataframe(_pd.DataFrame(plan.orphans), use_container_width=True)
+            else:
+                st.success("✅ No orphans.")
+
+        with tab_cash:
+            st.markdown("**New cash events (will be appended to Tiger Cash tab):**")
+            if plan.cash_events_new:
+                st.dataframe(_pd.DataFrame(plan.cash_events_new), use_container_width=True)
+            else:
+                st.caption("None.")
+            st.markdown("**NAV reconciliation:**")
+            if plan.nav_drift:
+                ao = plan.nav_drift.get('tiger_account_overview', {})
+                st.json({
+                    'Tiger End NAV (USD)': plan.nav_drift.get('tiger_end_nav'),
+                    'Period End': plan.nav_drift.get('tiger_period_end'),
+                    'Tiger breakdown': ao,
+                    'Note': plan.nav_drift.get('note'),
+                })
+            else:
+                st.caption("No NAV snapshot in this CSV.")
+            st.markdown("**Holdings drift (pre-apply, pre-update — drift may resolve after Apply):**")
+            if plan.holdings_drift:
+                st.dataframe(_pd.DataFrame(plan.holdings_drift), use_container_width=True)
+            else:
+                st.success("✅ No holdings drift.")
+
+        st.markdown(f"**Fees backfilled by this update:** ${plan.fees_backfilled:,.2f}")
+
+        # ── Apply button ──
+        col_apply, col_cancel = st.columns([2, 1])
+        apply_key = f"apply_{plan.run_id}_{uf.name}"
+        if col_apply.button(f"✅ Apply Import — {uf.name}", key=apply_key, type='primary',
+                            use_container_width=True,
+                            disabled=plan.has_blocking_issues()):
+            with st.spinner("Applying — this may take ~30 seconds..."):
+                try:
+                    apply_summary = apply_update_plan(plan, stmt, handler)
+                    st.success(
+                        f"✅ Applied: {apply_summary['inserts_applied']} inserts, "
+                        f"{apply_summary['updates_applied']} updates, "
+                        f"{apply_summary['cash_events_appended']} cash events. "
+                        f"Backup saved as `{apply_summary.get('backup_tab')}`. "
+                        f"Audit: `{apply_summary.get('audit_file')}`"
+                    )
+                    if apply_summary.get('errors'):
+                        st.error("⚠️ Some errors during apply:")
+                        for err in apply_summary['errors']:
+                            st.code(err)
+                    st.balloons()
+                    st.info("🔄 Refresh the Dashboard page to see updated NAV/positions.")
+                except Exception as e:
+                    st.error(f"❌ Apply failed: {e}")
+                    st.exception(e)
 
 
 def render_market_data_panel():

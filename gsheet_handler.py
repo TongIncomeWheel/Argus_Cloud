@@ -170,11 +170,26 @@ class GSheetHandler:
     # Readers
     # ------------------------------------------------------------------
     def read_data_table(self) -> pd.DataFrame:
-        """Read 'Data Table' worksheet -> DataFrame."""
+        """Read 'Data Table' worksheet -> DataFrame.
+
+        Uses get_all_values() + manual DataFrame construction (instead of
+        get_all_records()) so that hash-like strings (e.g. Tiger_Row_Hash =
+        '8e1482330133') aren't auto-coerced to scientific-notation floats.
+        """
         try:
             ws = self.spreadsheet.worksheet("Data Table")
-            records = ws.get_all_records()
-            df = _records_to_dataframe(records, sheet_label="Data Table")
+            all_vals = ws.get_all_values()
+            if not all_vals or len(all_vals) < 2:
+                df = pd.DataFrame()
+            else:
+                headers = all_vals[0]
+                df = pd.DataFrame(all_vals[1:], columns=headers)
+                # Strip whitespace from string fields
+                for col in df.columns:
+                    df[col] = df[col].astype(str).str.strip()
+                    # Empty string -> NaN for proper handling downstream
+                    df[col] = df[col].replace({'': pd.NA, 'nan': pd.NA, 'NaT': pd.NA})
+            df = _records_to_dataframe(df.to_dict('records') if not df.empty else [], sheet_label="Data Table")
             logger.info(f"Loaded {len(df)} trades from Data Table")
             return df
         except Exception as e:

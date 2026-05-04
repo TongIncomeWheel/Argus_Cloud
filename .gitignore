@@ -3,6 +3,12 @@
 gsheet_credentials.json
 .streamlit/secrets.toml
 
+# Personal Tiger Brokers statements — contain account numbers + trade history
+tiger_samples/
+
+# Local logs
+*.log
+
 # Data (ephemeral on cloud, local-only)
 data/
 logs/
