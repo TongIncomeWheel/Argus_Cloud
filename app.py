@@ -2401,7 +2401,9 @@ def render_entry_forms():
             return "WHEEL"
         return strategy if strategy != "— Select strategy —" else None
     
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Sell CC", "Sell CSP", "BTC", "Roll", "Expire", "Assignment"])
+    tab1, tab2, tab_leap, tab3, tab4, tab5, tab6 = st.tabs([
+        "Sell CC", "Sell CSP", "Buy LEAP", "BTC", "Roll", "Expire", "Assignment"
+    ])
     
     # Get live prices for this portfolio's tickers
     live_prices = get_cached_prices(tuple(tickers_for_portfolio)) if tickers_for_portfolio else {}
@@ -2876,7 +2878,149 @@ def render_entry_forms():
                 except Exception as e:
                     st.error(f"❌ Error saving trade: {e}")
                     st.error("⚠️ Trade was NOT saved. Please try again.")
-    
+
+    # ---- BUY LEAP TAB ----
+    # PMCC backbone: long-dated long calls (or rarely long puts) bought as
+    # the synthetic-stock leg under the wheel-of-CCs PMCC strategy.
+    # Tiger CSV exports often lag real broker state; this form lets users
+    # log LEAP buys immediately when the broker UI confirms the fill.
+    with tab_leap:
+        st.subheader("Buy LEAP (PMCC long call)")
+        display_live_prices_cards()
+        entry_strategy_leap = render_strategy_selector("leap")
+
+        st.caption(
+            "Use this form to log a LEAP buy when Tiger's CSV hasn't caught up yet. "
+            "Default is long CALL (PMCC backbone). For long PUT (rare), choose option below."
+        )
+
+        leap_col1, leap_col2 = st.columns(2)
+        with leap_col1:
+            leap_ticker = st.selectbox(
+                "Ticker", options=tickers_for_portfolio,
+                index=tickers_for_portfolio.index('SPY') if 'SPY' in tickers_for_portfolio else 0,
+                key="leap_ticker_select",
+                help="Underlying. Most LEAPs are SPY for PMCC.",
+            )
+            leap_right = st.radio(
+                "Option Right",
+                options=['CALL', 'PUT'],
+                index=0,
+                key="leap_right_radio",
+                horizontal=True,
+                help="CALL = long call (LEAP, PMCC backbone). PUT = long put (protection, rare).",
+            )
+            leap_qty = st.number_input(
+                "Quantity (contracts)", min_value=1, value=1, step=1,
+                key="leap_qty_input",
+                help="Number of LEAP contracts purchased",
+            )
+        with leap_col2:
+            leap_strike = st.number_input(
+                "Strike Price ($)", min_value=0.01, value=600.00, step=1.0, format="%.2f",
+                key="leap_strike_input",
+            )
+            leap_premium = st.number_input(
+                "Premium Paid ($) — per share", min_value=0.01, value=10.00, step=0.10, format="%.2f",
+                key="leap_premium_input",
+                help="What you paid per share. Cost basis per contract = premium × 100.",
+            )
+            leap_expiry = st.date_input(
+                "Expiry Date", value=date.today() + timedelta(days=365),
+                key="leap_expiry_input",
+                help="LEAPs are typically 9–24 months out.",
+            )
+
+        leap_underlying = st.number_input(
+            "Underlying Spot (optional, $)",
+            min_value=0.0,
+            value=float(live_prices.get(leap_ticker, 0.0)) if live_prices else 0.0,
+            step=1.0, format="%.2f",
+            key="leap_underlying_input",
+            help="Current stock price at time of buy (for reference / DTE calculations).",
+        )
+        leap_remarks = st.text_input("Comments (optional)", key="leap_remarks_input")
+
+        # Cost preview
+        cost_per_contract = leap_premium * 100
+        total_cost = cost_per_contract * leap_qty
+        dte = (leap_expiry - date.today()).days if leap_expiry else 0
+
+        leap_preview_col1, leap_preview_col2, leap_preview_col3 = st.columns(3)
+        with leap_preview_col1:
+            st.metric("Cost per contract", f"${cost_per_contract:,.0f}")
+        with leap_preview_col2:
+            st.metric("Total cost", f"${total_cost:,.0f}",
+                       help=f"{leap_qty} contracts × ${cost_per_contract:,.0f}")
+        with leap_preview_col3:
+            st.metric("DTE", f"{dte}d",
+                       delta=f"{dte/365:.1f} years" if dte > 0 else None)
+
+        # Submit
+        with st.form("buy_leap_form", clear_on_submit=True):
+            submitted_leap = st.form_submit_button("💾 Submit LEAP Buy", type='primary',
+                                                     use_container_width=True)
+
+        if submitted_leap:
+            errs = []
+            if not leap_ticker:
+                errs.append("Select a ticker.")
+            if leap_strike <= 0:
+                errs.append("Enter strike price.")
+            if leap_premium <= 0:
+                errs.append("Enter premium paid.")
+            if not leap_expiry:
+                errs.append("Select expiry date.")
+            if not entry_strategy_leap or entry_strategy_leap == "— Select strategy —":
+                errs.append("Select a strategy.")
+            if errs:
+                st.error("Please fix: " + " ".join(errs))
+            else:
+                from tiger_to_argus import derive_pot
+                new_trade_id = generate_trade_id(df_trades)
+                strategy_leap = entry_strategy_leap or "PMCC"
+                # TradeType: LEAP = long call, LEAP_PUT = long put (rare)
+                trade_type = 'LEAP' if leap_right == 'CALL' else 'LEAP_PUT'
+                trade_data = {
+                    'TradeID': new_trade_id,
+                    'Ticker': leap_ticker,
+                    'StrategyType': strategy_leap,
+                    'Direction': 'Buy',
+                    'TradeType': trade_type,
+                    'Quantity': leap_qty,
+                    'Option_Strike_Price_(USD)': leap_strike,
+                    'Price_of_current_underlying_(USD)': leap_underlying if leap_underlying > 0 else '',
+                    'OptPremium': leap_premium,
+                    'Date_open': datetime.now(),
+                    'Expiry_Date': leap_expiry,
+                    'Remarks': leap_remarks or f'LEAP buy ({leap_right}) @ ${leap_premium:.2f}',
+                    'Status': 'Open',
+                    'Open_lots': 0,
+                    'Fee': 0,
+                    'Pot': derive_pot(strategy_leap),
+                    'Tiger_Row_Hash': '',
+                }
+                audit_data = {
+                    'Audit ID': generate_audit_id(st.session_state.df_audit),
+                    'Timestamp': datetime.now(),
+                    'Action Type': 'Buy LEAP',
+                    'TradeID_Ref': new_trade_id,
+                    'Remarks': f'Buy LEAP {leap_ticker} {leap_right} ${leap_strike} '
+                                f'exp {leap_expiry} x{leap_qty} @ ${leap_premium:.2f}',
+                    'ScriptName': 'Income Wheel App',
+                    'AffectedQty': leap_qty,
+                }
+                try:
+                    handler = GSheetHandler(st.session_state.current_sheet_id)
+                    handler.append_trade(trade_data)
+                    handler.append_audit(audit_data)
+                    show_success_and_clear(new_trade_id, 'leap',
+                                            f"LEAP {leap_right} bought: {leap_ticker} ${leap_strike} "
+                                            f"exp {leap_expiry} x{leap_qty} (cost ${total_cost:,.0f})")
+                except Exception as e:
+                    st.error(f"❌ Error saving trade: {e}")
+                    st.error("⚠️ Trade was NOT saved. Please try again.")
+
     # ---- BTC TAB ----
     with tab3:
         st.subheader("Buy to Close (BTC)")
@@ -3083,32 +3227,45 @@ def render_entry_forms():
                                         st.error("⚠️ Trade was NOT saved. Please try again.")
     
     # ---- ROLL TAB ----
+    # Supports both:
+    #   SHORT rolls (CC, CSP):  BTC the old (pay premium) + STO the new (receive premium)
+    #   LONG rolls  (LEAP):     STC the old (receive sell price, realize PL vs cost basis)
+    #                           + BTO the new (pay premium = new cost basis)
     with tab4:
-        st.subheader("Roll Position")
+        st.subheader("Roll Position (CC / CSP / LEAP)")
         display_live_prices_cards()
-        
+        st.caption(
+            "Roll an existing short option (CC/CSP) OR a long LEAP. "
+            "The form auto-detects the side of the underlying position and adjusts mechanics."
+        )
+
         if df_open is None or df_open.empty:
             st.warning("No open positions to roll")
         else:
-            open_options = df_open[df_open['TradeType'].isin(['CC', 'CSP'])].copy()
-            
+            # Include LEAPs alongside short options (CC/CSP)
+            open_options = df_open[df_open['TradeType'].isin(['CC', 'CSP', 'LEAP', 'LEAP_PUT'])].copy()
+
             if open_options.empty:
-                st.warning("No open CC/CSP positions to roll")
+                st.warning("No open CC/CSP/LEAP positions to roll")
             else:
                 # Normalize Expiry_Date for filtering (may be datetime or string)
                 open_options['_expiry_d'] = pd.to_datetime(open_options['Expiry_Date'], errors='coerce').dt.date
                 open_options['_expiry_str'] = open_options['_expiry_d'].astype(str)
-                
+
                 # ---- Filters: Ticker, Option Type, Expiry Date (dropdowns) ----
                 st.markdown("**🔍 Filter positions available for roll**")
                 fcol1, fcol2, fcol3 = st.columns(3)
                 tickers_available = ["— Select —"] + sorted(open_options['Ticker'].dropna().unique().tolist())
                 expiries_available = ["— Select —"] + sorted(open_options['_expiry_str'].dropna().unique().tolist())
-                
+
                 with fcol1:
                     filter_ticker = st.selectbox("Ticker", tickers_available, key=f"roll_filter_ticker_{fv}", index=0)
                 with fcol2:
-                    filter_type = st.selectbox("Option Type", ["— Select —", "CC", "CSP"], key=f"roll_filter_type_{fv}", index=0)
+                    filter_type = st.selectbox(
+                        "Option Type",
+                        ["— Select —", "CC", "CSP", "LEAP", "LEAP_PUT"],
+                        key=f"roll_filter_type_{fv}", index=0,
+                    )
                 with fcol3:
                     filter_expiry = st.selectbox("Expiry Date", expiries_available, key=f"roll_filter_expiry_{fv}", index=0)
                 
@@ -3138,18 +3295,48 @@ def render_entry_forms():
                         quantity = int(pd.to_numeric(original['Quantity'], errors='coerce') or 0)
                         original_premium = float(pd.to_numeric(original['OptPremium'], errors='coerce') or 0.0)
                         orig_strike = float(pd.to_numeric(original['Option_Strike_Price_(USD)'], errors='coerce') or 0.0)
-                        st.write(f"**Rolling:** {original['TradeType']} {original['Ticker']}")
+
+                        # Auto-detect LONG vs SHORT side from TradeType
+                        is_long_roll = original['TradeType'] in ('LEAP', 'LEAP_PUT')
+                        side_label = "LONG (LEAP)" if is_long_roll else "SHORT (CC/CSP)"
+
+                        st.write(f"**Rolling:** {original['TradeType']} {original['Ticker']} — *{side_label}*")
                         st.write(f"**Current Strike:** ${orig_strike:.2f}")
                         st.write(f"**Current Expiry:** {original['_expiry_str']}")
                         st.write(f"**Quantity:** {quantity} contract(s)")
+                        if is_long_roll:
+                            st.info(
+                                "🔄 **LEAP roll mechanics:** Sell-to-Close (STC) the old long position "
+                                "→ realize P&L vs cost basis → Buy-to-Open (BTO) the new long position "
+                                "with a new cost basis."
+                            )
                         st.divider()
+
                         col1, col2 = st.columns(2)
                         with col1:
                             new_strike = st.number_input("New Strike ($)", min_value=0.0, step=0.50, key=f"roll_new_strike_{fv}", value=0.0)
                             new_expiry = st.date_input("New Expiry", min_value=date.today(), key=f"roll_new_expiry_{fv}", value=None)
                         with col2:
-                            btc_cost = st.number_input("BTC Cost (to close old, $)", min_value=0.0, step=0.01, key=f"roll_btc_cost_{fv}", value=0.0)
-                            new_premium = st.number_input("New Premium ($)", min_value=0.0, step=0.01, key=f"roll_new_premium_{fv}", value=0.0)
+                            if is_long_roll:
+                                btc_cost = st.number_input(
+                                    "STC Sell Price (per share, $) — what you received",
+                                    min_value=0.0, step=0.01, key=f"roll_btc_cost_{fv}", value=0.0,
+                                    help="What you sold the OLD LEAP for (per share). Cash inflow.",
+                                )
+                                new_premium = st.number_input(
+                                    "BTO Cost (per share, $) — what you paid for new",
+                                    min_value=0.0, step=0.01, key=f"roll_new_premium_{fv}", value=0.0,
+                                    help="What you paid for the NEW LEAP (per share). Cash outflow = new cost basis.",
+                                )
+                            else:
+                                btc_cost = st.number_input(
+                                    "BTC Cost (to close old short, $)",
+                                    min_value=0.0, step=0.01, key=f"roll_btc_cost_{fv}", value=0.0,
+                                )
+                                new_premium = st.number_input(
+                                    "New Premium ($)",
+                                    min_value=0.0, step=0.01, key=f"roll_new_premium_{fv}", value=0.0,
+                                )
                         quantity_to_roll = st.number_input(
                             "Quantity to roll (contracts)",
                             min_value=0,
@@ -3158,21 +3345,25 @@ def render_entry_forms():
                             step=1,
                             key=f"roll_quantity_{fv}"
                         )
-                        old_position_profit = (original_premium - btc_cost) * 100 * quantity_to_roll
-                        total_premium_received = original_premium * 100 * quantity_to_roll
-                        # Net Credit/Debit = original premium + new premium - cost to close (includes all cash flows)
-                        net_credit = (original_premium + new_premium - btc_cost) * 100 * quantity_to_roll
+
+                        # Side-aware P&L math
+                        if is_long_roll:
+                            # Old LEAP: sold at btc_cost (per share), bought originally at original_premium
+                            #   PL = (sell_price - cost_basis) × 100 × qty
+                            old_position_profit = (btc_cost - original_premium) * 100 * quantity_to_roll
+                            # Net cash impact = received from STC - paid for BTO
+                            net_credit = (btc_cost - new_premium) * 100 * quantity_to_roll
+                            old_pl_formula = f"(${btc_cost:.2f} sell − ${original_premium:.2f} original cost) × 100 × {quantity_to_roll}"
+                            net_formula = f"(${btc_cost:.2f} STC received − ${new_premium:.2f} BTO paid) × 100 × {quantity_to_roll}"
+                        else:
+                            # Short side (CC/CSP): close = pay; new = receive
+                            old_position_profit = (original_premium - btc_cost) * 100 * quantity_to_roll
+                            net_credit = (original_premium + new_premium - btc_cost) * 100 * quantity_to_roll
+                            old_pl_formula = f"(${original_premium:.2f} received − ${btc_cost:.2f} paid) × 100 × {quantity_to_roll}"
+                            net_formula = f"(${original_premium:.2f} orig + ${new_premium:.2f} new − ${btc_cost:.2f} close) × 100 × {quantity_to_roll}"
+
                         st.divider()
                         st.markdown("#### 📊 Roll Calculations (live)")
-                        st.markdown("**💰 Premium Received (P&L):**")
-                        col_prem1, col_prem2, col_prem3 = st.columns(3)
-                        with col_prem1:
-                            st.metric("Old Premium Received", f"${original_premium:.2f}")
-                        with col_prem2:
-                            st.metric("Quantity", f"{quantity_to_roll} contract(s)")
-                        with col_prem3:
-                            st.metric("**Total Premium Received**", f"**${total_premium_received:,.2f}**")
-                        st.caption(f"Premium received when sold: ${original_premium:.2f} × 100 × {quantity_to_roll} = ${total_premium_received:,.2f}")
                         col1, col2 = st.columns(2)
                         with col1:
                             st.markdown("**Old Position P&L (Being Closed):**")
@@ -3180,20 +3371,21 @@ def render_entry_forms():
                                 st.success(f"💰 Profit: ${old_position_profit:,.2f}")
                             else:
                                 st.error(f"📉 Loss: ${old_position_profit:,.2f}")
-                            st.caption(f"Formula: (${original_premium:.2f} received - ${btc_cost:.2f} paid) × 100 × {quantity_to_roll} = ${old_position_profit:,.2f}")
-                            st.info(f"✅ This P&L (${old_position_profit:,.2f}) will be recorded as **Actual_Profit_(USD)** on the old position.")
+                            st.caption(f"Formula: {old_pl_formula} = ${old_position_profit:,.2f}")
+                            st.info(f"This P&L will be recorded as **Actual_Profit_(USD)** on {old_trade_id}.")
                         with col2:
                             st.markdown("**Net Credit/Debit from Roll:**")
                             if net_credit >= 0:
                                 st.success(f"💵 Net Credit: ${net_credit:,.2f}")
                             else:
                                 st.warning(f"💸 Net Debit: ${abs(net_credit):,.2f}")
-                            st.caption(f"Formula: (${original_premium:.2f} orig + ${new_premium:.2f} new − ${btc_cost:.2f} close) × 100 × {quantity_to_roll} = ${net_credit:,.2f}")
-                            st.info("💡 Original premium received + new premium − cost to close old = net credit/debit.")
+                            st.caption(f"Formula: {net_formula} = ${net_credit:,.2f}")
+
                         submitted = st.button("Execute Roll", type="primary", key="roll_submit_btn")
                     else:
                         st.caption("Select a position above to roll.")
                         submitted = False
+                        is_long_roll = False  # default for downstream branch
                 
                 if submitted and not filtered.empty and selected and selected != "— Select position —":
                         roll_errs = []
@@ -3216,15 +3408,25 @@ def render_entry_forms():
                                 _qty_save = quantity_to_roll  # BUG-04 fix: use quantity_to_roll, not original['Quantity']
                                 _orig_prem = float(pd.to_numeric(original['OptPremium'], errors='coerce') or 0.0)
                                 orig_strike = float(pd.to_numeric(original['Option_Strike_Price_(USD)'], errors='coerce') or 0.0)  # BUG-06 fix: guarded conversion
-                                old_position_profit = (_orig_prem - btc_cost) * 100 * _qty_save
-                                net_credit_save = (_orig_prem + new_premium - btc_cost) * 100 * _qty_save
+                                # Side-aware P&L re-calculated at apply time
+                                if is_long_roll:
+                                    old_position_profit = (btc_cost - _orig_prem) * 100 * _qty_save
+                                    net_credit_save = (btc_cost - new_premium) * 100 * _qty_save
+                                else:
+                                    old_position_profit = (_orig_prem - btc_cost) * 100 * _qty_save
+                                    net_credit_save = (_orig_prem + new_premium - btc_cost) * 100 * _qty_save
                                 orig_strat = original.get('StrategyType') or entry_strategy or 'WHEEL'
                                 if orig_strat == "— Select strategy —":
                                     orig_strat = 'WHEEL'
 
+                                # Direction for the NEW position depends on side:
+                                #   short roll → STO (sell to open) → 'Sell'
+                                #   long roll  → BTO (buy to open) → 'Buy'
+                                new_direction = 'Buy' if is_long_roll else 'Sell'
+                                roll_action_label = 'LEAP Roll' if is_long_roll else 'Roll'
+
                                 try:
                                     handler = GSheetHandler(st.session_state.current_sheet_id)
-                                    # BUG-01 fix: use atomic_transaction for all 3 operations
                                     ops = [
                                         {'type': 'update_trade', 'data': {
                                             'trade_id': old_trade_id,
@@ -3240,7 +3442,7 @@ def render_entry_forms():
                                             'TradeID': new_trade_id,
                                             'Ticker': original['Ticker'],
                                             'StrategyType': orig_strat,
-                                            'Direction': 'Sell',
+                                            'Direction': new_direction,
                                             'TradeType': original['TradeType'],
                                             'Quantity': _qty_save,
                                             'Option_Strike_Price_(USD)': new_strike,
@@ -3250,8 +3452,7 @@ def render_entry_forms():
                                             'Expiry_Date': new_expiry,
                                             'Status': 'Open',
                                             'Remarks': f"Rolled from {old_trade_id}",
-                                            'Open_lots': _qty_save * 100,
-                                            # New schema fields — inherit Pot from original or derive from strategy
+                                            'Open_lots': _qty_save * 100 if not is_long_roll else 0,
                                             'Fee': 0,
                                             'Pot': original.get('Pot') or ('Active' if orig_strat == 'ActiveCore' else 'Base'),
                                             'Tiger_Row_Hash': '',
@@ -3259,9 +3460,14 @@ def render_entry_forms():
                                         {'type': 'append_audit', 'data': {
                                             'Audit ID': generate_audit_id(st.session_state.df_audit),
                                             'Timestamp': datetime.now(),
-                                            'Action Type': 'Roll',
+                                            'Action Type': roll_action_label,
                                             'TradeID_Ref': f"{old_trade_id}, {new_trade_id}",
-                                            'Remarks': f"Net credit: ${net_credit_save:.2f}",
+                                            'Remarks': (
+                                                f"LEAP Roll — STC ${btc_cost:.2f} → BTO ${new_premium:.2f}, "
+                                                f"P&L ${old_position_profit:.2f}, net ${net_credit_save:.2f}"
+                                                if is_long_roll
+                                                else f"Net credit: ${net_credit_save:.2f}"
+                                            ),
                                             'ScriptName': 'Income Wheel App',
                                             'AffectedQty': _qty_save
                                         }}
