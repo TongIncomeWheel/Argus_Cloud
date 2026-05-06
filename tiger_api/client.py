@@ -35,88 +35,113 @@ class TigerAssets:
     raw: object          # raw SDK object for debugging
 
 
-def _bootstrap_from_streamlit_secrets() -> bool:
-    """If running on Streamlit Cloud (no local .properties file present),
-    materialize the file from `st.secrets["tiger"]["properties"]` content.
+def _bootstrap_from_streamlit_secrets() -> Optional[Path]:
+    """If running on Streamlit Cloud, materialize tiger_openapi_config.properties
+    from `st.secrets["tiger"]["properties"]` and return the directory it was
+    written to.
 
-    The user puts the ENTIRE .properties file content into a single multi-line
-    secret in Streamlit Cloud's secrets manager:
+    Tries 3 writable locations in order (covers Cloud + Docker + local quirks):
+      1. .streamlit/  (relative to project root) — preferred if writable
+      2. /tmp/argus_tiger_config/  — Cloud always allows /tmp
+      3. tempfile.gettempdir()/argus_tiger_config/  — cross-platform fallback
 
-        # .streamlit/secrets.toml on Cloud (set via Cloud UI)
-        [tiger]
-        properties = '''
-        private_key=<base64 key content>
-        private_key_pk8=<base64 key content>
-        tiger_id=20159040
-        account=50179929
-        license=TBSG
-        env=PROD
-        '''
-
-    Returns True if file was successfully materialized, False otherwise.
+    Returns the Path of the dir the file was written to, or None if no secrets
+    were available.
     """
     try:
         import streamlit as st
-        if "tiger" not in st.secrets:
-            return False
+    except ImportError:
+        logger.warning("streamlit not importable — cannot bootstrap secrets")
+        return None
+    try:
+        # Probe st.secrets — `in` operator works without raising even if no secrets
+        try:
+            has_tiger = "tiger" in st.secrets
+        except Exception as e:
+            logger.warning("st.secrets unavailable: %s", e)
+            return None
+        if not has_tiger:
+            logger.warning("st.secrets has no [tiger] section")
+            return None
         tiger_secrets = st.secrets["tiger"]
         # Accept either 'properties' (whole file) or individual keys
-        properties_content = tiger_secrets.get("properties", "")
+        properties_content = ""
+        try:
+            properties_content = str(tiger_secrets.get("properties", "") or "")
+        except Exception:
+            pass
         if not properties_content:
-            # Fallback: rebuild from individual keys if the user prefers that style
             keys_in_order = ("private_key", "private_key_pk8", "tiger_id",
                              "account", "license", "env")
             lines = []
             for k in keys_in_order:
-                v = tiger_secrets.get(k)
+                try:
+                    v = tiger_secrets.get(k)
+                except Exception:
+                    v = None
                 if v:
                     lines.append(f"{k}={v}")
             properties_content = "\n".join(lines)
-        if not properties_content:
-            return False
-        # Write to .streamlit/ relative to project root (same path the resolver expects)
-        target_dir = Path(__file__).parent.parent / ".streamlit"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_file = target_dir / "tiger_openapi_config.properties"
-        target_file.write_text(properties_content.strip() + "\n", encoding="utf-8")
-        logger.info("Bootstrapped Tiger config from st.secrets → %s", target_file)
-        return True
+        if not properties_content.strip():
+            logger.warning("Tiger secrets present but no usable content")
+            return None
+
+        content = properties_content.strip() + "\n"
+        # Try multiple writable locations
+        import tempfile
+        candidates = [
+            Path(__file__).parent.parent / ".streamlit",
+            Path("/tmp") / "argus_tiger_config",
+            Path(tempfile.gettempdir()) / "argus_tiger_config",
+        ]
+        for target_dir in candidates:
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target_file = target_dir / "tiger_openapi_config.properties"
+                target_file.write_text(content, encoding="utf-8")
+                logger.info("Bootstrapped Tiger config from st.secrets → %s", target_file)
+                return target_dir
+            except (OSError, PermissionError) as we:
+                logger.warning("Cannot write Tiger config to %s: %s", target_dir, we)
+                continue
+        logger.error("All bootstrap target dirs failed — Tiger config not materialized")
+        return None
     except Exception as e:
-        logger.warning("Tiger secrets bootstrap failed: %s", e)
-        return False
+        logger.warning("Tiger secrets bootstrap exception: %s", e)
+        return None
 
 
 def _resolve_config_dir() -> Path:
     """Find directory containing tiger_openapi_config.properties.
 
     Resolution order:
-      1. $TIGER_CONFIG_PATH env var
-      2. .streamlit/tiger_openapi_config.properties (default local path)
-      3. If neither exists, attempt bootstrap from Streamlit secrets and retry
+      1. $TIGER_CONFIG_PATH env var (file or dir)
+      2. .streamlit/tiger_openapi_config.properties relative to project root
+      3. If neither exists, bootstrap from Streamlit secrets and use that path
     """
     cfg_rel = os.getenv("TIGER_CONFIG_PATH", _DEFAULT_CONFIG_REL)
     cfg_path = Path(cfg_rel)
-    # If env var points to a file, use its parent dir; if it points to a dir, use it.
     if not cfg_path.is_absolute():
-        # Resolve relative to ARGUS_Cloud root (this module's grandparent)
         cfg_path = Path(__file__).parent.parent / cfg_rel
     if cfg_path.is_file():
         return cfg_path.parent
     if cfg_path.is_dir():
         return cfg_path
 
-    # Not found — try Streamlit Cloud secrets bootstrap
-    if _bootstrap_from_streamlit_secrets():
-        # Retry after writing the file
-        if cfg_path.is_file():
-            return cfg_path.parent
-        if cfg_path.is_dir():
-            return cfg_path
+    # Not found locally — try Streamlit Cloud secrets bootstrap
+    bootstrapped_dir = _bootstrap_from_streamlit_secrets()
+    if bootstrapped_dir is not None:
+        # Update env var so subsequent calls (and logs) point at the right place
+        os.environ["TIGER_CONFIG_PATH"] = str(bootstrapped_dir)
+        return bootstrapped_dir
 
     raise FileNotFoundError(
-        f"Tiger config not found. Set $TIGER_CONFIG_PATH, place "
-        f"tiger_openapi_config.properties at {cfg_path}, or configure "
-        f"`[tiger] properties = \"...\"` in Streamlit Cloud secrets."
+        f"Tiger config not found. Either:\n"
+        f"  • Set $TIGER_CONFIG_PATH to a directory containing "
+        f"    tiger_openapi_config.properties\n"
+        f"  • Place the file at {cfg_path}\n"
+        f"  • Configure Streamlit Cloud secrets with a [tiger] section "
+        f"    containing `properties = \"\"\"...\"\"\"` (full .properties content)"
     )
 
 
