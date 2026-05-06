@@ -1987,7 +1987,7 @@ def render_transactions(df_orders: pd.DataFrame, days: int = 14):
 # 📅 LADDER — P&L Expiry Ladder (premium realization schedule)
 # ────────────────────────────────────────────────────────────────
 @st.fragment
-def render_ladder(df_open, spot_prices: dict = None):
+def render_ladder(df_open, spot_prices: dict = None, settings: dict = None):
     """📅 P&L Expiry Ladder — calendar of premium realization & capital release.
 
     For each week (Friday ending) ahead:
@@ -1996,9 +1996,11 @@ def render_ladder(df_open, spot_prices: dict = None):
       • Weekly aggregate: total premium captured if all expire worthless,
                          CSP collateral released, # contracts expiring
 
+    Filters: Type · Ticker · Pot · Weeks-ahead · Moneyness (ITM/OTM)
     Uses Alpaca option quotes (cached, batched) for current Last price + mid.
     Uses spot prices (Yahoo/Alpaca) to determine ITM/OTM moneyness.
     """
+    settings = settings or {}
     st.markdown("### 📅 P&L Expiry Ladder")
     st.caption(
         "Forward-looking premium realization schedule. Each row is one open option "
@@ -2059,28 +2061,40 @@ def render_ladder(df_open, spot_prices: dict = None):
             logger.debug("Ladder option quote fetch failed: %s", e)
 
     # ── Filters ────────────────────────────────────────────────
-    f1 = st.columns([1, 1, 1, 1, 1])
+    ticker_pots = settings.get("ticker_pots", {}) or {}
+    available_pots = sorted({str(p) for p in ticker_pots.values() if p}) or ["Core", "Active"]
+    f1 = st.columns([1, 1, 1, 1, 1, 1])
     type_options = ["All"] + sorted(options["TradeType"].dropna().unique().tolist())
     type_filter = f1[0].selectbox("Type", type_options, key="ladder_type_filter")
     ticker_options = ["All"] + sorted(options["Ticker"].dropna().unique().tolist())
     ticker_filter = f1[1].selectbox("Ticker", ticker_options, key="ladder_ticker_filter")
-    weeks_ahead = f1[2].number_input(
+    pot_filter = f1[2].multiselect(
+        "Pot(s)", available_pots, key="ladder_pot_filter",
+        placeholder="All pots",
+        help="Restrict to tickers in selected pot(s). Empty = all.",
+    )
+    weeks_ahead = f1[3].number_input(
         "Show next N weeks", min_value=1, max_value=104, value=12, step=1,
         key="ladder_weeks_ahead",
         help="Limit to nearest N weeks. Set high (52+) to include LEAPs.",
     )
-    moneyness_filter = f1[3].selectbox(
+    moneyness_filter = f1[4].selectbox(
         "Moneyness", ["All", "OTM only", "ITM only"], key="ladder_money_filter",
         help="Filter by current ITM/OTM status vs spot.",
     )
-    if f1[4].button("Reset", key="ladder_reset", use_container_width=True):
-        for k in ("ladder_type_filter", "ladder_ticker_filter",
+    if f1[5].button("Reset", key="ladder_reset", use_container_width=True):
+        for k in ("ladder_type_filter", "ladder_ticker_filter", "ladder_pot_filter",
                   "ladder_weeks_ahead", "ladder_money_filter"):
             st.session_state.pop(k, None)
         try:
             st.rerun(scope="fragment")
         except TypeError:
             st.rerun()
+
+    # Resolve pot filter → set of tickers
+    pot_tickers_set = None
+    if pot_filter:
+        pot_tickers_set = {t for t, p in ticker_pots.items() if p in pot_filter}
 
     # ── Build per-position row data ────────────────────────────
     cutoff = today + pd.Timedelta(weeks=int(weeks_ahead))
@@ -2098,6 +2112,8 @@ def render_ladder(df_open, spot_prices: dict = None):
             if type_filter != "All" and ttype != type_filter:
                 continue
             if ticker_filter != "All" and tkr != ticker_filter:
+                continue
+            if pot_tickers_set is not None and tkr not in pot_tickers_set:
                 continue
             qty = abs(int(r["Quantity"])) if r.get("Quantity") else 0
             avg = float(r.get("_avg_cost") or 0)
@@ -2356,10 +2372,12 @@ _OPTION_TYPES = {"CSP", "CC", "LEAP"}
 
 
 @st.fragment
-def render_pl(df_orders, df_open):
+def render_pl(df_orders, df_open, settings: dict = None):
     """📊 P&L Analytics — Realized (period) + Unrealized (snapshot), split by
     Stock vs Options, with cumulative curve chart and per-ticker breakdown.
+    Supports filters by Period · Month · Ticker(s) · Pot(s).
     """
+    settings = settings or {}
     st.markdown("### 📊 P&L Analytics")
     st.caption(
         "**Realized** = closed trades within the selected period (Tiger's "
@@ -2430,9 +2448,12 @@ def render_pl(df_orders, df_open):
 
     days_in_period = max(1, (end - start).days)
 
-    # ── Ticker filter (multiselect, applies on top of period) ──
+    # ── Ticker + Pot filters (multiselect, apply on top of period) ──
     available_tickers = sorted(df_orders.get("Ticker", pd.Series(dtype=str)).dropna().unique().tolist())
-    f1, f2 = st.columns([3, 2])
+    ticker_pots = settings.get("ticker_pots", {}) or {}
+    available_pots = sorted({str(p) for p in ticker_pots.values() if p}) or ["Core", "Active"]
+
+    f1, f2, f3 = st.columns([2, 2, 1])
     with f1:
         ticker_filter = st.multiselect(
             "Filter by Ticker(s)",
@@ -2443,21 +2464,39 @@ def render_pl(df_orders, df_open):
                  "Leave empty to include every ticker.",
         )
     with f2:
+        pot_filter = st.multiselect(
+            "Filter by Pot(s)",
+            available_pots,
+            key="pl_pot_filter",
+            placeholder="All pots (leave empty for all)",
+            help="Restrict P&L to tickers assigned to specific pot(s) "
+                 "(Core / Active). Set per-ticker in Config tab. "
+                 "Composes with Ticker filter (intersection).",
+        )
+    with f3:
+        st.write("")
         if st.button("Reset filters", key="pl_reset", use_container_width=True):
             for k in ("pl_period", "pl_month_pick", "pl_ticker_filter",
-                      "pl_start_custom", "pl_end_custom"):
+                      "pl_pot_filter", "pl_start_custom", "pl_end_custom"):
                 st.session_state.pop(k, None)
             try:
                 st.rerun(scope="fragment")
             except TypeError:
                 st.rerun()
 
-    # ── Apply period + ticker filters ──────────────────────────
+    # Resolve pot filter → set of tickers in those pots
+    pot_tickers = None  # None = no pot filter applied
+    if pot_filter:
+        pot_tickers = {t for t, p in ticker_pots.items() if p in pot_filter}
+
+    # ── Apply period + ticker + pot filters ───────────────────
     df = df_orders.copy()
     df["TradeDate"] = pd.to_datetime(df["TradeDate"], errors="coerce")
     df = df[(df["TradeDate"] >= pd.Timestamp(start)) & (df["TradeDate"] <= pd.Timestamp(end))]
     if ticker_filter:
         df = df[df["Ticker"].isin(ticker_filter)]
+    if pot_tickers is not None:
+        df = df[df["Ticker"].isin(pot_tickers)]
     closed = df[df["is_opening"] == False].copy()
 
     # ── Compute realized split (stock vs options) ──────────────
@@ -2486,11 +2525,13 @@ def render_pl(df_orders, df_open):
     if df_open is not None and not df_open.empty:
         d = df_open.copy()
         d["_unrealized_pnl"] = pd.to_numeric(d.get("_unrealized_pnl", 0), errors="coerce").fillna(0)
-        # Apply ticker filter to unrealized snapshot too (period filter doesn't
-        # apply to unrealized — those are current open positions regardless of
-        # when they were opened).
+        # Apply ticker + pot filters to unrealized snapshot too (period filter
+        # doesn't apply to unrealized — those are current open positions
+        # regardless of when they were opened).
         if ticker_filter:
             d = d[d["Ticker"].isin(ticker_filter)]
+        if pot_tickers is not None:
+            d = d[d["Ticker"].isin(pot_tickers)]
         stk_o = d[d["TradeType"].isin(list(_STOCK_TYPES))]
         opt_o = d[d["TradeType"].isin(list(_OPTION_TYPES))]
         unrealized_stock = float(stk_o["_unrealized_pnl"].sum())
@@ -2672,10 +2713,12 @@ def render_pl(df_orders, df_open):
             Realized=("Actual_Profit_(USD)", "sum"),
             Trades=("TradeID", "count"),
         ).reset_index()
-        # df_open ticker-filtered version for unrealized — d was built earlier with filter applied
+        # df_open ticker+pot-filtered version for unrealized — d was built earlier with filter applied
         df_open_filtered = df_open.copy() if df_open is not None else None
         if df_open_filtered is not None and ticker_filter:
             df_open_filtered = df_open_filtered[df_open_filtered["Ticker"].isin(ticker_filter)]
+        if df_open_filtered is not None and pot_tickers is not None:
+            df_open_filtered = df_open_filtered[df_open_filtered["Ticker"].isin(pot_tickers)]
         if df_open_filtered is not None and not df_open_filtered.empty:
             by_tk_unrl = df_open_filtered.groupby("Ticker").agg(
                 Unrealized=("_unrealized_pnl", "sum"),
@@ -2771,7 +2814,9 @@ def render_risk(df_open, summary, settings, spot_prices: dict = None):
         shorts_df["DTE"] = (shorts_df["Expiry_dt"] - today).dt.days
 
     # Filter row above the candidates table
-    rc1, rc2, rc3, rc4 = st.columns([2, 1, 1, 1])
+    ticker_pots = settings.get("ticker_pots", {}) or {}
+    available_pots = sorted({str(p) for p in ticker_pots.values() if p}) or ["Core", "Active"]
+    rc1, rc2, rc3, rc4, rc5 = st.columns([2, 1, 1, 1, 1])
     with rc1:
         threshold_pct = st.slider(
             "Profit captured threshold (%)",
@@ -2786,12 +2831,18 @@ def render_risk(df_open, summary, settings, spot_prices: dict = None):
             help="Filter to just CSPs or CCs.",
         )
     with rc3:
+        cand_pot_filter = st.multiselect(
+            "Pot(s)", available_pots, key="rr_pot_filter",
+            placeholder="All pots",
+            help="Restrict to tickers in selected pot(s). Empty = all.",
+        )
+    with rc4:
         cand_dte_max = st.number_input(
             "Max DTE", min_value=0, max_value=400, value=400, step=5,
             key="rr_dte_max",
             help="Hide candidates with DTE above this. Useful to focus on near-expiry.",
         )
-    with rc4:
+    with rc5:
         sort_by = st.selectbox(
             "Sort by",
             ["Captured % ↓", "Captured $ ↓", "DTE ↑", "DTE ↓",
@@ -2799,6 +2850,11 @@ def render_risk(df_open, summary, settings, spot_prices: dict = None):
             key="rr_sort_by",
             help="Default: highest captured % first.",
         )
+
+    # Resolve pot filter → set of tickers
+    cand_pot_tickers = None
+    if cand_pot_filter:
+        cand_pot_tickers = {t for t, p in ticker_pots.items() if p in cand_pot_filter}
 
     candidates = []
     for _, r in shorts_df.iterrows():
@@ -2825,6 +2881,8 @@ def render_risk(df_open, summary, settings, spot_prices: dict = None):
             remaining_dollars = last * 100 * qty
             dte = int(r["DTE"]) if pd.notna(r["DTE"]) else 0
             if cand_type != "All" and ttype != cand_type:
+                continue
+            if cand_pot_tickers is not None and tkr not in cand_pot_tickers:
                 continue
             if dte > cand_dte_max:
                 continue
@@ -3631,7 +3689,7 @@ def main():
     elif active == "transactions":
         render_transactions(df_orders, days=14)
     elif active == "ladder":
-        render_ladder(df_open, spot_prices)
+        render_ladder(df_open, spot_prices, settings)
     elif active == "pl":
         # P&L analytics gets full-history (live 90d + on-disk archive merged)
         df_orders_full = tiger_data.load_orders_full(pmcc_tuple)
@@ -3639,7 +3697,7 @@ def main():
             df_orders_full = df_orders_full[
                 ~df_orders_full["Ticker"].str.upper().isin(ignored)
             ].reset_index(drop=True)
-        render_pl(df_orders_full, df_open)
+        render_pl(df_orders_full, df_open, settings)
     elif active == "risk":
         render_risk(df_open, summary, settings, spot_prices)
     elif active == "lookup":
