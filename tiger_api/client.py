@@ -71,8 +71,8 @@ def _bootstrap_from_streamlit_secrets() -> Optional[Path]:
         except Exception:
             pass
         if not properties_content:
-            keys_in_order = ("private_key", "private_key_pk8", "tiger_id",
-                             "account", "license", "env")
+            keys_in_order = ("private_key_pk1", "private_key_pk8", "private_key",
+                             "tiger_id", "account", "license", "env")
             lines = []
             for k in keys_in_order:
                 try:
