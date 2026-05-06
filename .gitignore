@@ -3,6 +3,13 @@
 gsheet_credentials.json
 .streamlit/secrets.toml
 
+# Tiger Open API — credentials & private key (NEVER commit)
+*.pem
+.streamlit/tiger_private_key*
+.streamlit/tiger_openapi_config.properties
+tiger_openapi_config.properties
+tiger_openapi_token.properties
+
 # Personal Tiger Brokers statements — contain account numbers + trade history
 tiger_samples/
 

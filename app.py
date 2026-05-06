@@ -505,7 +505,7 @@ def render_sidebar():
                 ["📊 Dashboard", "📅 Daily Helper", "📝 Entry Forms",
                  "📈 Expiry Ladder", "📉 Performance", "📋 All Positions", "⚙️ Margin Config",
                  "🔍 Income Scanner", "📡 Market Data", "🔎 Contract Lookup",
-                 "🐅 Tiger Import"],
+                 "🐅 Tiger Import", "🟢 Tiger Live"],
                 key="navigation_radio",
                 label_visibility="collapsed"
             )
@@ -5888,6 +5888,8 @@ def main():
         render_contract_price_lookup()
     elif page == "🐅 Tiger Import":
         render_tiger_import()
+    elif page == "🟢 Tiger Live":
+        render_tiger_live()
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -6351,6 +6353,308 @@ def render_market_data_panel():
                 st.dataframe(df_bars, use_container_width=True, hide_index=True)
             else:
                 st.warning(f"No data returned for {hist_ticker}. Check ticker symbol.")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Tiger Live — Read-only reconcile vs API (Phase 1)
+# ─────────────────────────────────────────────────────────────────
+def render_tiger_live():
+    """Tiger Live page — pulls live broker state directly from Tiger Open API
+    and shows it side-by-side with what ARGUS Data Table holds.
+
+    READ-ONLY. No writes to gSheet. No orders placed. The user uses this to
+    eyeball drift between broker reality and ARGUS state. Phase 2 adds an
+    Apply button to write the diff into Data Table.
+    """
+    st.title("🟢 Tiger Live — Read-only Reconcile")
+    st.caption(
+        "Live broker state from Tiger Open API. ARGUS Data Table on the left, "
+        "Tiger reality on the right. Drift is highlighted. **No writes.**"
+    )
+
+    # Lazy import so the page only fails if Tiger SDK is missing — rest of app
+    # keeps working even without the API installed.
+    try:
+        from tiger_api.client import TigerClient
+    except ImportError as e:
+        st.error(f"Tiger SDK not available: {e}\n\nRun: `pip install tigeropen` and restart.")
+        return
+
+    @st.cache_data(ttl=30, show_spinner=False)
+    def _fetch_tiger_state():
+        """One round-trip per tab refresh, cached 30s. Returns dict with all reads."""
+        c = TigerClient()
+        out = {
+            "account": c.account,
+            "license": c.license,
+            "sandbox": c.is_sandbox,
+            "ts": datetime.now().isoformat(timespec='seconds'),
+        }
+        try:
+            out["assets"] = c.get_assets()
+        except Exception as e:
+            out["assets_err"] = str(e)
+        try:
+            pa = c.get_prime_assets()
+            out["prime_segments"] = {}
+            if pa and hasattr(pa, "segments"):
+                for k, seg in pa.segments.items():
+                    out["prime_segments"][k] = {
+                        "currency": getattr(seg, "currency", "?"),
+                        "cash_balance": float(getattr(seg, "cash_balance", 0) or 0),
+                        "cash_available_for_trade": float(getattr(seg, "cash_available_for_trade", 0) or 0),
+                        "gross_position_value": float(getattr(seg, "gross_position_value", 0) or 0),
+                        "equity_with_loan": float(getattr(seg, "equity_with_loan", 0) or 0),
+                        "capability": getattr(seg, "capability", "?"),
+                    }
+        except Exception as e:
+            out["prime_err"] = str(e)
+        try:
+            out["stk_positions"] = c.get_stock_positions()
+            out["opt_positions"] = c.get_option_positions()
+        except Exception as e:
+            out["positions_err"] = str(e)
+        try:
+            out["filled_7d"] = c.get_filled_orders(days=7)
+        except Exception as e:
+            out["fills_err"] = str(e)
+        try:
+            out["funding_df"] = c.get_funding_history()
+        except Exception as e:
+            out["funding_err"] = str(e)
+        return out
+
+    # Refresh button
+    refresh_col, status_col = st.columns([1, 4])
+    with refresh_col:
+        if st.button("🔄 Refresh from Tiger", type="primary", use_container_width=True):
+            _fetch_tiger_state.clear()
+            st.rerun()
+    with status_col:
+        st.caption(f"Cached 30s · click to force refresh.")
+
+    with st.spinner("Calling Tiger Open API..."):
+        try:
+            state = _fetch_tiger_state()
+        except Exception as e:
+            st.error(f"❌ Tiger API call failed: {e}")
+            st.info(
+                "Most common causes: bad credentials in `.streamlit/tiger_openapi_config.properties`, "
+                "expired token (TBHK only), or network issue."
+            )
+            return
+
+    # ── Header bar ───────────────────────────────────────────────
+    head_cols = st.columns(4)
+    head_cols[0].metric("Account", state["account"])
+    head_cols[1].metric("License", state["license"])
+    head_cols[2].metric("Mode", "SANDBOX" if state["sandbox"] else "PRODUCTION")
+    head_cols[3].metric("Fetched at", state["ts"].split("T")[-1])
+
+    if state["sandbox"]:
+        st.warning("⚠️ Sandbox mode active — figures are simulated. Set `env=PROD` in tiger_openapi_config.properties for live data.")
+
+    st.divider()
+
+    # ── SECTION A: NAV / Cash / BP ──────────────────────────────
+    st.subheader("💰 Account Value — ARGUS vs Tiger")
+
+    # ARGUS side: from current dashboard state
+    portfolio = st.session_state.get('current_portfolio', 'Income Wheel')
+    argus_deposit = float(st.session_state.get('portfolio_deposit', 0))
+    df_open = st.session_state.get('df_open', pd.DataFrame())
+    df_trades = st.session_state.get('df_trades', pd.DataFrame())
+
+    # Quick ARGUS NAV calc (mirror Dashboard logic)
+    argus_nav = argus_deposit  # Will refine if comprehensive_pnl is available
+    try:
+        from pnl_calculator import PnLCalculator
+        from persistence import get_stock_average_prices, get_spy_leap_pl
+        _stk_avg = get_stock_average_prices(portfolio)
+        _spy_pl = get_spy_leap_pl(portfolio)
+        live_prices = st.session_state.get('live_prices', {})
+        comp = PnLCalculator.calculate_comprehensive_pnl(
+            df_trades=df_trades, df_open=df_open,
+            stock_avg_prices=_stk_avg, live_prices=live_prices,
+            spy_leap_pl=_spy_pl if _spy_pl else None,
+            live_options=st.session_state.get("open_positions_data", []),
+        )
+        # Sum realized + unrealized
+        if df_trades is not None and not df_trades.empty and 'Status' in df_trades.columns:
+            closed = df_trades[(df_trades['Status'] == 'Closed') &
+                               (df_trades['TradeType'].isin(['CC', 'CSP', 'LEAP', 'STOCK']))]
+            if not closed.empty and 'Actual_Profit_(USD)' in closed.columns:
+                realized = pd.to_numeric(closed['Actual_Profit_(USD)'], errors='coerce').fillna(0).sum()
+            else:
+                realized = 0.0
+        else:
+            realized = 0.0
+        unrl = comp['unrealized_stock_pnl']['total'] + comp['unrealized_leap_pnl']['total']
+        argus_nav = argus_deposit + realized + unrl
+    except Exception:
+        pass  # fall back to deposit-only
+
+    a = state.get("assets")
+    if a is None:
+        st.error("Tiger get_assets failed: " + state.get("assets_err", "unknown"))
+    else:
+        nav_drift = a.nav - argus_nav
+        nav_drift_pct = (nav_drift / argus_nav * 100) if argus_nav else 0
+        nav_cols = st.columns(3)
+        nav_cols[0].metric("ARGUS NAV (calculated)", f"${argus_nav:,.2f}")
+        nav_cols[1].metric("Tiger NAV (live)", f"${a.nav:,.2f}",
+                           delta=f"{'+' if nav_drift >= 0 else ''}${nav_drift:,.0f} ({nav_drift_pct:+.2f}%)",
+                           delta_color="inverse" if abs(nav_drift_pct) > 1 else "off",
+                           help="If drift >1%, ARGUS Data Table is out of sync with Tiger reality.")
+        nav_cols[2].metric("Tiger Cash", f"${a.cash:,.2f}",
+                           help="Settled cash sitting at the broker.")
+
+    # Prime asset segment detail (BP / margin)
+    if state.get("prime_segments"):
+        with st.expander("🏦 Tiger Margin Detail (per-segment)", expanded=False):
+            seg_rows = []
+            for k, s in state["prime_segments"].items():
+                seg_label = {"S": "Securities", "C": "Commodities", "F": "Forex"}.get(k, k)
+                seg_rows.append({
+                    "Segment": f"{k} — {seg_label}",
+                    "Currency": s["currency"],
+                    "Cash Balance": f"${s['cash_balance']:,.2f}",
+                    "Cash Avail for Trade (BP)": f"${s['cash_available_for_trade']:,.2f}",
+                    "Gross Position Value": f"${s['gross_position_value']:,.2f}",
+                    "Equity w/ Loan": f"${s['equity_with_loan']:,.2f}",
+                    "Capability": s["capability"],
+                })
+            st.dataframe(pd.DataFrame(seg_rows), use_container_width=True, hide_index=True)
+            st.caption("This is Tiger's actual buying power and margin posture. Compare to your "
+                       "cash-secured policy on the Dashboard for headroom analysis.")
+
+    st.divider()
+
+    # ── SECTION B: Open Positions ────────────────────────────────
+    st.subheader("📊 Open Positions — ARGUS Data Table vs Tiger API")
+
+    stk = state.get("stk_positions", []) or []
+    opt = state.get("opt_positions", []) or []
+
+    # Convert to ARGUS rows for unified display
+    from tiger_api.adapters import positions_to_argus_rows
+    from persistence import get_pmcc_tickers
+    pmcc = set(get_pmcc_tickers(portfolio) or []) | {"SPY"}
+    tiger_rows = positions_to_argus_rows(stk + opt, pmcc_tickers=pmcc)
+
+    # Counts
+    cnt_cols = st.columns(4)
+    argus_open_count = len(df_open) if df_open is not None and not df_open.empty else 0
+    cnt_cols[0].metric("ARGUS rows (Open)", argus_open_count)
+    cnt_cols[1].metric("Tiger Stock", len(stk))
+    cnt_cols[2].metric("Tiger Options", len(opt))
+    cnt_cols[3].metric("Tiger Total", len(stk) + len(opt))
+
+    if argus_open_count != len(stk) + len(opt):
+        gap = (len(stk) + len(opt)) - argus_open_count
+        if gap > 0:
+            st.warning(f"⚠️ Tiger has **{gap} more** positions than ARGUS Data Table. Possible missed fills.")
+        else:
+            st.warning(f"⚠️ ARGUS has **{abs(gap)} more** rows than Tiger. Possible orphaned rows in Data Table.")
+    else:
+        st.success(f"✅ Position counts match: {argus_open_count}")
+
+    # Build display table from Tiger rows (with bookkeeping fields)
+    tiger_disp = []
+    for r in tiger_rows:
+        tiger_disp.append({
+            "Ticker": r["Ticker"],
+            "TradeType": r["TradeType"],
+            "Direction": r["Direction"],
+            "Qty": r["Quantity"],
+            "Strike": r["Option_Strike_Price_(USD)"] or "",
+            "Expiry": r["Expiry_Date"] or "",
+            "Premium / Avg Cost": f"${r['_avg_cost']:,.4f}" if r['_avg_cost'] else "",
+            "Mkt Price": f"${r['_market_price']:,.4f}" if r['_market_price'] else "",
+            "Mkt Value": f"${r['_market_value']:,.0f}",
+            "Unrl P&L": f"${r['_unrealized_pnl']:+,.0f}" if r['_unrealized_pnl'] else "",
+            "Hash": r["Tiger_Row_Hash"][:8],
+        })
+    if tiger_disp:
+        df_t = pd.DataFrame(tiger_disp).sort_values(["Ticker", "TradeType", "Expiry"])
+        st.dataframe(df_t, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── SECTION C: Recent fills (last 7 days) ───────────────────
+    st.subheader("📜 Recent Fills (last 7 days from Tiger)")
+    fills = state.get("filled_7d", [])
+    if not fills:
+        st.info("No filled orders in the last 7 days.")
+    else:
+        fill_rows = []
+        for o in fills:
+            try:
+                c = o.contract
+                trade_dt = datetime.fromtimestamp(o.trade_time / 1000).strftime("%Y-%m-%d %H:%M") if o.trade_time else ""
+                fill_rows.append({
+                    "Time": trade_dt,
+                    "Action": o.action,
+                    "Symbol": c.symbol if c else "",
+                    "Type": c.sec_type if c else "",
+                    "Strike": getattr(c, "strike", "") if c else "",
+                    "Expiry": getattr(c, "expiry", "") if c else "",
+                    "P/C": getattr(c, "put_call", "") if c else "",
+                    "Qty": o.quantity,
+                    "Filled": o.filled,
+                    "Avg Fill $": f"{o.avg_fill_price:.4f}" if o.avg_fill_price else "",
+                    "Filled $ Total": f"${o.filled_cash_amount:,.2f}" if o.filled_cash_amount else "",
+                    "Commission": f"${o.commission:,.2f}" if o.commission else "$0",
+                    "GST": f"${o.gst:,.2f}" if o.gst else "$0",
+                    "Realized P&L": f"${o.realized_pnl:+,.2f}" if o.realized_pnl else "—",
+                    "Order ID": o.id,
+                    "Status": str(o.status).replace("OrderStatus.", ""),
+                })
+            except Exception:
+                continue
+        df_fills = pd.DataFrame(fill_rows)
+        st.dataframe(df_fills, use_container_width=True, hide_index=True)
+        st.caption(f"{len(fills)} fills shown. Tiger's `realized_pnl` field is the broker's own P&L "
+                   "calc — for closing trades only.")
+
+    st.divider()
+
+    # ── SECTION D: Funding history (deposits) ────────────────────
+    st.subheader("💵 Lifetime Funding History")
+
+    funding_df = state.get("funding_df")
+    if funding_df is None or (hasattr(funding_df, 'empty') and funding_df.empty):
+        st.info("No funding history available.")
+    else:
+        # Currency totals
+        if "currency" in funding_df.columns and "amount" in funding_df.columns:
+            ccy_totals = funding_df.groupby("currency")["amount"].sum()
+            tot_cols = st.columns(len(ccy_totals) + 1)
+            for i, (ccy, total) in enumerate(ccy_totals.items()):
+                tot_cols[i].metric(f"Total {ccy} deposits", f"{ccy} {total:,.2f}")
+            tot_cols[-1].metric("Events", len(funding_df))
+
+        # Table
+        with st.expander(f"📋 All {len(funding_df)} funding events", expanded=False):
+            disp = funding_df.copy()
+            if "amount" in disp.columns:
+                disp["amount"] = disp["amount"].apply(lambda x: f"{x:,.2f}")
+            st.dataframe(disp, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "✅ **Currency is explicit** — solves the SGD/USD parser ambiguity from CSV. "
+            "These figures reconcile with Tiger's broker UI deposit total."
+        )
+
+    st.divider()
+
+    # ── SECTION E: Sync action (Phase 2 placeholder) ────────────
+    st.subheader("⚙️ Sync to ARGUS (coming in Phase 2)")
+    st.info(
+        "Phase 1 complete: this page shows Tiger reality alongside ARGUS state. "
+        "**Phase 2** will add an 'Apply Diff' button that writes new fills into Data Table "
+        "with full backup/rollback. Until then, use Tiger Import (CSV) to sync."
+    )
 
 
 if __name__ == "__main__":
