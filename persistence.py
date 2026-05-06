@@ -81,11 +81,17 @@ def load_settings() -> Dict:
 
 
 def save_settings(settings: Dict):
-    """Save user settings to JSON file (and GSheet on Cloud)."""
+    """Save user settings to BOTH local JSON file AND gSheet Settings tab.
+
+    Local JSON is fast/ephemeral (gets wiped on Streamlit Cloud restart).
+    gSheet is canonical and survives restarts. Without the gSheet write, every
+    save would only live in memory until the container recycles — which is why
+    saves "didn't stick" before this fix.
+    """
     global _SETTINGS_CACHE
     _SETTINGS_CACHE = settings  # always update in-memory cache
 
-    # Try local file write (fails silently on read-only Cloud filesystem)
+    # 1. Local file write (fast, ephemeral on Cloud)
     try:
         PERSISTENCE_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(PERSISTENCE_FILE, 'w') as f:
@@ -93,6 +99,20 @@ def save_settings(settings: Dict):
         logger.info(f"Settings saved to {PERSISTENCE_FILE}")
     except Exception as e:
         logger.warning(f"Local settings save failed (may be Cloud filesystem): {e}")
+
+    # 2. gSheet write — CANONICAL persistence. Survives Cloud restarts.
+    try:
+        from config import INCOME_WHEEL_SHEET_ID
+        from gsheet_handler import GSheetHandler
+        if INCOME_WHEEL_SHEET_ID:
+            handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
+            ok = handler.write_settings(settings)
+            if ok:
+                logger.info(f"Settings persisted to gSheet ({len(settings)} keys)")
+            else:
+                logger.warning("gSheet write_settings returned False (no exception)")
+    except Exception as e:
+        logger.warning(f"gSheet settings save failed: {e}")
 
 
 def get_portfolio_deposit(portfolio: str = "Income Wheel") -> float:
