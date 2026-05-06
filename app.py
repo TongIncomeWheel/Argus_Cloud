@@ -2378,7 +2378,7 @@ def render_pl(df_orders, df_open):
     with p1:
         period = st.radio(
             "Period",
-            ["YTD", "MTD", "WTD", "Last 30d", "Last 90d", "Last 12M", "Lifetime", "Custom"],
+            ["YTD", "MTD", "WTD", "Last 30d", "Last 90d", "Last 12M", "Lifetime", "Month", "Custom"],
             horizontal=True,
             key="pl_period",
         )
@@ -2396,7 +2396,33 @@ def render_pl(df_orders, df_open):
         start = today - timedelta(days=365); end = today
     elif period == "Lifetime":
         start = date(2024, 1, 1); end = today
-    else:
+    elif period == "Month":
+        # Month picker — populated from months actually present in df_orders
+        df_dates_tmp = pd.to_datetime(df_orders.get("TradeDate"), errors="coerce")
+        available_months = sorted(
+            df_dates_tmp.dt.strftime("%Y-%m").dropna().unique().tolist(),
+            reverse=True,  # most recent first
+        )
+        if not available_months:
+            available_months = [today.strftime("%Y-%m")]
+        with p2:
+            month_pick = st.selectbox(
+                "Month (YYYY-MM)", available_months, key="pl_month_pick",
+                help="Show only trades within this calendar month.",
+            )
+        try:
+            yr, mo = map(int, month_pick.split("-"))
+            start = date(yr, mo, 1)
+            # Last day of month
+            if mo == 12:
+                end = date(yr, 12, 31)
+            else:
+                end = date(yr, mo + 1, 1) - timedelta(days=1)
+            if end > today:
+                end = today
+        except (ValueError, TypeError):
+            start = today.replace(day=1); end = today
+    else:  # Custom
         with p2:
             start = st.date_input("Start", value=today - timedelta(days=30), key="pl_start_custom")
         with p3:
@@ -2404,10 +2430,34 @@ def render_pl(df_orders, df_open):
 
     days_in_period = max(1, (end - start).days)
 
-    # ── Filter realized trades to period ───────────────────────
+    # ── Ticker filter (multiselect, applies on top of period) ──
+    available_tickers = sorted(df_orders.get("Ticker", pd.Series(dtype=str)).dropna().unique().tolist())
+    f1, f2 = st.columns([3, 2])
+    with f1:
+        ticker_filter = st.multiselect(
+            "Filter by Ticker(s)",
+            available_tickers,
+            key="pl_ticker_filter",
+            placeholder="All tickers (leave empty for all)",
+            help="Restrict P&L to specific tickers. Multi-select supported. "
+                 "Leave empty to include every ticker.",
+        )
+    with f2:
+        if st.button("Reset filters", key="pl_reset", use_container_width=True):
+            for k in ("pl_period", "pl_month_pick", "pl_ticker_filter",
+                      "pl_start_custom", "pl_end_custom"):
+                st.session_state.pop(k, None)
+            try:
+                st.rerun(scope="fragment")
+            except TypeError:
+                st.rerun()
+
+    # ── Apply period + ticker filters ──────────────────────────
     df = df_orders.copy()
     df["TradeDate"] = pd.to_datetime(df["TradeDate"], errors="coerce")
     df = df[(df["TradeDate"] >= pd.Timestamp(start)) & (df["TradeDate"] <= pd.Timestamp(end))]
+    if ticker_filter:
+        df = df[df["Ticker"].isin(ticker_filter)]
     closed = df[df["is_opening"] == False].copy()
 
     # ── Compute realized split (stock vs options) ──────────────
@@ -2436,6 +2486,11 @@ def render_pl(df_orders, df_open):
     if df_open is not None and not df_open.empty:
         d = df_open.copy()
         d["_unrealized_pnl"] = pd.to_numeric(d.get("_unrealized_pnl", 0), errors="coerce").fillna(0)
+        # Apply ticker filter to unrealized snapshot too (period filter doesn't
+        # apply to unrealized — those are current open positions regardless of
+        # when they were opened).
+        if ticker_filter:
+            d = d[d["Ticker"].isin(ticker_filter)]
         stk_o = d[d["TradeType"].isin(list(_STOCK_TYPES))]
         opt_o = d[d["TradeType"].isin(list(_OPTION_TYPES))]
         unrealized_stock = float(stk_o["_unrealized_pnl"].sum())
@@ -2612,13 +2667,17 @@ def render_pl(df_orders, df_open):
         )
 
     with tab_ticker:
-        # Compute realized AND unrealized per ticker
+        # Compute realized AND unrealized per ticker (both already ticker-filtered above)
         by_tk_realized = closed.groupby("Ticker").agg(
             Realized=("Actual_Profit_(USD)", "sum"),
             Trades=("TradeID", "count"),
         ).reset_index()
-        if df_open is not None and not df_open.empty:
-            by_tk_unrl = df_open.groupby("Ticker").agg(
+        # df_open ticker-filtered version for unrealized — d was built earlier with filter applied
+        df_open_filtered = df_open.copy() if df_open is not None else None
+        if df_open_filtered is not None and ticker_filter:
+            df_open_filtered = df_open_filtered[df_open_filtered["Ticker"].isin(ticker_filter)]
+        if df_open_filtered is not None and not df_open_filtered.empty:
+            by_tk_unrl = df_open_filtered.groupby("Ticker").agg(
                 Unrealized=("_unrealized_pnl", "sum"),
                 OpenPositions=("Ticker", "count"),
             ).reset_index()
