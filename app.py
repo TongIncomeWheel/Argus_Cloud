@@ -2730,8 +2730,8 @@ def render_pl(df_orders, df_open, settings: dict = None):
     st.divider()
 
     # ── 📊 Win-rate & ticker tables ────────────────────────────
-    tab_type, tab_ticker, tab_pivot = st.tabs([
-        "By Type (win-rate)", "By Ticker", "Pivot: Type × Ticker"
+    tab_type, tab_ticker, tab_pivot, tab_cycles = st.tabs([
+        "By Type (win-rate)", "By Ticker", "Pivot: Type × Ticker", "🔄 Wheel Cycles"
     ])
 
     with tab_type:
@@ -2809,6 +2809,98 @@ def render_pl(df_orders, df_open, settings: dict = None):
             st.dataframe(disp, use_container_width=True, hide_index=True)
         else:
             st.info("No closed trades to pivot.")
+
+    with tab_cycles:
+        st.caption(
+            "**Wheel Cycle** = a full revolution per ticker: CSP-open → "
+            "(close OR assignment) → CC-open if shares acquired → (close OR called away) "
+            "→ back to cash. Each cycle's realized P&L = Σpremium received − Σbuybacks "
+            "± stock gain/loss. Cycles are derived from order history fills."
+        )
+        try:
+            from tiger_api.wheel_cycles import build_cycles, cycle_summary
+            # Use full archive (period filter doesn't apply — cycles span across periods)
+            cycles_df = build_cycles(df_orders)  # df_orders is already pot-filtered upstream
+            if cycles_df.empty:
+                st.info("No wheel cycles detected. Need at least one full ticker thread of fills.")
+            else:
+                # Apply user's period+ticker+pot filters to cycles too: include cycles
+                # that have any activity OVERLAPPING the period.
+                cycles_df["_start"] = pd.to_datetime(cycles_df["Start"], errors="coerce")
+                cycles_df["_end"] = pd.to_datetime(cycles_df["End"], errors="coerce")
+                period_mask = (
+                    (cycles_df["_start"] <= pd.Timestamp(end))
+                    & ((cycles_df["_end"].isna()) | (cycles_df["_end"] >= pd.Timestamp(start)))
+                )
+                cdf = cycles_df[period_mask].copy()
+                if ticker_filter:
+                    cdf = cdf[cdf["Ticker"].isin(ticker_filter)]
+                if pot_tickers is not None:
+                    cdf = cdf[cdf["Ticker"].isin(pot_tickers)]
+
+                if cdf.empty:
+                    st.info("No cycles match current filters.")
+                else:
+                    summ = cycle_summary(cdf)
+                    cs1, cs2, cs3, cs4, cs5 = st.columns(5)
+                    cs1.metric("Total cycles", summ["total_cycles"],
+                               delta=f"{summ['closed_cycles']} closed · {summ['open_cycles']} open",
+                               delta_color="off")
+                    cs2.metric("Avg duration", f"{summ['avg_duration_days']:.0f}d",
+                               help="Average days per closed cycle (CSP open → cash).")
+                    cs3.metric("Win rate", f"{summ['win_rate_pct']:.0f}%",
+                               help="% of closed cycles with positive realized P&L.")
+                    cs4.metric("Σ Realized (closed)",
+                               f"${summ['total_realized']:+,.0f}",
+                               delta=f"avg ${summ['avg_realized_per_cycle']:+,.0f}/cycle",
+                               delta_color="off")
+                    cs5.metric("Best / Worst",
+                               f"${summ['best_cycle_pnl']:+,.0f}",
+                               delta=f"worst ${summ['worst_cycle_pnl']:+,.0f}",
+                               delta_color="off")
+
+                    # Display cycles table — Premium P&L + Stock P&L separated
+                    keep_cols = [
+                        "Ticker", "Cycle #", "Start", "End", "Duration (days)",
+                        "Status", "Outcome",
+                        "CSP fills", "CC fills",
+                        "Premium P&L", "Stock P&L", "Realized $",
+                        "CSP Premium", "CSP Buyback", "CC Premium", "CC Buyback",
+                        "Stock Bought $", "Stock Sold $",
+                    ]
+                    keep_cols = [c for c in keep_cols if c in cdf.columns]
+                    disp = cdf[keep_cols].copy()
+                    disp["Start"] = pd.to_datetime(disp["Start"], errors="coerce").dt.strftime("%Y-%m-%d")
+                    disp["End"] = pd.to_datetime(disp["End"], errors="coerce").dt.strftime("%Y-%m-%d")
+                    # Sort newest first
+                    disp = disp.sort_values(["Start", "Ticker"], ascending=[False, True]).reset_index(drop=True)
+                    st.dataframe(
+                        disp, use_container_width=True, hide_index=True,
+                        column_config={
+                            "Premium P&L":     st.column_config.NumberColumn(format="$%+,.0f"),
+                            "Stock P&L":       st.column_config.NumberColumn(format="$%+,.0f"),
+                            "Realized $":      st.column_config.NumberColumn(format="$%+,.0f"),
+                            "CSP Premium":     st.column_config.NumberColumn(format="$%,.0f"),
+                            "CSP Buyback":     st.column_config.NumberColumn(format="$%,.0f"),
+                            "CC Premium":      st.column_config.NumberColumn(format="$%,.0f"),
+                            "CC Buyback":      st.column_config.NumberColumn(format="$%,.0f"),
+                            "Stock Bought $":  st.column_config.NumberColumn(format="$%,.0f"),
+                            "Stock Sold $":    st.column_config.NumberColumn(format="$%,.0f"),
+                            "Duration (days)": st.column_config.NumberColumn(format="%dd"),
+                            "Cycle #":         st.column_config.NumberColumn(format="%d"),
+                        },
+                    )
+                    st.caption(
+                        "**Premium P&L** = net cash from options (CSP/CC premium received − buybacks). "
+                        "Always realized. **Stock P&L** = stock sold − stock bought (only realized when "
+                        "cycle closes; for OPEN cycles, stock P&L is unrealized and shows $0). "
+                        "**Realized $** = Premium + Stock realized so far. "
+                        "**Outcome** legend: `worthless` = options expired worthless · "
+                        "`called_away` = CC assigned · `stock_sold` = manual sale · `open` = active."
+                    )
+        except Exception as e:
+            st.warning(f"Wheel cycle analysis failed: {e}")
+            logger.debug("cycles error", exc_info=True)
 
 
 # ────────────────────────────────────────────────────────────────
