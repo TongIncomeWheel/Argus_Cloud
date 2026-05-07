@@ -3247,6 +3247,105 @@ def _panel_expiring_soon(df_open: pd.DataFrame, spot_prices: dict, days: int = 1
 
 
 # ────────────────────────────────────────────────────────────────
+# 📊 IV RANK SCANNER — when to sell premium per ticker
+# ────────────────────────────────────────────────────────────────
+@st.fragment
+def render_iv_scanner(df_open: pd.DataFrame, settings: dict):
+    """IV Rank / Percentile scanner — proxy via realized vol from yfinance.
+
+    Wheel literature says sell premium when IV is HIGH relative to its own
+    history (IV Rank > 50). Avoid when IV is suppressed.
+
+    We don't have a clean historical IV feed for free — use realized vol (RV30)
+    rolling 30-day annualized as proxy. Highly correlated with IV on liquid
+    underlyings.
+    """
+    st.markdown("### 📊 IV Rank Scanner")
+    st.caption(
+        "When to sell premium: IV Rank > 50 → high vol environment, juicy premium. "
+        "IV Rank < 30 → low vol, premium is thin, avoid full size. "
+        "**Note:** rank/percentile use realized-vol proxy (yfinance daily returns) "
+        "since Alpaca's historical IV isn't in the free tier. Highly correlated with "
+        "actual IV on liquid stocks. Cached 1 hour."
+    )
+
+    # Default ticker pool: open positions + user-editable extras
+    default_tickers = []
+    if df_open is not None and not df_open.empty:
+        default_tickers = sorted(df_open["Ticker"].dropna().unique().tolist())
+
+    extras_csv = st.text_input(
+        "Additional tickers to scan (comma-separated, e.g. AAPL,GOOG,QQQ)",
+        value="SPY,QQQ,IWM",
+        key="iv_extras",
+        help="Open-position tickers are always scanned. Add candidates you're "
+             "considering wheeling here.",
+    )
+    extras = [t.strip().upper() for t in extras_csv.split(",") if t.strip()]
+    full_pool = sorted(set(default_tickers) | set(extras))
+
+    if st.button("🔄 Run scanner", key="iv_scan_run", type="primary"):
+        st.session_state["iv_scan_triggered"] = True
+
+    if not st.session_state.get("iv_scan_triggered"):
+        st.info(
+            f"Click **Run scanner** to compute IV Rank + Percentile for "
+            f"**{len(full_pool)} tickers**: {', '.join(full_pool[:20])}"
+            f"{' …' if len(full_pool) > 20 else ''}. "
+            "First run pulls 2y history per ticker via yfinance (~10-30s)."
+        )
+        return
+
+    try:
+        from tiger_api.iv_scanner import build_iv_scanner, regime_label
+        with st.spinner(f"Computing IV Rank for {len(full_pool)} tickers…"):
+            iv_df = build_iv_scanner(tuple(full_pool))
+
+        if iv_df.empty:
+            st.warning("No IV data could be computed. Check ticker symbols + yfinance availability.")
+            return
+
+        # Add regime label column
+        iv_df = iv_df.copy()
+        iv_df["Regime"] = iv_df["iv_rank_proxy"].apply(regime_label)
+        iv_df["Held?"] = iv_df["ticker"].isin(default_tickers).map({True: "✓ open", False: "—"})
+
+        # Display
+        disp = iv_df[[
+            "ticker", "Held?", "spot",
+            "iv_rank_proxy", "iv_percentile_proxy",
+            "rv30_current", "rv30_52w_high", "rv30_52w_low",
+            "Regime",
+        ]].copy()
+        disp.columns = [
+            "Ticker", "Held?", "Spot",
+            "IV Rank", "IV %ile",
+            "RV30 (now)", "RV30 (52w hi)", "RV30 (52w lo)",
+            "Regime",
+        ]
+        st.dataframe(
+            disp, use_container_width=True, hide_index=True,
+            column_config={
+                "Spot":          st.column_config.NumberColumn(format="$%.2f"),
+                "IV Rank":       st.column_config.NumberColumn(format="%.0f"),
+                "IV %ile":       st.column_config.NumberColumn(format="%.0f%%"),
+                "RV30 (now)":    st.column_config.NumberColumn(format="%.0f%%"),
+                "RV30 (52w hi)": st.column_config.NumberColumn(format="%.0f%%"),
+                "RV30 (52w lo)": st.column_config.NumberColumn(format="%.0f%%"),
+            },
+        )
+        st.caption(
+            "**IV Rank** = (current RV30 − 52w low) / (52w high − 52w low) × 100. "
+            "**IV %ile** = % of last 252 days where RV30 was below current. "
+            "**Regime guide**: 🟢 ≥70 sell aggressively · 🟡 50-70 OK to sell · "
+            "⚪ 30-50 neutral · 🔴 <30 avoid (premium too cheap)."
+        )
+    except Exception as e:
+        st.error(f"IV scanner failed: {e}")
+        logger.debug("iv scanner error", exc_info=True)
+
+
+# ────────────────────────────────────────────────────────────────
 # ⚙️ CONFIG — Settings tab editor
 # ────────────────────────────────────────────────────────────────
 def render_config(settings: dict, save_settings_fn):
@@ -3907,14 +4006,16 @@ def main():
     elif active == "risk":
         render_risk(df_open, summary, settings, spot_prices)
     elif active == "lookup":
-        # Standalone contract price lookup — paste OCC option codes, get last
-        # price via Alpaca. Independent of the Income Wheel — useful for
-        # researching positions outside the portfolio.
-        try:
-            from contract_price_lookup import render_contract_price_lookup
-            render_contract_price_lookup()
-        except Exception as e:
-            st.error(f"Contract lookup unavailable: {e}")
+        # Combined research tab: contract pricer + IV-Rank scanner
+        lookup_a, lookup_b = st.tabs(["🔎 Contract Price Lookup", "📊 IV Rank Scanner"])
+        with lookup_a:
+            try:
+                from contract_price_lookup import render_contract_price_lookup
+                render_contract_price_lookup()
+            except Exception as e:
+                st.error(f"Contract lookup unavailable: {e}")
+        with lookup_b:
+            render_iv_scanner(df_open, settings)
     elif active == "config":
         render_config(settings, save_settings_dict)
 
