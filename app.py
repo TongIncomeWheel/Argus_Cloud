@@ -3169,9 +3169,94 @@ def render_risk(df_open, summary, settings, spot_prices: dict = None):
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+    st.divider()
+
+    # ── 🌡️ Stress Test (spot shocks) ───────────────────────────
+    st.markdown("#### 🌡️ Stress Test — what if spot moves N%?")
     st.caption(
-        "⏳ Coming next: stress test (spot −10/−20/−30%), wheel-cycle status, theta accrual."
+        "Reprice the entire book at shocked underlying prices. Stocks reprice "
+        "linearly. Options reprice via Black-Scholes (using IV solved from "
+        "current market price, held constant — assumes no IV crush/spike). "
+        "**Rough but directional** — a real -30% event would also crush IVs differently "
+        "per ticker, but this gives you the first-order delta+gamma exposure."
     )
+    try:
+        from tiger_api.stress import stress_book
+        if df_open is None or df_open.empty or not spot_prices:
+            st.info("No open positions or spot prices available to stress.")
+        else:
+            shocks = [-30, -20, -10, -5, 0, 5, 10, 20]
+            stress_df = stress_book(df_open, spot_prices, shocks_pct=shocks)
+            if stress_df.empty:
+                st.warning("Stress test produced no rows — IV solve may have failed for all options.")
+            else:
+                # Add NAV impact %
+                nav_now = float(summary.nav or 0) if summary else 0
+                if nav_now > 0:
+                    stress_df["Total NAV change %"] = (stress_df["Total NAV change $"] / nav_now * 100)
+                st.dataframe(
+                    stress_df, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Shock %":             st.column_config.NumberColumn(format="%+d%%"),
+                        "Stock impact $":      st.column_config.NumberColumn(format="$%+,.0f"),
+                        "Option impact $":     st.column_config.NumberColumn(format="$%+,.0f"),
+                        "Total NAV change $":  st.column_config.NumberColumn(format="$%+,.0f"),
+                        "Total NAV change %":  st.column_config.NumberColumn(format="%+.1f%%"),
+                        "Positions ITM after": st.column_config.NumberColumn(format="%d"),
+                    },
+                )
+                # Plot the curve
+                try:
+                    import plotly.graph_objects as go
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=stress_df["Shock %"], y=stress_df["Total NAV change $"],
+                        mode="lines+markers", name="Total NAV",
+                        line=dict(width=3, color="#000"),
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=stress_df["Shock %"], y=stress_df["Stock impact $"],
+                        mode="lines+markers", name="Stock",
+                        line=dict(width=2, color="#1976d2", dash="dot"),
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=stress_df["Shock %"], y=stress_df["Option impact $"],
+                        mode="lines+markers", name="Options",
+                        line=dict(width=2, color="#2e7d32", dash="dot"),
+                    ))
+                    fig.add_hline(y=0, line_dash="dash", line_color="gray")
+                    fig.update_layout(
+                        height=320,
+                        xaxis_title="Spot shock %",
+                        yaxis_title="P&L impact ($)",
+                        yaxis_tickformat="$,.0f",
+                        hovermode="x unified",
+                        margin=dict(l=10, r=10, t=20, b=10),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                except ImportError:
+                    pass
+                # Margin warning
+                worst_30 = stress_df[stress_df["Shock %"] == -30]
+                if not worst_30.empty:
+                    nav_change_30 = float(worst_30["Total NAV change $"].iloc[0])
+                    if summary and summary.init_margin > 0:
+                        if nav_now + nav_change_30 < summary.init_margin:
+                            st.error(
+                                f"⚠️ At -30% spot shock, NAV (${nav_now + nav_change_30:,.0f}) "
+                                f"would fall BELOW init margin (${summary.init_margin:,.0f}). "
+                                f"Maintenance margin call would trigger."
+                            )
+                        else:
+                            st.success(
+                                f"✅ At -30% spot shock, NAV (${nav_now + nav_change_30:,.0f}) "
+                                f"stays above init margin (${summary.init_margin:,.0f}). "
+                                f"No margin call risk at this shock level."
+                            )
+    except Exception as e:
+        st.warning(f"Stress test failed: {e}")
+        logger.debug("stress error", exc_info=True)
 
 
 def _panel_expiring_soon(df_open: pd.DataFrame, spot_prices: dict, days: int = 14):
