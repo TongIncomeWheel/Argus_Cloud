@@ -1458,6 +1458,70 @@ def _panel_cash_maximization(summary, df_open: pd.DataFrame, settings: dict):
             f"= net **\\${cur['nav']:,.0f} NAV** (with unrealized P&L baked in)."
         )
 
+        # ── Capital AT RISK (vs deployed) ──────────────────────
+        st.markdown("**🎯 Capital at Risk (worst-case downside)**")
+        st.caption(
+            "Different mental model from 'capital deployed'. **At risk** = "
+            "max loss in a 30%-spot-drop scenario. Stocks lose 30% of cost. "
+            "CSPs: assignment + 30% drop on the assigned stock = (strike − premium) × "
+            "0.30 × 100 × qty per contract. Helps gauge tail-risk vs daily MTM."
+        )
+        # Compute at-risk per ticker
+        at_risk_rows = []
+        if df_open is not None and not df_open.empty:
+            d = df_open.copy()
+            d["q"] = pd.to_numeric(d["Quantity"], errors="coerce").fillna(0).abs()
+            d["k"] = pd.to_numeric(d["Option_Strike_Price_(USD)"], errors="coerce").fillna(0)
+            d["avg_cost"] = pd.to_numeric(d.get("_avg_cost", 0), errors="coerce").fillna(0)
+
+            stock_at_risk_30 = float((d[d["TradeType"] == "STOCK"]["q"] *
+                                      d[d["TradeType"] == "STOCK"]["avg_cost"]).sum() * 0.30)
+            leap_at_risk = float((d[d["TradeType"] == "LEAP"]["q"] *
+                                  d[d["TradeType"] == "LEAP"]["avg_cost"] * 100).sum())  # 100% loss if expires worthless
+            csp_d = d[d["TradeType"] == "CSP"]
+            # CSP downside: if assigned, you own at strike. Then -30% on that stock.
+            csp_at_risk_30 = float(((csp_d["k"] - csp_d["avg_cost"]) * csp_d["q"] * 100 * 0.30).sum())
+            csp_assignment_full = float(((csp_d["k"] - csp_d["avg_cost"]) * csp_d["q"] * 100).sum())
+
+            total_at_risk_30 = stock_at_risk_30 + leap_at_risk + csp_at_risk_30
+            total_at_risk_assignment = stock_at_risk_30 + leap_at_risk + csp_assignment_full
+
+            ar1, ar2, ar3, ar4 = st.columns(4)
+            ar1.metric("Stock −30% drop",
+                       f"−${stock_at_risk_30:,.0f}",
+                       help="30% of stock cost basis. Fully realized if stocks fall 30%.")
+            ar2.metric("LEAP max loss",
+                       f"−${leap_at_risk:,.0f}",
+                       help="Premium paid on LEAPs. 100% loss if they expire worthless OTM.")
+            ar3.metric("CSP risk if assigned + −30%",
+                       f"−${csp_at_risk_30:,.0f}",
+                       help="If all CSPs assigned at strike, then assigned stock falls 30%.")
+            ar4.metric("Σ Tail-risk (−30% scenario)",
+                       f"−${total_at_risk_30:,.0f}",
+                       delta=f"{(total_at_risk_30 / cur['nav'] * 100) if cur['nav'] > 0 else 0:.0f}% of NAV",
+                       delta_color="off",
+                       help="Sum of all 30%-shock losses. Compare to NAV to see your "
+                            "tail exposure as a fraction of net worth.")
+
+            # Detail row
+            ar_detail_rows = [
+                {"Bucket": "📊 Long Stock", "Cost basis": f"${stock_at_risk_30 / 0.30:,.0f}",
+                 "−30% loss": f"−${stock_at_risk_30:,.0f}",
+                 "Note": "Linear MTM if all held stocks drop 30%."},
+                {"Bucket": "📉 Long LEAPs", "Cost basis": f"${leap_at_risk:,.0f}",
+                 "−30% loss": f"−${leap_at_risk:,.0f}",
+                 "Note": "Could lose 100% of premium paid (LEAPs are convex)."},
+                {"Bucket": "🔒 Open CSPs (max-loss-30%)",
+                 "Cost basis": f"${csp_assignment_full:,.0f}",
+                 "−30% loss": f"−${csp_at_risk_30:,.0f}",
+                 "Note": "If assigned at strike, then assigned stock drops 30%."},
+                {"Bucket": "🔒 Open CSPs (max-loss-100%)",
+                 "Cost basis": f"${csp_assignment_full:,.0f}",
+                 "−30% loss": f"−${csp_assignment_full:,.0f}",
+                 "Note": "Full assignment loss if assigned stock goes to 0 — apocalyptic scenario."},
+            ]
+            center_table(pd.DataFrame(ar_detail_rows))
+
     # ── B. Carry analysis ───────────────────────────────────────
     st.markdown("##### 🧮 B. Carry Analysis — true cost of margin")
     try:
