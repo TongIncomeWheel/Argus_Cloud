@@ -2856,9 +2856,9 @@ def render_pl(df_orders, df_open, settings: dict = None):
     st.divider()
 
     # ── 📊 Win-rate & ticker tables ────────────────────────────
-    tab_type, tab_ticker, tab_pivot, tab_cycles, tab_winrate = st.tabs([
+    tab_type, tab_ticker, tab_pivot, tab_cycles, tab_winrate, tab_rolls = st.tabs([
         "By Type (win-rate)", "By Ticker", "Pivot: Type × Ticker",
-        "🔄 Wheel Cycles", "🎯 Setup Win-Rate",
+        "🔄 Wheel Cycles", "🎯 Setup Win-Rate", "🔁 Rolls",
     ])
 
     with tab_type:
@@ -3040,7 +3040,11 @@ def render_pl(df_orders, df_open, settings: dict = None):
         try:
             from tiger_api.win_rate import build_win_rate_table
             ticker_set = set(ticker_filter) if ticker_filter else None
-            wr = build_win_rate_table(df_orders, ticker_filter=ticker_set, pot_tickers=pot_tickers)
+            # NOW respects the period filter — only closed trades within the window
+            wr = build_win_rate_table(
+                df_orders, ticker_filter=ticker_set, pot_tickers=pot_tickers,
+                start_date=start, end_date=end,
+            )
 
             if (wr.get("by_type") is None or wr["by_type"].empty):
                 st.info("No closed CSP/CC trades match current filters. "
@@ -3093,6 +3097,88 @@ def render_pl(df_orders, df_open, settings: dict = None):
         except Exception as e:
             st.warning(f"Win-rate analysis failed: {e}")
             logger.debug("winrate error", exc_info=True)
+
+    with tab_rolls:
+        st.caption(
+            "Every roll executed in the selected period: net cash credit/debit, "
+            "strike movement, DTE extension, and quality classification. "
+            "**Strong** = credit + better strike. **Defensive** = paying debit to roll. "
+            "Use to spot patterns: are rolls a profit center or a cost?"
+        )
+        try:
+            from tiger_api.rolls import build_rolls, roll_summary
+            ticker_set_rolls = set(ticker_filter) if ticker_filter else None
+            rolls_df = build_rolls(
+                df_orders, ticker_filter=ticker_set_rolls, pot_tickers=pot_tickers,
+                start_date=start, end_date=end,
+            )
+            if rolls_df.empty:
+                st.info("No rolls match current filters in this period.")
+            else:
+                rs = roll_summary(rolls_df)
+                rsm = st.columns(5)
+                rsm[0].metric("Total rolls", rs["total_rolls"],
+                              delta=f"{rs['credit_rolls']} credit · {rs['debit_rolls']} debit",
+                              delta_color="off")
+                rsm[1].metric("Σ Net credit",
+                              f"${rs['total_net_credit']:+,.0f}",
+                              help="Cumulative net cash from all rolls in this period.")
+                rsm[2].metric("Avg per roll",
+                              f"${rs['avg_credit_per_roll']:+,.0f}")
+                rsm[3].metric("Best roll", f"${rs['best_roll']:+,.0f}")
+                rsm[4].metric("Worst roll", f"${rs['worst_roll']:+,.0f}")
+
+                # Roll income by month chart
+                rolls_df_chart = rolls_df.copy()
+                rolls_df_chart["Date_dt"] = pd.to_datetime(rolls_df_chart["Date"], errors="coerce")
+                rolls_df_chart["Month"] = rolls_df_chart["Date_dt"].dt.strftime("%Y-%m")
+                monthly = rolls_df_chart.groupby("Month")["Net Cash $"].sum().reset_index()
+                if not monthly.empty:
+                    try:
+                        import plotly.express as px
+                        fig = px.bar(
+                            monthly, x="Month", y="Net Cash $",
+                            title="Roll Net Credit by Month",
+                            text="Net Cash $",
+                        )
+                        fig.update_traces(texttemplate="$%{text:,.0f}", textposition="outside")
+                        fig.update_layout(
+                            height=320,
+                            xaxis_tickangle=-45,
+                            yaxis_tickformat="$,.0f",
+                            margin=dict(l=10, r=10, t=40, b=10),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    except ImportError:
+                        pass
+
+                show_debit_only = st.checkbox(
+                    "Show only defensive (debit / worse-strike) rolls",
+                    key="pl_roll_debit_only",
+                    help="Filter to rolls that locked in losses — closing instead "
+                         "may have been better.",
+                )
+                disp_rolls = rolls_df.copy()
+                if show_debit_only:
+                    disp_rolls = disp_rolls[disp_rolls["Roll Quality"].str.contains("Defensive", na=False)]
+                disp_rolls["Old Expiry"] = pd.to_datetime(disp_rolls["Old Expiry"], errors="coerce").dt.strftime("%Y-%m-%d")
+                disp_rolls["New Expiry"] = pd.to_datetime(disp_rolls["New Expiry"], errors="coerce").dt.strftime("%Y-%m-%d")
+                st.dataframe(
+                    disp_rolls, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Old Strike":   st.column_config.NumberColumn(format="$%.2f"),
+                        "New Strike":   st.column_config.NumberColumn(format="$%.2f"),
+                        "Old Premium":  st.column_config.NumberColumn(format="$%.2f"),
+                        "New Premium":  st.column_config.NumberColumn(format="$%.2f"),
+                        "Net Cash $":   st.column_config.NumberColumn(format="$%+,.0f"),
+                        "Strike Δ":     st.column_config.NumberColumn(format="$%+,.2f"),
+                        "DTE Δ":        st.column_config.NumberColumn(format="%+dd"),
+                        "Qty":          st.column_config.NumberColumn(format="%d"),
+                    },
+                )
+        except Exception as e:
+            st.warning(f"Roll history analysis failed: {e}")
+            logger.debug("rolls in PL error", exc_info=True)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -3386,66 +3472,8 @@ def render_risk(df_open, summary, settings, spot_prices: dict = None,
         st.warning(f"Stress test failed: {e}")
         logger.debug("stress error", exc_info=True)
 
-    st.divider()
-
-    # ── 🔁 Roll Tracker (historical roll quality) ──────────────
-    st.markdown("#### 🔁 Roll History — quality of every roll")
-    st.caption(
-        "For each historical roll (BTC + STO same day, same ticker, same right): "
-        "what was the net credit/debit, did the strike improve, did you buy time? "
-        "**Strong** = credit + better strike. **Defensive** = paying debit to roll "
-        "out of trouble. Use to spot patterns: are you rolling defensively too often?"
-    )
-    try:
-        from tiger_api.rolls import build_rolls, roll_summary
-        if df_orders is None or df_orders.empty:
-            st.info("No order history loaded.")
-        else:
-            rolls_df = build_rolls(df_orders)
-            if rolls_df.empty:
-                st.info("No rolls detected in the order history.")
-            else:
-                rs = roll_summary(rolls_df)
-                rsm = st.columns(5)
-                rsm[0].metric("Total rolls", rs["total_rolls"],
-                              delta=f"{rs['credit_rolls']} credit · {rs['debit_rolls']} debit",
-                              delta_color="off")
-                rsm[1].metric("Σ Net credit",
-                              f"${rs['total_net_credit']:+,.0f}",
-                              help="Cumulative net cash from all rolls.")
-                rsm[2].metric("Avg per roll",
-                              f"${rs['avg_credit_per_roll']:+,.0f}")
-                rsm[3].metric("Best roll", f"${rs['best_roll']:+,.0f}")
-                rsm[4].metric("Worst roll", f"${rs['worst_roll']:+,.0f}")
-
-                # Filter to optionally focus on debit (defensive) rolls
-                show_debit_only = st.checkbox(
-                    "Show only defensive (debit / worse-strike) rolls",
-                    key="roll_debit_only",
-                    help="Filter to rolls that locked in losses (debit) — these "
-                         "indicate positions you should consider closing instead.",
-                )
-                disp_rolls = rolls_df.copy()
-                if show_debit_only:
-                    disp_rolls = disp_rolls[disp_rolls["Roll Quality"].str.contains("Defensive", na=False)]
-                disp_rolls["Old Expiry"] = pd.to_datetime(disp_rolls["Old Expiry"], errors="coerce").dt.strftime("%Y-%m-%d")
-                disp_rolls["New Expiry"] = pd.to_datetime(disp_rolls["New Expiry"], errors="coerce").dt.strftime("%Y-%m-%d")
-                st.dataframe(
-                    disp_rolls, use_container_width=True, hide_index=True,
-                    column_config={
-                        "Old Strike":   st.column_config.NumberColumn(format="$%.2f"),
-                        "New Strike":   st.column_config.NumberColumn(format="$%.2f"),
-                        "Old Premium":  st.column_config.NumberColumn(format="$%.2f"),
-                        "New Premium":  st.column_config.NumberColumn(format="$%.2f"),
-                        "Net Cash $":   st.column_config.NumberColumn(format="$%+,.0f"),
-                        "Strike Δ":     st.column_config.NumberColumn(format="$%+,.2f"),
-                        "DTE Δ":        st.column_config.NumberColumn(format="%+dd"),
-                        "Qty":          st.column_config.NumberColumn(format="%d"),
-                    },
-                )
-    except Exception as e:
-        st.warning(f"Roll tracker failed: {e}")
-        logger.debug("rolls error", exc_info=True)
+    # NOTE: Historical Roll Tracker moved to 📊 P&L → 🔁 Rolls tab
+    # (it's a profitability/insight question, not a forward-looking risk question).
 
 
 def _panel_expiring_soon(df_open: pd.DataFrame, spot_prices: dict, days: int = 14):

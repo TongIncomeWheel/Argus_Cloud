@@ -46,7 +46,8 @@ def _moneyness_bucket(prem: float, strike: float) -> str:
 
 
 def build_win_rate_table(df_orders: pd.DataFrame, ticker_filter: Optional[set] = None,
-                         pot_tickers: Optional[set] = None) -> dict:
+                         pot_tickers: Optional[set] = None,
+                         start_date=None, end_date=None) -> dict:
     """Walk closed CSP/CC trades, attribute outcomes to setup buckets.
 
     Strategy:
@@ -77,6 +78,14 @@ def build_win_rate_table(df_orders: pd.DataFrame, ticker_filter: Optional[set] =
 
     # Only CSP/CC fills; LEAP/STOCK skipped
     df = df[df["TradeType"].isin(["CSP", "CC"])].copy()
+
+    # Period filter: applied to CLOSING fills (when the trade was actually realized)
+    if start_date is not None or end_date is not None:
+        # Note: opens may fall before the period; what matters is when it closed
+        # to count as a realized trade in the period. We DON'T filter df itself
+        # (we still need opens for the matching join). Instead we filter the
+        # `closes` set after the open lookup is built.
+        pass
     if df.empty:
         return out
 
@@ -85,6 +94,14 @@ def build_win_rate_table(df_orders: pd.DataFrame, ticker_filter: Optional[set] =
     df["is_opening"] = df["is_opening"].fillna(False)
     closes = df[~df["is_opening"].astype(bool)].copy()
     opens = df[df["is_opening"].astype(bool)].copy()
+
+    # Apply period filter to CLOSES only — what matters is when the trade
+    # realized P&L within the user's selected period.
+    if start_date is not None:
+        closes = closes[closes["TradeDateTime"] >= pd.Timestamp(start_date)]
+    if end_date is not None:
+        closes = closes[closes["TradeDateTime"] <= pd.Timestamp(end_date) + pd.Timedelta(days=1)]
+
     if closes.empty:
         return out
 

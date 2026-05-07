@@ -26,8 +26,14 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
-def build_rolls(df_orders: pd.DataFrame) -> pd.DataFrame:
+def build_rolls(df_orders: pd.DataFrame, ticker_filter=None, pot_tickers=None,
+                start_date=None, end_date=None) -> pd.DataFrame:
     """Identify roll pairs (BTC + STO) and analyze each.
+
+    Args:
+      ticker_filter: optional set/list of tickers to include
+      pot_tickers:   optional set of tickers in selected pot(s)
+      start_date, end_date: filter by roll Date
 
     Returns DataFrame with columns:
       Date · Ticker · Type · Right (P/C) ·
@@ -42,6 +48,12 @@ def build_rolls(df_orders: pd.DataFrame) -> pd.DataFrame:
     df["TradeDateTime"] = pd.to_datetime(df.get("TradeDateTime", df.get("TradeDate")), errors="coerce")
     df["Expiry_Date"] = pd.to_datetime(df.get("Expiry_Date"), errors="coerce")
     df["TradeDate"] = df["TradeDateTime"].dt.date
+
+    # Filters before grouping
+    if ticker_filter:
+        df = df[df["Ticker"].isin(ticker_filter)]
+    if pot_tickers:
+        df = df[df["Ticker"].isin(pot_tickers)]
 
     # Only options
     df = df[df["TradeType"].isin(["CSP", "CC"])].copy()
@@ -122,6 +134,17 @@ def build_rolls(df_orders: pd.DataFrame) -> pd.DataFrame:
     if not rolls_out:
         return pd.DataFrame()
     rdf = pd.DataFrame(rolls_out)
+
+    # Apply date filter
+    if start_date is not None or end_date is not None:
+        rdf["_date_dt"] = pd.to_datetime(rdf["Date"], errors="coerce")
+        if start_date is not None:
+            rdf = rdf[rdf["_date_dt"] >= pd.Timestamp(start_date)]
+        if end_date is not None:
+            # Include the end date by adding 1 day (since rolls are date-only)
+            rdf = rdf[rdf["_date_dt"] <= pd.Timestamp(end_date) + pd.Timedelta(days=1)]
+        rdf = rdf.drop(columns=["_date_dt"])
+
     return rdf.sort_values("Date", ascending=False).reset_index(drop=True)
 
 
