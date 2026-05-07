@@ -124,6 +124,68 @@ st.markdown("""
     .argus-coverage .ok { color: #2e7d32; }
     .argus-coverage .warn { color: #ed6c02; }
     .argus-coverage .bad { color: #d32f2f; }
+
+    /* ════════════════════════════════════════════════════════════════
+       Mobile-responsive layout (≤ 768px wide)
+       Stack horizontal columns vertically, shrink padding, hide non-essential.
+       ═══════════════════════════════════════════════════════════════ */
+    @media (max-width: 768px) {
+        /* Reduce outer padding */
+        .block-container {
+            padding-top: 1rem !important;
+            padding-left: 0.5rem !important;
+            padding-right: 0.5rem !important;
+        }
+        /* Stack ALL horizontal columns vertically */
+        div[data-testid="stHorizontalBlock"] {
+            flex-direction: column !important;
+            gap: 0.5rem !important;
+        }
+        div[data-testid="stHorizontalBlock"] > div {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+        }
+        /* Smaller metric font */
+        [data-testid="stMetricValue"] { font-size: 1.1rem !important; }
+        [data-testid="stMetricLabel"] { font-size: 0.7rem !important; }
+        [data-testid="stMetricDelta"] { font-size: 0.7rem !important; }
+        /* Coverage strip wraps */
+        .argus-coverage {
+            flex-direction: column !important;
+            align-items: flex-start !important;
+            gap: 0.3rem !important;
+            font-size: 0.72rem !important;
+        }
+        /* Custom centered tables — smaller font + horizontal scroll */
+        table.argus-c {
+            font-size: 0.78rem !important;
+            display: block;
+            overflow-x: auto;
+            white-space: nowrap;
+        }
+        table.argus-c th, table.argus-c td {
+            padding: 0.3rem 0.4rem !important;
+        }
+        /* Tab radio scrolls horizontally instead of stacking */
+        div[data-testid="stRadio"]:has(input[name="_argus_tab_radio"]) > div {
+            flex-direction: row !important;
+            overflow-x: auto !important;
+            flex-wrap: nowrap !important;
+            -webkit-overflow-scrolling: touch;
+            padding-bottom: 0.3rem;
+        }
+        div[data-testid="stRadio"]:has(input[name="_argus_tab_radio"]) > div > label {
+            flex: 0 0 auto !important;
+            padding: 0.4rem 0.7rem !important;
+            font-size: 0.85rem !important;
+        }
+        /* Headings smaller */
+        h1, h2 { font-size: 1.4rem !important; }
+        h3 { font-size: 1.15rem !important; }
+        h4 { font-size: 1rem !important; }
+        /* Plotly charts shorter on mobile */
+        .stPlotlyChart { max-height: 320px; }
+    }
 </style>
 """, unsafe_allow_html=True)
 
