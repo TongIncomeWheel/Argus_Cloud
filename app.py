@@ -2973,8 +2973,10 @@ def render_pl(df_orders, df_open, settings: dict = None):
 # ⚠️ RISK — placeholder
 # ────────────────────────────────────────────────────────────────
 @st.fragment
-def render_risk(df_open, summary, settings, spot_prices: dict = None):
-    """⚠️ Risk & Rolls — expiring soon, concentration, AND Roll/Close candidates."""
+def render_risk(df_open, summary, settings, spot_prices: dict = None,
+                 df_orders: pd.DataFrame = None):
+    """⚠️ Risk & Rolls — expiring soon, concentration, Roll/Close candidates,
+    Stress Test, Roll History."""
     spot_prices = spot_prices or {}
     portfolio_deposit = float(settings.get("portfolio_deposit_usd", 0))
 
@@ -3257,6 +3259,67 @@ def render_risk(df_open, summary, settings, spot_prices: dict = None):
     except Exception as e:
         st.warning(f"Stress test failed: {e}")
         logger.debug("stress error", exc_info=True)
+
+    st.divider()
+
+    # ── 🔁 Roll Tracker (historical roll quality) ──────────────
+    st.markdown("#### 🔁 Roll History — quality of every roll")
+    st.caption(
+        "For each historical roll (BTC + STO same day, same ticker, same right): "
+        "what was the net credit/debit, did the strike improve, did you buy time? "
+        "**Strong** = credit + better strike. **Defensive** = paying debit to roll "
+        "out of trouble. Use to spot patterns: are you rolling defensively too often?"
+    )
+    try:
+        from tiger_api.rolls import build_rolls, roll_summary
+        if df_orders is None or df_orders.empty:
+            st.info("No order history loaded.")
+        else:
+            rolls_df = build_rolls(df_orders)
+            if rolls_df.empty:
+                st.info("No rolls detected in the order history.")
+            else:
+                rs = roll_summary(rolls_df)
+                rsm = st.columns(5)
+                rsm[0].metric("Total rolls", rs["total_rolls"],
+                              delta=f"{rs['credit_rolls']} credit · {rs['debit_rolls']} debit",
+                              delta_color="off")
+                rsm[1].metric("Σ Net credit",
+                              f"${rs['total_net_credit']:+,.0f}",
+                              help="Cumulative net cash from all rolls.")
+                rsm[2].metric("Avg per roll",
+                              f"${rs['avg_credit_per_roll']:+,.0f}")
+                rsm[3].metric("Best roll", f"${rs['best_roll']:+,.0f}")
+                rsm[4].metric("Worst roll", f"${rs['worst_roll']:+,.0f}")
+
+                # Filter to optionally focus on debit (defensive) rolls
+                show_debit_only = st.checkbox(
+                    "Show only defensive (debit / worse-strike) rolls",
+                    key="roll_debit_only",
+                    help="Filter to rolls that locked in losses (debit) — these "
+                         "indicate positions you should consider closing instead.",
+                )
+                disp_rolls = rolls_df.copy()
+                if show_debit_only:
+                    disp_rolls = disp_rolls[disp_rolls["Roll Quality"].str.contains("Defensive", na=False)]
+                disp_rolls["Old Expiry"] = pd.to_datetime(disp_rolls["Old Expiry"], errors="coerce").dt.strftime("%Y-%m-%d")
+                disp_rolls["New Expiry"] = pd.to_datetime(disp_rolls["New Expiry"], errors="coerce").dt.strftime("%Y-%m-%d")
+                st.dataframe(
+                    disp_rolls, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Old Strike":   st.column_config.NumberColumn(format="$%.2f"),
+                        "New Strike":   st.column_config.NumberColumn(format="$%.2f"),
+                        "Old Premium":  st.column_config.NumberColumn(format="$%.2f"),
+                        "New Premium":  st.column_config.NumberColumn(format="$%.2f"),
+                        "Net Cash $":   st.column_config.NumberColumn(format="$%+,.0f"),
+                        "Strike Δ":     st.column_config.NumberColumn(format="$%+,.2f"),
+                        "DTE Δ":        st.column_config.NumberColumn(format="%+dd"),
+                        "Qty":          st.column_config.NumberColumn(format="%d"),
+                    },
+                )
+    except Exception as e:
+        st.warning(f"Roll tracker failed: {e}")
+        logger.debug("rolls error", exc_info=True)
 
 
 def _panel_expiring_soon(df_open: pd.DataFrame, spot_prices: dict, days: int = 14):
@@ -4089,7 +4152,13 @@ def main():
             ].reset_index(drop=True)
         render_pl(df_orders_full, df_open, settings)
     elif active == "risk":
-        render_risk(df_open, summary, settings, spot_prices)
+        # Use full archive for Roll Tracker (rolls span historical periods)
+        df_orders_full_for_risk = tiger_data.load_orders_full(pmcc_tuple)
+        if ignored and not df_orders_full_for_risk.empty and "Ticker" in df_orders_full_for_risk.columns:
+            df_orders_full_for_risk = df_orders_full_for_risk[
+                ~df_orders_full_for_risk["Ticker"].str.upper().isin(ignored)
+            ].reset_index(drop=True)
+        render_risk(df_open, summary, settings, spot_prices, df_orders=df_orders_full_for_risk)
     elif active == "lookup":
         # Combined research tab: contract pricer + IV-Rank scanner
         lookup_a, lookup_b = st.tabs(["🔎 Contract Price Lookup", "📊 IV Rank Scanner"])
