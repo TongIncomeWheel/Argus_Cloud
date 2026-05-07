@@ -2730,8 +2730,9 @@ def render_pl(df_orders, df_open, settings: dict = None):
     st.divider()
 
     # ── 📊 Win-rate & ticker tables ────────────────────────────
-    tab_type, tab_ticker, tab_pivot, tab_cycles = st.tabs([
-        "By Type (win-rate)", "By Ticker", "Pivot: Type × Ticker", "🔄 Wheel Cycles"
+    tab_type, tab_ticker, tab_pivot, tab_cycles, tab_winrate = st.tabs([
+        "By Type (win-rate)", "By Ticker", "Pivot: Type × Ticker",
+        "🔄 Wheel Cycles", "🎯 Setup Win-Rate",
     ])
 
     with tab_type:
@@ -2901,6 +2902,71 @@ def render_pl(df_orders, df_open, settings: dict = None):
         except Exception as e:
             st.warning(f"Wheel cycle analysis failed: {e}")
             logger.debug("cycles error", exc_info=True)
+
+    with tab_winrate:
+        st.caption(
+            "Closed CSP/CC trades classified by setup: **Type × DTE-at-open × "
+            "Moneyness-at-open**. Moneyness derived from premium-to-strike ratio "
+            "as a Δ-at-open proxy (we don't have spot-at-open in archive). "
+            "Win = positive realized P&L on closing fill. "
+            "Use this to identify which setups perform best for you historically."
+        )
+        try:
+            from tiger_api.win_rate import build_win_rate_table
+            ticker_set = set(ticker_filter) if ticker_filter else None
+            wr = build_win_rate_table(df_orders, ticker_filter=ticker_set, pot_tickers=pot_tickers)
+
+            if (wr.get("by_type") is None or wr["by_type"].empty):
+                st.info("No closed CSP/CC trades match current filters. "
+                        "Win-rate analysis needs closed (not opening) fills with linked open trades.")
+            else:
+                wr1, wr2, wr3 = st.columns(3)
+                with wr1:
+                    st.markdown("**By Type**")
+                    st.dataframe(
+                        wr["by_type"], use_container_width=True, hide_index=True,
+                        column_config={
+                            "Total P&L":     st.column_config.NumberColumn(format="$%+,.0f"),
+                            "Win %":         st.column_config.NumberColumn(format="%d%%"),
+                            "Avg per trade": st.column_config.NumberColumn(format="$%+,.0f"),
+                        },
+                    )
+                with wr2:
+                    st.markdown("**By DTE Bucket (at open)**")
+                    st.dataframe(
+                        wr["by_dte"], use_container_width=True, hide_index=True,
+                        column_config={
+                            "Total P&L":     st.column_config.NumberColumn(format="$%+,.0f"),
+                            "Win %":         st.column_config.NumberColumn(format="%d%%"),
+                            "Avg per trade": st.column_config.NumberColumn(format="$%+,.0f"),
+                        },
+                    )
+                with wr3:
+                    st.markdown("**By Moneyness (Δ proxy)**")
+                    st.dataframe(
+                        wr["by_money"], use_container_width=True, hide_index=True,
+                        column_config={
+                            "Total P&L":     st.column_config.NumberColumn(format="$%+,.0f"),
+                            "Win %":         st.column_config.NumberColumn(format="%d%%"),
+                            "Avg per trade": st.column_config.NumberColumn(format="$%+,.0f"),
+                        },
+                    )
+
+                # Type × DTE pivot for Win %
+                if "pivot" in wr and isinstance(wr["pivot"], pd.DataFrame) and not wr["pivot"].empty:
+                    st.markdown("**Win % pivot (DTE × Type)**")
+                    st.dataframe(wr["pivot"], use_container_width=True)
+
+                st.caption(
+                    "📚 **Wheel literature heuristic**: Tasty Trade research suggests "
+                    "selling 30-Δ options at 30-45 DTE typically yields ~70-80% win rate "
+                    "on liquid underlyings. Use the Moneyness × DTE pivot to compare "
+                    "your historical win rate against that benchmark and adjust strike "
+                    "selection. **Higher win rate at lower premium** is the trade-off."
+                )
+        except Exception as e:
+            st.warning(f"Win-rate analysis failed: {e}")
+            logger.debug("winrate error", exc_info=True)
 
 
 # ────────────────────────────────────────────────────────────────
