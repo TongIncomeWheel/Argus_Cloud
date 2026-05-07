@@ -1699,6 +1699,14 @@ def render_positions(df_open: pd.DataFrame, spot_prices: dict, settings: dict):
         except Exception as e:
             logger.debug("Option quote fetch failed: %s", e)
 
+    # Pre-fetch earnings calendar for all unique tickers in filter
+    unique_tickers = tuple(sorted(filt["Ticker"].dropna().unique().tolist()))
+    earnings = {}
+    try:
+        earnings = _td_mod.load_earnings_calendar(unique_tickers)
+    except Exception as e:
+        logger.debug("Earnings calendar fetch failed: %s", e)
+
     rows = []
     total_theta_dollars = 0.0  # Σ θ/day across all option positions (× 100 × |qty|)
     total_delta_shares = 0.0   # Σ delta-equivalent shares (× 100 × |qty|)
@@ -1735,6 +1743,20 @@ def render_positions(df_open: pd.DataFrame, spot_prices: dict, settings: dict):
             except (TypeError, ValueError, KeyError):
                 pass
 
+        # Annualized yield % — wheel's most-cited efficiency metric.
+        # CSP/CC: yield = (premium/share / strike) × (365 / DTE) × 100
+        # LEAP: skipped (long-term holding, not yielding premium).
+        yield_pct = None
+        if is_option and r["TradeType"] in ("CSP", "CC"):
+            try:
+                prem = float(r.get("_avg_cost") or 0)
+                strk = float(r.get("Option_Strike_Price_(USD)") or 0)
+                dte = float(r["DTE"]) if pd.notna(r["DTE"]) else 0
+                if prem > 0 and strk > 0 and dte > 0:
+                    yield_pct = (prem / strk) * (365.0 / dte) * 100.0
+            except (TypeError, ValueError, KeyError):
+                pass
+
         # Look up Alpaca quote for this option (Last + Mid, replaces Tiger's market_price)
         last_str = "—"
         mid_str = "—"
@@ -1763,6 +1785,21 @@ def render_positions(df_open: pd.DataFrame, spot_prices: dict, settings: dict):
             except (TypeError, ValueError, KeyError):
                 pass
 
+        # Earnings warning — flag if earnings fall within DTE window for shorts
+        earn_str = "—"
+        if is_option:
+            earn_date = earnings.get(str(r["Ticker"]).upper())
+            if earn_date:
+                today_d = pd.Timestamp.now().normalize().date()
+                days_to_earnings = (earn_date - today_d).days if hasattr(earn_date, "year") else None
+                exp_d = pd.to_datetime(r["Expiry_Date"], errors="coerce")
+                if days_to_earnings is not None and days_to_earnings >= 0:
+                    if pd.notna(exp_d) and earn_date <= exp_d.date() and r["TradeType"] in ("CSP", "CC"):
+                        # Earnings BEFORE expiry on a short = gap risk
+                        earn_str = f"⚠️ {earn_date.strftime('%m-%d')} ({days_to_earnings}d)"
+                    else:
+                        earn_str = f"{earn_date.strftime('%m-%d')} ({days_to_earnings}d)"
+
         rows.append({
             "Ticker": r["Ticker"],
             "Strategy": r["Strategy"],
@@ -1772,7 +1809,9 @@ def render_positions(df_open: pd.DataFrame, spot_prices: dict, settings: dict):
             "Strike $": f"${float(r['Option_Strike_Price_(USD)']):.2f}" if (is_option and r["Option_Strike_Price_(USD)"]) else "—",
             "Expiry": str(r["Expiry_Date"]) if (is_option and r["Expiry_Date"]) else "—",
             "DTE": int(r["DTE"]) if pd.notna(r["DTE"]) else "—",
+            "Earnings": earn_str,
             "Avg / Premium": f"${float(r['_avg_cost']):.4f}" if r.get("_avg_cost") else "—",
+            "Yield %/yr": f"{yield_pct:.0f}%" if yield_pct is not None else "—",
             "Spot": f"${float(r['Spot']):.2f}" if pd.notna(r.get("Spot")) and r["Spot"] else "—",
             "Last": last_str,
             "Mid": mid_str,
@@ -2152,6 +2191,13 @@ def render_ladder(df_open, spot_prices: dict = None, settings: dict = None):
 
             csp_collateral = strike * 100 * qty if ttype == "CSP" else 0
 
+            # Annualized yield % — capital efficiency metric
+            yield_pct = None
+            if ttype in ("CSP", "CC") and avg > 0 and strike > 0:
+                _dte = int(r["DTE"]) if pd.notna(r["DTE"]) else 0
+                if _dte > 0:
+                    yield_pct = (avg / strike) * (365.0 / _dte) * 100.0
+
             rows.append({
                 "Week": week_end,
                 "Expiry": exp_str,
@@ -2165,6 +2211,7 @@ def render_ladder(df_open, spot_prices: dict = None, settings: dict = None):
                 "Premium": avg,
                 "Last": last if last > 0 else None,
                 "Mid": mid if mid > 0 else None,
+                "Yield %/yr": yield_pct,
                 "Captured %": captured_pct,
                 "If-Expire $": if_expire_dollars,
                 "CSP Coll $": csp_collateral if csp_collateral > 0 else None,
@@ -2348,6 +2395,7 @@ def render_ladder(df_open, spot_prices: dict = None, settings: dict = None):
             "Premium":      st.column_config.NumberColumn(format="$%.2f"),
             "Last":         st.column_config.NumberColumn(format="$%.2f"),
             "Mid":          st.column_config.NumberColumn(format="$%.2f"),
+            "Yield %/yr":   st.column_config.NumberColumn(format="%.0f%%"),
             "Captured %":   st.column_config.NumberColumn(format="%.0f%%"),
             "If-Expire $":  st.column_config.NumberColumn(format="$%+,.0f"),
             "CSP Coll $":   st.column_config.NumberColumn(format="$%,.0f"),

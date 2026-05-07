@@ -989,6 +989,39 @@ def _alpaca_spot_prices(symbols: list) -> dict:
         return {}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_earnings_calendar(tickers_tuple: tuple) -> dict:
+    """Earnings dates per ticker from yfinance.
+
+    Returns: {ticker: next_earnings_date (datetime.date) | None}.
+    Cached 1 hour — earnings dates rarely change intraday.
+    """
+    out = {}
+    if not tickers_tuple:
+        return out
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.warning("yfinance not installed — earnings calendar unavailable")
+        return out
+    for tkr in tickers_tuple:
+        try:
+            t = yf.Ticker(tkr)
+            cal = getattr(t, "calendar", None)
+            if not cal:
+                continue
+            ed = cal.get("Earnings Date") if isinstance(cal, dict) else None
+            if isinstance(ed, list) and ed:
+                # Take the nearest earnings date (could be a range — pick first)
+                out[tkr.upper()] = ed[0]
+            elif ed:
+                out[tkr.upper()] = ed
+        except Exception as e:
+            logger.debug("Earnings fetch failed for %s: %s", tkr, e)
+            continue
+    return out
+
+
 @st.cache_data(ttl=120, show_spinner="📈 Fetching option quotes (Alpaca)…")
 def load_option_quotes(positions_key: tuple) -> dict:
     """Per-option bid/ask/last/mid + IV + real Greeks from Alpaca.
