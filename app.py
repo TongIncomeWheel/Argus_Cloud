@@ -1752,14 +1752,17 @@ def render_positions(df_open: pd.DataFrame, spot_prices: dict, settings: dict):
 
     # ── Filter row 1: Type / Strategy / Ticker ──────────────────
     f1 = st.columns([1, 1, 1, 1, 1])
-    type_options = ["All"] + sorted(df["TradeType"].dropna().unique().tolist())
-    type_filter = f1[0].selectbox("Type", type_options, key="pos_type_filter")
+    type_options = sorted(df["TradeType"].dropna().unique().tolist())
+    type_filter = f1[0].multiselect("Type", type_options, key="pos_type_filter",
+                                     placeholder="All types")
 
-    strat_options = ["All"] + sorted(df["Strategy"].dropna().unique().tolist())
-    strat_filter = f1[1].selectbox("Strategy", strat_options, key="pos_strat_filter")
+    strat_options = sorted(df["Strategy"].dropna().unique().tolist())
+    strat_filter = f1[1].multiselect("Strategy", strat_options, key="pos_strat_filter",
+                                      placeholder="All strategies")
 
-    ticker_options = ["All"] + sorted(df["Ticker"].dropna().unique().tolist())
-    ticker_filter = f1[2].selectbox("Ticker", ticker_options, key="pos_ticker_filter")
+    ticker_options = sorted(df["Ticker"].dropna().unique().tolist())
+    ticker_filter = f1[2].multiselect("Ticker", ticker_options, key="pos_ticker_filter",
+                                       placeholder="All tickers")
 
     month_options = sorted(df["Expiry_Month"].dropna().unique().tolist())
     month_filter = f1[3].multiselect(
@@ -1783,12 +1786,12 @@ def render_positions(df_open: pd.DataFrame, spot_prices: dict, settings: dict):
             st.rerun()
 
     filt = df.copy()
-    if type_filter != "All":
-        filt = filt[filt["TradeType"] == type_filter]
-    if strat_filter != "All":
-        filt = filt[filt["Strategy"] == strat_filter]
-    if ticker_filter != "All":
-        filt = filt[filt["Ticker"] == ticker_filter]
+    if type_filter:
+        filt = filt[filt["TradeType"].isin(type_filter)]
+    if strat_filter:
+        filt = filt[filt["Strategy"].isin(strat_filter)]
+    if ticker_filter:
+        filt = filt[filt["Ticker"].isin(ticker_filter)]
     if month_filter:  # non-empty list
         filt = filt[filt["Expiry_Month"].isin(month_filter)]
     if date_filter:
@@ -2042,7 +2045,7 @@ def render_transactions(df_orders: pd.DataFrame, days: int = 14):
     with f1[4]:
         if st.button("Reset filters", use_container_width=True, key="txn_reset"):
             for k in ("txn_start_filter", "txn_end_filter", "txn_exp_start_filter",
-                      "txn_exp_end_filter", "txn_type_filter", "txn_side_filter",
+                      "txn_exp_end_filter", "txn_type_filter", "txn_event_filter",
                       "txn_ticker_filter"):
                 st.session_state.pop(k, None)
             # Rerun ONLY the fragment (preserves active tab)
@@ -2053,14 +2056,17 @@ def render_transactions(df_orders: pd.DataFrame, days: int = 14):
 
     # ── Filter row 3: Type / Event / Ticker ─────────────────────
     f2 = st.columns([1, 1, 1, 2])
-    type_options = ["All"] + sorted(df["TradeType"].dropna().unique().tolist())
-    type_filter = f2[0].selectbox("Type", type_options, key="txn_type_filter")
-    event_options = ["All"] + sorted(df.get("Event", pd.Series(dtype=str)).dropna().unique().tolist()) \
-        if "Event" in df.columns else ["All"]
-    event_filter = f2[1].selectbox("Event", event_options, key="txn_event_filter",
-                                   help="STO=Sell-to-Open · BTC=Buy-to-Close · BTO=Buy-to-Open · STC=Sell-to-Close · EXPIRED=expired worthless")
-    ticker_options = ["All"] + sorted(df["Ticker"].dropna().unique().tolist())
-    ticker_filter = f2[2].selectbox("Ticker", ticker_options, key="txn_ticker_filter")
+    type_options = sorted(df["TradeType"].dropna().unique().tolist())
+    type_filter = f2[0].multiselect("Type", type_options, key="txn_type_filter",
+                                     placeholder="All types")
+    event_options = sorted(df.get("Event", pd.Series(dtype=str)).dropna().unique().tolist()) \
+        if "Event" in df.columns else []
+    event_filter = f2[1].multiselect("Event", event_options, key="txn_event_filter",
+                                      placeholder="All events",
+                                      help="STO=Sell-to-Open · BTC=Buy-to-Close · BTO=Buy-to-Open · STC=Sell-to-Close · EXPIRED=expired worthless")
+    ticker_options = sorted(df["Ticker"].dropna().unique().tolist())
+    ticker_filter = f2[2].multiselect("Ticker", ticker_options, key="txn_ticker_filter",
+                                       placeholder="All tickers")
 
     # ── Apply all filters ───────────────────────────────────────
     filt = df.copy()
@@ -2076,12 +2082,12 @@ def render_transactions(df_orders: pd.DataFrame, days: int = 14):
         ((filt["Expiry_dt"].dt.date >= exp_start) & (filt["Expiry_dt"].dt.date <= exp_end))
     )
     filt = filt[expiry_pass]
-    if type_filter != "All":
-        filt = filt[filt["TradeType"] == type_filter]
-    if event_filter != "All" and "Event" in filt.columns:
-        filt = filt[filt["Event"] == event_filter]
-    if ticker_filter != "All":
-        filt = filt[filt["Ticker"] == ticker_filter]
+    if type_filter:
+        filt = filt[filt["TradeType"].isin(type_filter)]
+    if event_filter and "Event" in filt.columns:
+        filt = filt[filt["Event"].isin(event_filter)]
+    if ticker_filter:
+        filt = filt[filt["Ticker"].isin(ticker_filter)]
 
     if filt.empty:
         st.info("No transactions match the current filters.")
@@ -2152,14 +2158,14 @@ def render_transactions(df_orders: pd.DataFrame, days: int = 14):
 # 📅 LADDER — P&L Expiry Ladder (premium realization schedule)
 # ────────────────────────────────────────────────────────────────
 @st.fragment
-def render_ladder(df_open, spot_prices: dict = None, settings: dict = None):
+def render_ladder(df_open, spot_prices: dict = None, settings: dict = None,
+                  df_orders: pd.DataFrame = None):
     """📅 P&L Expiry Ladder — calendar of premium realization & capital release.
 
-    For each week (Friday ending) ahead:
-      • Per-position rows: ticker, strike, qty, premium received, current Last,
-                          captured %, ITM/OTM vs spot, $ if expires worthless
-      • Weekly aggregate: total premium captured if all expire worthless,
-                         CSP collateral released, # contracts expiring
+    Two views:
+      1. Forward-looking: open positions bucketed by expiry week (Friday)
+      2. Historical: closed trades YTD bucketed by close-date week — shows
+         premium earned / P&L realized per week in the same format.
 
     Filters: Type · Ticker · Pot · Weeks-ahead · Moneyness (ITM/OTM)
     Uses Alpaca option quotes (cached, batched) for current Last price + mid.
@@ -2229,10 +2235,12 @@ def render_ladder(df_open, spot_prices: dict = None, settings: dict = None):
     ticker_pots = settings.get("ticker_pots", {}) or {}
     available_pots = sorted({str(p) for p in ticker_pots.values() if p}) or ["Core", "Active"]
     f1 = st.columns([1, 1, 1, 1, 1, 1])
-    type_options = ["All"] + sorted(options["TradeType"].dropna().unique().tolist())
-    type_filter = f1[0].selectbox("Type", type_options, key="ladder_type_filter")
-    ticker_options = ["All"] + sorted(options["Ticker"].dropna().unique().tolist())
-    ticker_filter = f1[1].selectbox("Ticker", ticker_options, key="ladder_ticker_filter")
+    type_options = sorted(options["TradeType"].dropna().unique().tolist())
+    type_filter = f1[0].multiselect("Type", type_options, key="ladder_type_filter",
+                                     placeholder="All types")
+    ticker_options = sorted(options["Ticker"].dropna().unique().tolist())
+    ticker_filter = f1[1].multiselect("Ticker", ticker_options, key="ladder_ticker_filter",
+                                       placeholder="All tickers")
     pot_filter = f1[2].multiselect(
         "Pot(s)", available_pots, key="ladder_pot_filter",
         placeholder="All pots",
@@ -2243,13 +2251,14 @@ def render_ladder(df_open, spot_prices: dict = None, settings: dict = None):
         key="ladder_weeks_ahead",
         help="Limit to nearest N weeks. Set high (52+) to include LEAPs.",
     )
-    moneyness_filter = f1[4].selectbox(
-        "Moneyness", ["All", "OTM only", "ITM only"], key="ladder_money_filter",
+    moneyness_filter = f1[4].multiselect(
+        "Moneyness", ["OTM", "ITM"], key="ladder_money_filter",
+        placeholder="All",
         help="Filter by current ITM/OTM status vs spot.",
     )
     if f1[5].button("Reset", key="ladder_reset", use_container_width=True):
         for k in ("ladder_type_filter", "ladder_ticker_filter", "ladder_pot_filter",
-                  "ladder_weeks_ahead", "ladder_money_filter"):
+                  "ladder_weeks_ahead", "ladder_money_filter", "ladder_hist_chart_view"):
             st.session_state.pop(k, None)
         try:
             st.rerun(scope="fragment")
@@ -2274,9 +2283,9 @@ def render_ladder(df_open, spot_prices: dict = None, settings: dict = None):
             week_end = r["WeekEnd"].strftime("%Y-%m-%d") if pd.notna(r["WeekEnd"]) else "—"
             if exp_ts > cutoff:
                 continue
-            if type_filter != "All" and ttype != type_filter:
+            if type_filter and ttype not in type_filter:
                 continue
-            if ticker_filter != "All" and tkr != ticker_filter:
+            if ticker_filter and tkr not in ticker_filter:
                 continue
             if pot_tickers_set is not None and tkr not in pot_tickers_set:
                 continue
@@ -2299,9 +2308,9 @@ def render_ladder(df_open, spot_prices: dict = None, settings: dict = None):
                 itm = spot > 0 and spot < strike
             else:  # CC or LEAP (call)
                 itm = spot > 0 and spot > strike
-            if moneyness_filter == "OTM only" and itm:
+            if moneyness_filter and "OTM" in moneyness_filter and "ITM" not in moneyness_filter and itm:
                 continue
-            if moneyness_filter == "ITM only" and not itm:
+            if moneyness_filter and "ITM" in moneyness_filter and "OTM" not in moneyness_filter and not itm:
                 continue
 
             # Captured% & if-expire-worthless $
@@ -2534,6 +2543,163 @@ def render_ladder(df_open, spot_prices: dict = None, settings: dict = None):
         "Click any column header to sort. **Captured %** = how much of the original premium "
         "you've already locked in via theta decay. **If-Expire $** = premium kept if it "
         "expires worthless from now."
+    )
+
+    # ══════════════════════════════════════════════════════════════
+    # 📅 HISTORICAL LADDER — realized premium by week (YTD)
+    # ══════════════════════════════════════════════════════════════
+    st.divider()
+    st.markdown("### 📅 Historical Ladder — Realized Premium by Week (YTD)")
+    st.caption(
+        "Closed option trades bucketed by the week they closed. Shows actual premium "
+        "earned per week — the mirror of the forward ladder above."
+    )
+
+    if df_orders is None or df_orders.empty:
+        st.info("No historical trade data available. Archive may not be loaded yet.")
+        return
+
+    hist = df_orders.copy()
+    hist["TradeDateTime"] = pd.to_datetime(hist.get("TradeDateTime", hist.get("TradeDate")), errors="coerce")
+
+    # Only CLOSED option trades (closing legs = is_opening False)
+    hist = hist[hist["TradeType"].isin(["CSP", "CC", "LEAP"])].copy()
+    if "is_opening" in hist.columns:
+        hist["is_opening"] = hist["is_opening"].fillna(False)
+        hist = hist[~hist["is_opening"].astype(bool)].copy()
+    if hist.empty:
+        st.info("No closed option trades in archive.")
+        return
+
+    # YTD filter
+    from datetime import date as _date
+    ytd_start = pd.Timestamp(_date(today.year, 1, 1))
+    hist = hist[hist["TradeDateTime"] >= ytd_start].copy()
+    if hist.empty:
+        st.info("No closed option trades YTD.")
+        return
+
+    # Week bucket (Friday ending, same logic as forward ladder)
+    hist["CloseDate"] = hist["TradeDateTime"].dt.normalize()
+    hist["WeekEnd"] = hist["CloseDate"].apply(_friday_for)
+    hist["WeekLabel"] = hist["WeekEnd"].dt.strftime("%Y-%m-%d")
+
+    # Apply same filters (Type, Ticker, Pot) for consistency
+    if type_filter:
+        hist = hist[hist["TradeType"].isin(type_filter)]
+    if ticker_filter:
+        hist = hist[hist["Ticker"].str.upper().isin([t.upper() for t in ticker_filter])]
+    if pot_tickers_set is not None:
+        hist = hist[hist["Ticker"].str.upper().isin(pot_tickers_set)]
+    if hist.empty:
+        st.info("No closed trades match the current filters for YTD.")
+        return
+
+    # Compute per-row: Premium received (FillPrice × 100 × Qty) and realized P&L
+    hist["Qty"] = pd.to_numeric(hist.get("Quantity", 0), errors="coerce").fillna(0).abs()
+    hist["FillPrice"] = pd.to_numeric(hist.get("FillPrice", 0), errors="coerce").fillna(0)
+    hist["Premium $"] = hist["FillPrice"] * 100 * hist["Qty"]
+    hist["P&L $"] = pd.to_numeric(hist.get("Actual_Profit_(USD)", 0), errors="coerce").fillna(0)
+
+    # ── Historical chart ─────────────────────────────────────────
+    st.markdown("##### 📊 Realized P&L by Week (YTD)")
+
+    hist_chart_view = st.radio(
+        "History view",
+        ["By Ticker (stacked)", "By Type (CSP vs CC)", "Aggregated"],
+        horizontal=True,
+        key="ladder_hist_chart_view",
+        label_visibility="collapsed",
+    )
+
+    try:
+        import plotly.express as px
+
+        if hist_chart_view == "Aggregated":
+            hagg = hist.groupby("WeekLabel", as_index=False)["P&L $"].sum()
+            hfig = px.bar(
+                hagg, x="WeekLabel", y="P&L $",
+                labels={"WeekLabel": "Week Ending (Friday)", "P&L $": "Realized P&L ($)"},
+                title="Realized P&L by Week — Aggregated",
+                text="P&L $",
+                color="P&L $",
+                color_continuous_scale=["#d32f2f", "#eeeeee", "#2e7d32"],
+                color_continuous_midpoint=0,
+            )
+            hfig.update_traces(texttemplate="$%{text:,.0f}", textposition="outside")
+            hfig.update_layout(coloraxis_showscale=False)
+        elif hist_chart_view == "By Type (CSP vs CC)":
+            hagg = hist.groupby(["WeekLabel", "TradeType"], as_index=False)["P&L $"].sum()
+            hfig = px.bar(
+                hagg, x="WeekLabel", y="P&L $", color="TradeType",
+                labels={"WeekLabel": "Week Ending (Friday)", "P&L $": "Realized P&L ($)"},
+                title="Realized P&L by Week — By Type",
+                color_discrete_map={"CSP": "#2e7d32", "CC": "#1976d2", "LEAP": "#f57c00"},
+                barmode="stack",
+            )
+        else:  # By Ticker
+            hagg = hist.groupby(["WeekLabel", "Ticker"], as_index=False)["P&L $"].sum()
+            hfig = px.bar(
+                hagg, x="WeekLabel", y="P&L $", color="Ticker",
+                labels={"WeekLabel": "Week Ending (Friday)", "P&L $": "Realized P&L ($)"},
+                title="Realized P&L by Week — By Ticker",
+                barmode="stack",
+            )
+        hfig.update_layout(
+            height=420,
+            xaxis_tickangle=-45,
+            hovermode="x unified",
+            yaxis_tickformat="$,.0f",
+            margin=dict(l=10, r=10, t=50, b=10),
+        )
+        st.plotly_chart(hfig, use_container_width=True)
+    except ImportError:
+        st.warning("plotly not installed — `pip install plotly` to enable the chart.")
+
+    # ── Historical headline metrics ──────────────────────────────
+    hm1, hm2, hm3, hm4 = st.columns(4)
+    total_realized = float(hist["P&L $"].sum())
+    n_hist_weeks = hist["WeekLabel"].nunique()
+    avg_per_week_hist = total_realized / n_hist_weeks if n_hist_weeks > 0 else 0
+    n_trades = len(hist)
+    win_count = int((hist["P&L $"] > 0).sum())
+    win_pct = win_count / n_trades * 100 if n_trades > 0 else 0
+    hm1.metric("YTD Realized P&L", f"${total_realized:+,.0f}")
+    hm2.metric("Avg per week", f"${avg_per_week_hist:+,.0f}",
+               help=f"{n_hist_weeks} weeks with closes YTD.")
+    hm3.metric("Trades closed", f"{n_trades}")
+    hm4.metric("Win rate", f"{win_pct:.0f}%",
+               help=f"{win_count} wins / {n_trades} trades (P&L > 0 = win).")
+
+    # ── Historical weekly summary table ──────────────────────────
+    st.markdown("##### 📊 Weekly Realized Summary")
+    hist_weekly = []
+    for wk, grp in hist.groupby("WeekLabel"):
+        pnl_sum = float(grp["P&L $"].sum())
+        prem_sum = float(grp["Premium $"].sum())
+        n_csp = int((grp["TradeType"] == "CSP").sum())
+        n_cc = int((grp["TradeType"] == "CC").sum())
+        n_leap = int((grp["TradeType"] == "LEAP").sum())
+        hist_weekly.append({
+            "Week Ending": wk,
+            "Trades": len(grp),
+            "CSPs": n_csp,
+            "CCs": n_cc,
+            "LEAPs": n_leap,
+            "Close Prem $": prem_sum,
+            "Realized P&L $": pnl_sum,
+        })
+    hwdf = pd.DataFrame(hist_weekly).sort_values("Week Ending", ascending=False).reset_index(drop=True)
+    st.dataframe(
+        hwdf, use_container_width=True, hide_index=True,
+        column_config={
+            "Close Prem $":     st.column_config.NumberColumn(format="$%,.0f"),
+            "Realized P&L $":   st.column_config.NumberColumn(format="$%+,.0f"),
+        },
+    )
+    st.caption(
+        "**Close Prem $** = fill price × 100 × qty on the closing trade. "
+        "**Realized P&L $** = Tiger's realized P&L on that close (premium collected − buyback cost)."
     )
 
 
@@ -3246,8 +3412,9 @@ def render_risk(df_open, summary, settings, spot_prices: dict = None,
                  "Lower = more aggressive. Higher = hold for max profit (gamma risk).",
         )
     with rc2:
-        cand_type = st.selectbox(
-            "Type", ["All", "CSP", "CC"], key="rr_type_filter",
+        cand_type = st.multiselect(
+            "Type", ["CSP", "CC"], key="rr_type_filter",
+            placeholder="All types",
             help="Filter to just CSPs or CCs.",
         )
     with rc3:
@@ -3300,7 +3467,7 @@ def render_risk(df_open, summary, settings, spot_prices: dict = None,
             captured_dollars = (avg - last) * 100 * qty
             remaining_dollars = last * 100 * qty
             dte = int(r["DTE"]) if pd.notna(r["DTE"]) else 0
-            if cand_type != "All" and ttype != cand_type:
+            if cand_type and ttype not in cand_type:
                 continue
             if cand_pot_tickers is not None and tkr not in cand_pot_tickers:
                 continue
@@ -3319,7 +3486,7 @@ def render_risk(df_open, summary, settings, spot_prices: dict = None,
 
     if not candidates:
         st.info(
-            f"No short positions match: ≥{threshold_pct}% captured · type={cand_type} · DTE≤{cand_dte_max}. "
+            f"No short positions match: ≥{threshold_pct}% captured · type={', '.join(cand_type) if cand_type else 'All'} · DTE≤{cand_dte_max}. "
             "Loosen filters to see partial candidates."
         )
     else:
@@ -4296,7 +4463,13 @@ def main():
     elif active == "transactions":
         render_transactions(df_orders, days=14)
     elif active == "ladder":
-        render_ladder(df_open, spot_prices, settings)
+        # Ladder needs archive for historical weeks view
+        df_orders_full_for_ladder = tiger_data.load_orders_full(pmcc_tuple)
+        if ignored and not df_orders_full_for_ladder.empty and "Ticker" in df_orders_full_for_ladder.columns:
+            df_orders_full_for_ladder = df_orders_full_for_ladder[
+                ~df_orders_full_for_ladder["Ticker"].str.upper().isin(ignored)
+            ].reset_index(drop=True)
+        render_ladder(df_open, spot_prices, settings, df_orders=df_orders_full_for_ladder)
     elif active == "pl":
         # P&L analytics gets full-history (live 90d + on-disk archive merged)
         df_orders_full = tiger_data.load_orders_full(pmcc_tuple)

@@ -228,21 +228,81 @@ from pathlib import Path as _Path
 _MLEG_CACHE_PATH = _Path(__file__).parent.parent / "data" / "mleg_cache.parquet"
 
 
-def _load_mleg_cache() -> dict:
-    """Read the parquet cache → dict[order_id_str, list[leg_row_dict]]."""
-    if not _MLEG_CACHE_PATH.exists():
-        return {}
+def _seed_mleg_cache_from_archive() -> dict:
+    """Reconstruct MLEG cache from the gSheet archive (cold-start recovery).
+
+    On Streamlit Cloud the ephemeral filesystem wipes the parquet cache every
+    time the app sleeps.  Previously this meant re-expanding ALL ~60 combos
+    via Tiger API (1.05s each = 60-90s).
+
+    The archive already contains the expanded legs with:
+      - Source = "TigerAPI-LEG (combo <order_id>)"
+      - OrderID_Tiger = the parent order ID
+
+    We parse these to rebuild the cache dict[order_id → list[leg_row_dict]],
+    save to parquet locally, and return it — zero Tiger API calls needed.
+    """
+    import re
     try:
-        df = pd.read_parquet(_MLEG_CACHE_PATH)
-        if df.empty or "_mleg_order_id" not in df.columns:
+        from tiger_api.archive import load_orders_archive
+        archive = load_orders_archive()
+        if archive.empty:
             return {}
+        # Find MLEG-expanded rows — they have Source matching "TigerAPI-LEG (combo ...)"
+        if "Source" not in archive.columns:
+            return {}
+        mask = archive["Source"].astype(str).str.contains("TigerAPI-LEG", na=False)
+        mleg_rows = archive[mask].copy()
+        if mleg_rows.empty:
+            return {}
+        # Extract parent order_id from Source field or OrderID_Tiger
         cache = {}
-        for oid, grp in df.groupby("_mleg_order_id"):
-            cache[str(oid)] = grp.drop(columns=["_mleg_order_id"]).to_dict("records")
+        for _, row in mleg_rows.iterrows():
+            # Try OrderID_Tiger first (most reliable)
+            oid = str(row.get("OrderID_Tiger", "") or "").strip()
+            if not oid:
+                # Fallback: parse from Source "TigerAPI-LEG (combo 12345678)"
+                m = re.search(r"combo\s+(\d+)", str(row.get("Source", "")))
+                if m:
+                    oid = m.group(1)
+            if not oid:
+                continue
+            leg = row.to_dict()
+            # Remove archive-specific columns that aren't part of the cache
+            for drop_col in ("_mleg_order_id",):
+                leg.pop(drop_col, None)
+            cache.setdefault(oid, []).append(leg)
+        if cache:
+            _save_mleg_cache(cache)
+            logger.info("MLEG cache seeded from archive: %d combos (%d legs)",
+                        len(cache), sum(len(v) for v in cache.values()))
         return cache
     except Exception as e:
-        logger.warning("MLEG cache read failed: %s", e)
+        logger.warning("MLEG cache seed from archive failed: %s", e)
         return {}
+
+
+def _load_mleg_cache() -> dict:
+    """Read the parquet cache → dict[order_id_str, list[leg_row_dict]].
+
+    On Cloud cold start (parquet wiped), automatically seeds from the gSheet
+    archive — avoids 60-90s of Tiger API re-expansion.
+    """
+    if _MLEG_CACHE_PATH.exists():
+        try:
+            df = pd.read_parquet(_MLEG_CACHE_PATH)
+            if not df.empty and "_mleg_order_id" in df.columns:
+                cache = {}
+                for oid, grp in df.groupby("_mleg_order_id"):
+                    cache[str(oid)] = grp.drop(columns=["_mleg_order_id"]).to_dict("records")
+                if cache:
+                    return cache
+        except Exception as e:
+            logger.warning("MLEG cache read failed: %s", e)
+
+    # Parquet missing or empty — seed from archive (Cloud cold-start recovery)
+    logger.info("MLEG parquet cache missing — seeding from gSheet archive")
+    return _seed_mleg_cache_from_archive()
 
 
 def _save_mleg_cache(cache: dict) -> None:

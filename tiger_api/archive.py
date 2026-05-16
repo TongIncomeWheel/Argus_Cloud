@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import streamlit as st
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +65,8 @@ def _get_or_create_archive_ws(handler):
             return None
 
 
-def read_archive_from_gsheet() -> pd.DataFrame:
-    """Read the Orders_Archive tab → DataFrame. Empty DataFrame if missing/error."""
+def _read_archive_from_gsheet_uncached() -> pd.DataFrame:
+    """Raw gSheet read — NO cache. Used internally; callers use read_archive_from_gsheet()."""
     handler = _get_gsheet_handler()
     if handler is None:
         return pd.DataFrame()
@@ -93,6 +94,17 @@ def read_archive_from_gsheet() -> pd.DataFrame:
     except Exception as e:
         logger.warning("Could not read Orders_Archive tab: %s", e)
         return pd.DataFrame()
+
+
+# Session-level cache — the gSheet archive doesn't change within a single
+# app run, so reading it more than once per 10 min is pure waste.  On cold
+# start this was being read 3× (auto_archive check + header archive badge
+# + data coverage strip) = ~30-60s of redundant gSheet I/O.  Now: once.
+
+@st.cache_data(ttl=600, show_spinner="📂 Loading archive from gSheet (one-time)…")
+def read_archive_from_gsheet() -> pd.DataFrame:
+    """Cached gSheet archive read — at most once per 10 min."""
+    return _read_archive_from_gsheet_uncached()
 
 
 def write_archive_to_gsheet(df: pd.DataFrame) -> bool:
@@ -123,6 +135,11 @@ def write_archive_to_gsheet(df: pd.DataFrame) -> bool:
         ws.clear()
         ws.update(values=values, range_name="A1")
         logger.info("Wrote %d rows to Orders_Archive tab", len(df))
+        # Bust the read cache so subsequent reads see the new data
+        try:
+            read_archive_from_gsheet.clear()
+        except Exception:
+            pass
         return True
     except Exception as e:
         logger.error("Could not write Orders_Archive tab: %s", e)
