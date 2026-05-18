@@ -4423,6 +4423,7 @@ def main():
     TAB_OPTIONS = [
         ("🎯 Cockpit",       "cockpit"),
         ("⚠️ Risk & Rolls",  "risk"),
+        ("🧠 PMCC Engine",   "pmcc"),
         ("📦 Positions",     "positions"),
         ("📜 Transactions",  "transactions"),
         ("📅 Ladder",        "ladder"),
@@ -4499,6 +4500,14 @@ def main():
             render_iv_scanner(df_open, settings)
     elif active == "config":
         render_config(settings, save_settings_dict)
+    elif active == "pmcc":
+        # PMCC Engine — operationalizes the PMCC Operating Doctrine v2
+        try:
+            from pmcc_engine.ui import render_pmcc_engine
+            render_pmcc_engine(df_open, settings, spot_prices, save_settings_dict)
+        except Exception as e:
+            st.error(f"PMCC Engine error: {e}")
+            logger.exception("PMCC engine render failed")
 
 
 if __name__ == "__main__":
