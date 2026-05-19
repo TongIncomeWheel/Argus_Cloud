@@ -23,24 +23,36 @@ IVR_RICH_MAX = 75      # IVR 50-75 → rich; above 75 → extreme
 
 # Regime grid: (vol_band, ivr_band) → posture metadata.
 # `dte_weeks` is a (min, max) tuple in weeks for short DTE selection.
-# `posture` is a short code; `array` describes ITM/OTM allocation.
+# `posture` is a short code; `shape` describes the ITM/OTM LEAN direction —
+# NOT a count. The count comes from how many LEAPS the operator chooses to
+# cover (typically N LEAPS → N shorts for 100% coverage). The regime tells
+# you how to SPLIT those shorts (lean ITM, balanced, lean OTM, all ITM, etc.).
+#
+# Shape vocabulary (see SHAPE_DESCRIPTIONS):
+#   centered         equal ITM and OTM
+#   lean_itm         more ITM than OTM (harvest mode)
+#   lean_otm         more OTM than ITM (growth-participation mode)
+#   all_itm          all shorts ITM (defensive flip)
+#   all_otm          all shorts OTM
+#   all_otm_half     all shorts OTM, half size
+#   stand_down       no new short deployment
 REGIME_GRID = {
-    ("L", "cheap"):    {"posture": "defensive_flip",       "dte_weeks": (3, 4),  "array": "all_itm_3pct_below"},
-    ("L", "neutral"):  {"posture": "standard_lean_theta",  "dte_weeks": (6, 6),  "array": "2_2"},
-    ("L", "rich"):     {"posture": "standard",             "dte_weeks": (4, 5),  "array": "2_2"},
-    ("L", "extreme"):  {"posture": "otm_skew",             "dte_weeks": (3, 4),  "array": "all_otm"},
-    ("M", "cheap"):    {"posture": "otm_lean",             "dte_weeks": (5, 6),  "array": "2_2"},
-    ("M", "neutral"):  {"posture": "base_case",            "dte_weeks": (4, 6),  "array": "3_3"},
-    ("M", "rich"):     {"posture": "itm_harvest",          "dte_weeks": (4, 4),  "array": "itm_lean"},
-    ("M", "extreme"):  {"posture": "fade_vol",             "dte_weeks": (3, 4),  "array": "all_otm"},
-    ("H", "cheap"):    {"posture": "otm_lean",             "dte_weeks": (4, 4),  "array": "2_2_otm_lean"},
-    ("H", "neutral"):  {"posture": "otm_lean",             "dte_weeks": (4, 4),  "array": "2_2_otm_lean"},
-    ("H", "rich"):     {"posture": "all_otm",              "dte_weeks": (3, 3),  "array": "all_otm"},
-    ("H", "extreme"):  {"posture": "all_otm_half_size",    "dte_weeks": (2, 3),  "array": "all_otm"},
-    ("X", "cheap"):    {"posture": "stand_down",           "dte_weeks": None,    "array": None},
-    ("X", "neutral"):  {"posture": "stand_down_or_half",   "dte_weeks": None,    "array": "all_otm_half"},
-    ("X", "rich"):     {"posture": "all_otm_half_size",    "dte_weeks": (2, 2),  "array": "all_otm"},
-    ("X", "extreme"):  {"posture": "all_otm_half_gamma",   "dte_weeks": (2, 2),  "array": "all_otm"},
+    ("L", "cheap"):    {"posture": "defensive_flip",       "dte_weeks": (3, 4),  "shape": "all_itm"},
+    ("L", "neutral"):  {"posture": "standard_lean_theta",  "dte_weeks": (6, 6),  "shape": "centered"},
+    ("L", "rich"):     {"posture": "standard",             "dte_weeks": (4, 5),  "shape": "centered"},
+    ("L", "extreme"):  {"posture": "otm_skew",             "dte_weeks": (3, 4),  "shape": "all_otm"},
+    ("M", "cheap"):    {"posture": "otm_lean",             "dte_weeks": (5, 6),  "shape": "lean_otm"},
+    ("M", "neutral"):  {"posture": "base_case",            "dte_weeks": (4, 6),  "shape": "centered"},
+    ("M", "rich"):     {"posture": "itm_harvest",          "dte_weeks": (4, 4),  "shape": "lean_itm"},
+    ("M", "extreme"):  {"posture": "fade_vol",             "dte_weeks": (3, 4),  "shape": "all_otm"},
+    ("H", "cheap"):    {"posture": "otm_lean",             "dte_weeks": (4, 4),  "shape": "lean_otm"},
+    ("H", "neutral"):  {"posture": "otm_lean",             "dte_weeks": (4, 4),  "shape": "lean_otm"},
+    ("H", "rich"):     {"posture": "all_otm",              "dte_weeks": (3, 3),  "shape": "all_otm"},
+    ("H", "extreme"):  {"posture": "all_otm_half_size",    "dte_weeks": (2, 3),  "shape": "all_otm_half"},
+    ("X", "cheap"):    {"posture": "stand_down",           "dte_weeks": None,    "shape": "stand_down"},
+    ("X", "neutral"):  {"posture": "stand_down_or_half",   "dte_weeks": None,    "shape": "all_otm_half"},
+    ("X", "rich"):     {"posture": "all_otm_half_size",    "dte_weeks": (2, 2),  "shape": "all_otm_half"},
+    ("X", "extreme"):  {"posture": "all_otm_half_gamma",   "dte_weeks": (2, 2),  "shape": "all_otm_half"},
 }
 
 POSTURE_DESCRIPTIONS = {
@@ -60,158 +72,171 @@ POSTURE_DESCRIPTIONS = {
 }
 
 
-# Plain-English description of array codenames used in REGIME_GRID["array"].
-# Used by the UI so users never see cryptic codes like "2_2" or "all_itm_3pct_below".
-ARRAY_DESCRIPTIONS = {
-    "2_2":                  "2 ITM + 2 OTM short calls",
-    "3_3":                  "3 ITM + 3 OTM short calls",
-    "2_2_otm_lean":         "2 ITM + 2 OTM short calls (OTM-weighted)",
-    "itm_lean":             "ITM-leaning short array",
-    "all_otm":              "All shorts OTM",
-    "all_otm_half":         "All shorts OTM, half size",
-    "all_itm_3pct_below":   "All shorts ITM (~3% below spot, defensive flip)",
+# Plain-English descriptions of SHAPE codes used in REGIME_GRID["shape"].
+# These are direction-of-lean labels — the COUNT of shorts is set by the
+# operator (typically = number of LEAPS for 100% coverage).
+SHAPE_DESCRIPTIONS = {
+    "centered":       "Centered (equal short calls ITM and OTM)",
+    "lean_itm":       "ITM-lean (more shorts below spot — harvest mode)",
+    "lean_otm":       "OTM-lean (more shorts above spot — growth-participation mode)",
+    "all_itm":        "All shorts ITM (defensive flip — premium harvest only)",
+    "all_otm":        "All shorts OTM (defensive — growth participation only)",
+    "all_otm_half":   "All shorts OTM, half-size (preserve capital in shock regime)",
+    "stand_down":     "Stand down (no new short deployment until regime re-ranks)",
 }
 
 
-def array_description(code) -> str:
-    """Translate a regime-grid array codename to plain English for UI display."""
+def shape_description(code) -> str:
+    """Translate a regime-grid shape codename to plain English."""
     if not code:
         return "—"
-    return ARRAY_DESCRIPTIONS.get(code, code)
+    return SHAPE_DESCRIPTIONS.get(code, code)
 
 
-def parse_array_code(code: str):
-    """Parse a regime-grid array code to (target_itm, target_otm) where numeric.
+def classify_shape(itm_count: int, otm_count: int) -> str:
+    """Classify the operator's current short array into a doctrine shape code.
 
-    Returns None for codes that don't map to a simple N+M count
-    (e.g. 'itm_lean' has no fixed numbers — operator interprets).
+    The shape is purely about LEAN direction; the count comes from coverage.
     """
-    if not code:
-        return None
-    if code == "all_otm":
-        return (0, None)         # 0 ITM, OTM count operator-set
-    if code == "all_otm_half":
-        return (0, None)
-    if code == "all_itm_3pct_below":
-        return (None, 0)         # ITM count operator-set, 0 OTM
-    parts = code.split("_")
-    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-        return (int(parts[0]), int(parts[1]))
-    return None
+    if itm_count == 0 and otm_count == 0:
+        return "empty"
+    if otm_count == 0:
+        return "all_itm"
+    if itm_count == 0:
+        return "all_otm"
+    if itm_count == otm_count:
+        return "centered"
+    if itm_count > otm_count:
+        return "lean_itm"
+    return "lean_otm"
 
 
-def array_guidance(current_itm: int, current_otm: int, target_code: str) -> dict:
-    """Compare current short placement to doctrine target. Returns plain-English guidance.
+def shape_guidance(current_itm: int, current_otm: int, target_shape: str) -> dict:
+    """Compare operator's current short shape to the regime's target shape.
+
+    Returns plain-English guidance: headline, actions, tradeoffs. The count
+    of shorts (4 vs 6 vs 8) is irrelevant — only the lean direction matters.
 
     Output dict:
-        match (bool)             — true if current matches target shape
-        target (str)             — plain-English target description
-        delta_itm, delta_otm     — (current - target) where target is numeric
-        actions (list[str])      — concrete trim/add instructions
-        tradeoffs (list[str])    — what the operator gives up either way
-        headline (str)           — one-line takeaway
+        match (bool)
+        current_shape (str)        — operator's actual classified shape
+        target (str)               — regime's target shape description
+        actions (list[str])        — what to shift to align (rolls, not closes)
+        tradeoffs (list[str])
+        headline (str)
     """
-    target = parse_array_code(target_code)
-    target_desc = array_description(target_code)
+    current_shape = classify_shape(current_itm, current_otm)
+    target_desc = shape_description(target_shape)
 
-    # Variable-count targets (all_otm, all_itm)
-    if target == (0, None):
-        on_doctrine = current_itm == 0
-        actions = (
-            [f"Close or roll your {current_itm} ITM short(s) to OTM strikes."]
-            if not on_doctrine else
-            ["Already all-OTM — on doctrine."]
-        )
-        return {
-            "match": on_doctrine,
-            "target": target_desc,
-            "current": (current_itm, current_otm),
-            "actions": actions,
-            "tradeoffs": [
-                "All-OTM = lower theta capture, more directional headroom for LEAPS.",
-                "Doctrine prescribes this when vol is rich + IVR extreme, or in shock regimes.",
-            ],
-            "headline": "On doctrine (all-OTM)." if on_doctrine else f"Off doctrine — trim {current_itm} ITM short(s) to reach all-OTM.",
-        }
-    if target == (None, 0):
-        on_doctrine = current_otm == 0
-        actions = (
-            [f"Close or roll your {current_otm} OTM short(s) to ITM strikes (~3% below spot)."]
-            if not on_doctrine else
-            ["Already all-ITM — on doctrine."]
-        )
-        return {
-            "match": on_doctrine,
-            "target": target_desc,
-            "current": (current_itm, current_otm),
-            "actions": actions,
-            "tradeoffs": [
-                "All-ITM = max defensive theta, but caps LEAPS upside and concentrates assignment risk.",
-                "Doctrine prescribes this in low-vol-cheap-IVR regimes (defensive flip).",
-            ],
-            "headline": "On doctrine (all-ITM defensive flip)." if on_doctrine else f"Off doctrine — close/roll {current_otm} OTM short(s) to ITM.",
-        }
-
-    # Qualitative targets without numeric mapping
-    if target is None:
+    if not target_shape or target_shape == "stand_down":
         return {
             "match": False,
+            "current_shape": current_shape,
             "target": target_desc,
-            "current": (current_itm, current_otm),
-            "actions": [f"Doctrine target is qualitative (`{target_code}`) — interpret per regime cell description."],
-            "tradeoffs": [],
-            "headline": f"Doctrine target: {target_desc} — operator interprets.",
+            "actions": ["Regime calls for **stand down** — close or let expire; do not deploy new shorts until vol re-ranks."],
+            "tradeoffs": ["Standing down means zero income for the duration. Doctrine accepts this cost to avoid deploying into a regime that can't be trusted."],
+            "headline": "🛑 Stand down regime — no new shorts.",
         }
 
-    # Numeric N_M target (e.g. 2_2, 3_3)
-    target_itm, target_otm = target
-    delta_itm = current_itm - target_itm
-    delta_otm = current_otm - target_otm
-
-    if delta_itm == 0 and delta_otm == 0:
+    # Exact-match shapes
+    if current_shape == target_shape:
         return {
             "match": True,
+            "current_shape": current_shape,
             "target": target_desc,
-            "current": (current_itm, current_otm),
-            "actions": ["On doctrine — no change needed."],
+            "actions": [f"On doctrine — your shape is **{shape_description(current_shape)}**, matching the regime target."],
             "tradeoffs": [],
-            "headline": "✅ Array matches doctrine target.",
+            "headline": f"✅ {shape_description(current_shape)}.",
+        }
+
+    # Compute the shift needed
+    total = current_itm + current_otm
+    if total == 0:
+        return {
+            "match": False,
+            "current_shape": current_shape,
+            "target": target_desc,
+            "actions": [f"No shorts deployed. Regime calls for **{target_desc}** at your chosen coverage count."],
+            "tradeoffs": [],
+            "headline": f"No shorts yet — regime target is {target_desc}.",
         }
 
     actions = []
-    if delta_itm > 0:
-        actions.append(f"**Close {delta_itm} ITM short(s)** — extras vs doctrine. Pick the one with lowest extrinsic + closest to expiry (cheapest to BTC).")
-    elif delta_itm < 0:
-        actions.append(f"**Add {-delta_itm} ITM short(s)** — below target. Sell ~3% below spot per §3, hurdle-checked.")
-    if delta_otm > 0:
-        actions.append(f"**Close {delta_otm} OTM short(s)** — extras vs doctrine. These uncap LEAPS upside, so closing returns headroom.")
-    elif delta_otm < 0:
-        actions.append(f"**Add {-delta_otm} OTM short(s)** — below target. Sell above nearest resistance per §3.")
-
     tradeoffs = []
-    if delta_itm > 0 or delta_otm > 0:
-        tradeoffs.append("Holding extras vs target: more gross theta, but more gamma + assignment exposure and more capital deployed than the regime calls for.")
-        tradeoffs.append("Trimming to target: lower income but cleaner regime alignment + less roll-cost exposure in a vol shock.")
-    if delta_itm < 0:
-        tradeoffs.append("Under-ITM: leaving income on the table; ITM legs do the §2 hurdle work.")
-    if delta_otm < 0:
-        tradeoffs.append("Under-OTM: LEAPS uncapped (potential upside), but no growth-participation premium collected.")
+    headline = f"⚠️ Your shape is **{shape_description(current_shape)}** — regime calls for **{target_desc}**."
 
-    headline = (
-        f"⚠️ Off doctrine: you have {current_itm} ITM + {current_otm} OTM "
-        f"vs target {target_itm} ITM + {target_otm} OTM."
-    )
+    if target_shape == "centered":
+        # Need equal counts. Calculate the move.
+        if current_otm > current_itm:
+            move = (current_otm - current_itm) // 2 or 1
+            actions.append(f"**Roll {move} OTM short(s) ITM** (above-spot strikes to below-spot, e.g. into the 1-3% ITM band).")
+            tradeoffs.append("Rolling OTM→ITM trades growth participation for higher theta capture.")
+        else:
+            move = (current_itm - current_otm) // 2 or 1
+            actions.append(f"**Roll {move} ITM short(s) OTM** (below-spot strikes to above-spot, e.g. into the 1-3% OTM band).")
+            tradeoffs.append("Rolling ITM→OTM gives back some theta to uncap LEAPS upside.")
+        actions.append("Alternative: keep current count, accept off-doctrine, document rationale in your §10 review.")
+
+    elif target_shape == "lean_itm":
+        if current_otm >= current_itm:
+            move = max(1, (current_otm - current_itm + 1) // 2)
+            actions.append(f"**Roll {move} OTM short(s) ITM** to tilt the array toward harvest mode.")
+            tradeoffs.append("ITM-lean trades growth headroom for more reliable theta capture (regime is paying for harvest right now).")
+
+    elif target_shape == "lean_otm":
+        if current_itm >= current_otm:
+            move = max(1, (current_itm - current_otm + 1) // 2)
+            actions.append(f"**Roll {move} ITM short(s) OTM** to tilt the array toward growth-participation.")
+            tradeoffs.append("OTM-lean trades theta capture for less assignment risk + LEAPS upside participation.")
+
+    elif target_shape == "all_otm":
+        actions.append(f"**Roll all {current_itm} ITM short(s) to OTM strikes.** Regime can't be trusted for ITM theta-harvest.")
+        tradeoffs.append("All-OTM gives up most theta in exchange for minimizing assignment risk in a high-vol regime.")
+
+    elif target_shape == "all_itm":
+        actions.append(f"**Roll all {current_otm} OTM short(s) to ITM strikes (~3% below spot).** Defensive flip — extract what theta is available.")
+        tradeoffs.append("All-ITM caps LEAPS upside completely but maximizes theta capture when premium is otherwise dead.")
+
+    elif target_shape == "all_otm_half":
+        if current_itm > 0 or total > max(1, total // 2):
+            actions.append(f"**Roll all {current_itm} ITM short(s) OTM AND close ~half the OTM legs.** Half-size all-OTM in shock regime.")
+            tradeoffs.append("Half-size preserves capital while maintaining minimum directional cover.")
+
+    if not actions:
+        actions = [f"Adjust array toward **{target_desc}**."]
+
+    actions.append("Alternative: hold current shape, accept off-doctrine, document rationale in your §10 review.")
+
     return {
         "match": False,
+        "current_shape": current_shape,
         "target": target_desc,
-        "current": (current_itm, current_otm),
-        "target_counts": (target_itm, target_otm),
-        "delta_itm": delta_itm,
-        "delta_otm": delta_otm,
         "actions": actions,
         "tradeoffs": tradeoffs,
         "headline": headline,
     }
+
+
+# ─── Legacy aliases (kept for backwards-compat during refactor) ───
+# Older callers may reference these. They simply delegate to the new
+# shape-based helpers so the engine stays unified.
+
+def array_description(code) -> str:   # legacy
+    return shape_description(code)
+
+
+def array_guidance(current_itm, current_otm, target_code):   # legacy
+    return shape_guidance(current_itm, current_otm, target_code)
+
+
+def parse_array_code(code):   # legacy — no longer used internally
+    if not code:
+        return None
+    if code in ("all_otm", "all_otm_half"):
+        return (0, None)
+    if code == "all_itm":
+        return (None, 0)
+    return None
 
 
 # ─── §2 Theta Hurdle ───────────────────────────────────────────────

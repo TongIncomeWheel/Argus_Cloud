@@ -39,12 +39,13 @@ class IVRBandTests(unittest.TestCase):
 
 
 class RegimeCellTests(unittest.TestCase):
-    def test_base_case_resolves_to_2_2_array(self):
+    def test_base_case_resolves_to_centered_shape(self):
         cell = regime.regime_cell(current_vol=22.0, median_vol=18.0, ivr=40.0)
         self.assertEqual(cell["vol_band"], "M")
         self.assertEqual(cell["ivr_band"], "neutral")
         self.assertEqual(cell["posture"], "base_case")
-        self.assertEqual(cell["array"], "3_3")
+        self.assertEqual(cell["shape"], "centered")
+        self.assertEqual(cell["array"], "centered")   # legacy alias also exposes the same
         self.assertTrue(regime.is_base_case(cell))
 
     def test_extreme_vol_extreme_ivr_calls_for_half_size_otm(self):

@@ -213,21 +213,23 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
     st.markdown("#### Array")
     short_dicts = [{"strike": s["strike"], "label": s.get("expiry", ""), "extrinsic": s.get("extrinsic", 0.0)} for s in shorts]
     layout = posture_mod.array_layout(spot, short_dicts)
-    doctrine_array = cell.get("array") or "—"
+    target_shape = cell.get("shape") or cell.get("array")   # 'shape' is new, 'array' is legacy alias
     layout_line = _format_array_line(layout, spot)
     st.code(layout_line, language="text")
 
     coverage = posture_mod.coverage_ratios(longs_for_book, shorts_for_book)
-    cov_pct = (coverage["long_total"] / coverage["short_total"] * 100) if coverage["short_total"] else 0
+    cov_pct = (coverage["short_total"] / coverage["long_total"] * 100) if coverage["long_total"] else 0
+    current_shape = doctrine.classify_shape(layout["itm_count"], layout["otm_count"])
     st.markdown(
-        f"**Your shorts:** {layout['itm_count']} ITM + {layout['otm_count']} OTM  ·  "
-        f"**PMCC coverage:** {coverage['long_total']} LEAPS : {coverage['short_total']} shorts "
-        f"({cov_pct:.0f}% covered)  ·  "
-        f"**Doctrine target** ({cell['cell_label']}): {doctrine.array_description(doctrine_array)}"
+        f"**Your array:** {layout['itm_count']} ITM + {layout['otm_count']} OTM "
+        f"= **{doctrine.shape_description(current_shape)}**  \n"
+        f"**PMCC coverage:** {coverage['short_total']} shorts / {coverage['long_total']} LEAPS "
+        f"= **{cov_pct:.0f}% of LEAPS covered**  \n"
+        f"**Regime target shape** ({cell['cell_label']}): {doctrine.shape_description(target_shape)}"
     )
-    guidance = doctrine.array_guidance(
+    guidance = doctrine.shape_guidance(
         current_itm=layout["itm_count"], current_otm=layout["otm_count"],
-        target_code=doctrine_array,
+        target_shape=target_shape,
     )
     if guidance["match"]:
         st.success(f"✅ {guidance['headline']}")
@@ -240,18 +242,40 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
                 for t in guidance["tradeoffs"]:
                     st.markdown(f"  - {t}")
 
-    with st.expander("ℹ️ What is the array notation (2-2, 3-3, all-OTM)?"):
+    with st.expander("ℹ️ How the array works — shape vs count, and how the regime guides it"):
         st.markdown(
-            "**Your PMCC array is your set of short call positions at any one time.** "
-            "`N-M` = N shorts below spot (ITM) + M shorts above spot (OTM).\n\n"
-            "Different from **PMCC coverage** (LEAPs : shorts ratio). You have "
-            f"{coverage['long_total']}:{coverage['short_total']} contract coverage — "
-            f"{cov_pct:.0f}% of shorts are LEAP-backed. Array shape is independent of that.\n\n"
-            "Each side does a different job: ITM legs harvest theta (income engine), "
-            "OTM legs uncap LEAPS upside (growth-participation engine). "
-            "Doctrine target shape changes per regime — `2-2` in low-vol neutral, "
-            "`3-3` in the base case (Band M × IVR neutral), `all-ITM` in defensive flip, "
-            "`all-OTM` in shock regimes."
+            "**Two separate decisions sit underneath every PMCC array:**\n\n"
+            "1. **Count** — how many short calls to run. This is *your* choice based on "
+            "how many LEAPS you want to cover. In a strict 100%-covered PMCC, the rule is "
+            "**one short per LEAP** — so if you own 6 LEAPS, you'd run 6 shorts; if you own "
+            "2 LEAPS, you'd run 2 shorts. **The doctrine doesn't pick this number for you.**\n\n"
+            "2. **Shape** — where those shorts sit relative to spot. *This* is what the "
+            "regime tells you. Same six shorts can be split 6 ITM (defensive flip), or "
+            "3 ITM + 3 OTM (centered), or 0 ITM + 6 OTM (all-OTM). Same count, different shape.\n\n"
+            "### The shape vocabulary (no numbers — just direction of lean)\n\n"
+            "| Shape | Meaning | Use case |\n"
+            "|-------|---------|----------|\n"
+            "| **Centered** | Equal ITM and OTM shorts | Standard / base case — balanced theta + growth participation |\n"
+            "| **ITM-lean** | More ITM than OTM | Harvest mode — when regime pays for theta capture |\n"
+            "| **OTM-lean** | More OTM than ITM | Growth mode — when vol is rising and ITM assignment risk grows |\n"
+            "| **All-ITM** | Every short ITM | Defensive flip — low vol, low IVR; only ITM theta worth grabbing |\n"
+            "| **All-OTM** | Every short OTM | High vol, high IVR; minimize assignment risk |\n"
+            "| **Stand down** | Don't deploy new shorts | Extreme vol regime — wait for re-rank |\n\n"
+            "### Regime → shape mapping (what the engine surfaces)\n\n"
+            "| Regime cell | Target shape | Why |\n"
+            "|-------------|--------------|-----|\n"
+            "| Band M × IVR neutral (base case) | Centered | Premium typical → balanced split |\n"
+            "| Band L × IVR neutral / rich | Centered | Low vol but still earning — stay balanced |\n"
+            "| Band L × IVR cheap | All-ITM | Premium is dead → only ITM has any theta |\n"
+            "| Band M × IVR rich | ITM-lean | Premium is rich → harvest extra |\n"
+            "| Band M × IVR cheap | OTM-lean | Lean OTM in low-but-rising vol |\n"
+            "| Band H × IVR cheap / neutral | OTM-lean | Vol expansion → reduce ITM assignment exposure |\n"
+            "| Band H × IVR rich | All-OTM | Pay attention to gamma; defensive only |\n"
+            "| Band H × IVR extreme | All-OTM half-size | Half size in shock regime |\n"
+            "| Band X (extreme) | Stand down or half-size OTM | Can't trust the regime |\n\n"
+            f"**Your book right now:** {coverage['long_total']} LEAPS, {coverage['short_total']} shorts → "
+            f"**{cov_pct:.0f}% of LEAPS covered**. Shape = **{doctrine.shape_description(current_shape)}**. "
+            f"Regime target shape = **{doctrine.shape_description(target_shape)}**."
         )
 
     # ── POSITION TABLE (unified, advisor-style) ───────────────────
