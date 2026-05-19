@@ -217,8 +217,7 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
 
     st.markdown(
         f"**Your shorts:** {layout['itm_count']} ITM + {layout['otm_count']} OTM  ·  "
-        f"**Doctrine target** ({cell['cell_label']}): {doctrine.array_description(doctrine_array)}  ·  "
-        f"{'✅ on-doctrine' if array_match else '⚠️ off-doctrine'}"
+        f"**Doctrine target** ({cell['cell_label']}): {doctrine.array_description(doctrine_array)}"
     )
     st.caption(
         "Compares your current short-call placement (how many sit ITM vs OTM of spot) against the doctrine §1 "
@@ -226,6 +225,32 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
     )
     layout_line = _format_array_line(layout, spot)
     st.code(layout_line, language="text")
+
+    # ── Doctrine guidance — what to do if off-doctrine ────────────
+    guidance = doctrine.array_guidance(
+        current_itm=layout["itm_count"],
+        current_otm=layout["otm_count"],
+        target_code=doctrine_array,
+    )
+    if guidance["match"]:
+        st.success(f"✅ {guidance['headline']}")
+    else:
+        st.warning(f"⚠️ **Doctrine guidance** — {guidance['headline']}")
+        if guidance.get("actions"):
+            st.markdown("**Options to align (or accept off-doctrine):**")
+            for a in guidance["actions"]:
+                st.markdown(f"  - {a}")
+        if guidance.get("tradeoffs"):
+            with st.expander("Tradeoffs of staying off-doctrine vs trimming"):
+                for t in guidance["tradeoffs"]:
+                    st.markdown(f"- {t}")
+                st.markdown(
+                    "\n_Doctrine §1 prescribes the target shape per regime cell, but "
+                    "doesn't force a re-shape. Operators can accept off-doctrine if the "
+                    "rationale is documented in the §10 review (e.g. 'leaning ITM-heavy "
+                    "to harvest while vol re-ranks toward Band M'). The mismatch is a "
+                    "thinking prompt, not an alarm._"
+                )
 
     # ── BLOCK 3 — AGGREGATE ───────────────────────────────────────
     st.markdown("#### Block 3 — Aggregate")
