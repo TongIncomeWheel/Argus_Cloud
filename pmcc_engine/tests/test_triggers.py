@@ -108,6 +108,99 @@ class RollTriggerTests(unittest.TestCase):
         self.assertFalse(r.triggered)
 
 
+class ShortStatusLabelTests(unittest.TestCase):
+    def test_sit_when_clean(self):
+        s = triggers.short_status_label(
+            {"mark": 4.5, "strike": 750.0, "dte": 30, "premium_received": 5.0}, spot=738.0)
+        self.assertEqual(s["tier"], "ok")
+        self.assertIn("Sit", s["label"])
+
+    def test_approaching_50pct(self):
+        # OTM call: strike 750 vs spot 738 — premium $5, mark $3.45 → 31% profit
+        # Extrinsic = mark = $3.45 (OTM has no intrinsic). >$3 so not 'declining' watch.
+        # Should hit 'Approaching 50% harvest'.
+        s = triggers.short_status_label(
+            {"mark": 3.45, "strike": 750.0, "dte": 37, "premium_received": 5.0}, spot=738.0)
+        self.assertEqual(s["tier"], "watch")
+        self.assertIn("Approaching 50%", s["label"])
+
+    def test_harvest_at_50pct(self):
+        # OTM call: premium $5, mark $2.50 = 50% profit. ext = $2.50 (no intrinsic).
+        # profit ≥50% wins ordering ahead of extrinsic-declining watch.
+        s = triggers.short_status_label(
+            {"mark": 2.5, "strike": 760.0, "dte": 30, "premium_received": 5.0}, spot=738.0)
+        self.assertEqual(s["tier"], "triggered")
+        self.assertIn("Harvest", s["label"])
+
+    def test_close_at_80pct(self):
+        # OTM call: premium $5, mark $1.00 = 80% profit
+        s = triggers.short_status_label(
+            {"mark": 1.0, "strike": 760.0, "dte": 30, "premium_received": 5.0}, spot=738.0)
+        self.assertEqual(s["tier"], "triggered")
+        self.assertIn("Close", s["label"])
+
+    def test_extrinsic_critical(self):
+        # ITM short with extrinsic < $1
+        s = triggers.short_status_label(
+            {"mark": 23.5, "strike": 715.0, "dte": 30, "premium_received": 20.0}, spot=738.0)
+        # intrinsic 23, extrinsic 0.5 → critical
+        self.assertEqual(s["tier"], "triggered")
+        self.assertIn("Extrinsic", s["label"])
+
+    def test_extrinsic_declining_watch(self):
+        # ITM short with extrinsic between $1 and $3
+        s = triggers.short_status_label(
+            {"mark": 25.0, "strike": 715.0, "dte": 30, "premium_received": 20.0}, spot=738.0)
+        # intrinsic 23, extrinsic 2 → watch
+        self.assertEqual(s["tier"], "watch")
+
+    def test_dte_critical(self):
+        s = triggers.short_status_label(
+            {"mark": 3.0, "strike": 750.0, "dte": 8, "premium_received": 4.0}, spot=738.0)
+        # DTE 8, profit 25% → DTE forced roll
+        self.assertEqual(s["tier"], "triggered")
+
+    def test_paper_red(self):
+        # Short above spot that's now near spot, mark > premium
+        s = triggers.short_status_label(
+            {"mark": 9.0, "strike": 745.0, "dte": 30, "premium_received": 5.0}, spot=738.0)
+        # 745 ≤ 738 * 1.02 = 752.76 → strike threatened
+        # profit = (5-9)/5 = -80% → paper red
+        self.assertEqual(s["tier"], "watch")
+        self.assertIn("Paper red", s["label"])
+
+
+class ItemsOnWatchTests(unittest.TestCase):
+    def test_extrinsic_approaching_floor(self):
+        from datetime import date
+        shorts = [{
+            "strike": 710.0, "mark": 31.0, "extrinsic": 3.0,
+            "theta_per_day": 0.15, "dte": 29, "premium_received": 30.0,
+            "label": "$710",
+        }]
+        items = triggers.items_on_watch(shorts, state={}, today=date(2026, 5, 19))
+        # Should surface extrinsic watch
+        self.assertTrue(any("extrinsic" in i["item"].lower() for i in items))
+
+    def test_profit_approaching_50(self):
+        from datetime import date
+        shorts = [{
+            "strike": 725.0, "mark": 3.5, "extrinsic": 11.25,
+            "theta_per_day": 0.20, "dte": 37, "premium_received": 5.0,
+            "label": "$725",
+        }]
+        items = triggers.items_on_watch(shorts, state={}, today=date(2026, 5, 19))
+        # 30% profit → on watch for 50%
+        self.assertTrue(any("profit" in i["item"].lower() for i in items))
+
+    def test_ex_div_approaching(self):
+        from datetime import date
+        state = {"ex_div_calendar": [{"date": "2026-06-19", "est_dividend": 1.85}]}
+        items = triggers.items_on_watch([], state=state, today=date(2026, 5, 25))
+        # ~17 business days to ex-div, within 30-day window
+        self.assertTrue(any("Ex-div" in i["item"] for i in items))
+
+
 class RefreshTriggerTests(unittest.TestCase):
     def test_survival_floor_takes_precedence(self):
         r = triggers.leaps_refresh_trigger({"delta": 0.80, "dte": 90})

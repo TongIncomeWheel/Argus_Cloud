@@ -72,19 +72,28 @@ def regime_cell(current_vol: float, median_vol: float,
     """Look up the (vol_band, ivr_band) cell in the regime grid.
 
     Returns a dict with keys:
-        vol_band, ivr_band, posture, dte_weeks, array, description, cell_label.
+        vol_band, ivr_band, posture, dte_weeks, shape, description, cell_label.
+
+    `shape` is the LEAN direction the regime calls for (centered / lean_itm /
+    lean_otm / all_itm / all_otm / all_otm_half / stand_down). The count of
+    shorts is operator-determined — typically = number of LEAPS to maintain
+    100% PMCC coverage.
+
+    The legacy key `array` is kept as an alias of `shape` for backwards-compat.
     """
     vb = vol_band(current_vol, median_vol)
     ib = ivr_band(ivr)
     grid_entry = doctrine.REGIME_GRID.get((vb, ib), {})
     posture = grid_entry.get("posture")
+    shape = grid_entry.get("shape")
     return {
         "vol_band": vb,
         "ivr_band": ib,
         "cell_label": f"Band {vb} × IVR {ib}",
         "posture": posture,
         "dte_weeks": grid_entry.get("dte_weeks"),
-        "array": grid_entry.get("array"),
+        "shape": shape,
+        "array": shape,   # legacy alias
         "description": doctrine.POSTURE_DESCRIPTIONS.get(posture, ""),
         "ivr": float(ivr) if ivr is not None else None,
         "current_vol": float(current_vol) if current_vol else None,

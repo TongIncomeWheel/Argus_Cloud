@@ -90,9 +90,11 @@ class BookGreeksTests(unittest.TestCase):
 
 class ThetaPerDeltaTests(unittest.TestCase):
     def test_optimal_threshold(self):
-        self.assertEqual(theta_math.theta_per_delta_rating(2.00), "Optimal")
-        self.assertEqual(theta_math.theta_per_delta_rating(1.00), "Acceptable")
-        self.assertEqual(theta_math.theta_per_delta_rating(0.50), "Suboptimal")
+        # Calibrated thresholds: ≥0.75 Optimal · ≥0.40 Acceptable · <0.40 Suboptimal
+        self.assertEqual(theta_math.theta_per_delta_rating(1.00), "Optimal")
+        self.assertEqual(theta_math.theta_per_delta_rating(0.50), "Acceptable")
+        self.assertEqual(theta_math.theta_per_delta_rating(0.41), "Acceptable")
+        self.assertEqual(theta_math.theta_per_delta_rating(0.35), "Suboptimal")
 
     def test_zero_delta_returns_zero(self):
         self.assertEqual(theta_math.theta_per_delta(10.0, 0.0), 0.0)

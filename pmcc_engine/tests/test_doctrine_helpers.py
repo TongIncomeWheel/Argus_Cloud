@@ -7,71 +7,86 @@ from pmcc_engine import doctrine
 from pmcc_engine import state
 
 
-class ArrayDescriptionTests(unittest.TestCase):
+class ShapeDescriptionTests(unittest.TestCase):
     def test_known_codes(self):
-        self.assertEqual(doctrine.array_description("2_2"), "2 ITM + 2 OTM short calls")
-        self.assertEqual(doctrine.array_description("3_3"), "3 ITM + 3 OTM short calls")
-        self.assertEqual(doctrine.array_description("all_otm"), "All shorts OTM")
-        self.assertIn("ITM", doctrine.array_description("all_itm_3pct_below"))
+        self.assertIn("Centered", doctrine.shape_description("centered"))
+        self.assertIn("ITM-lean", doctrine.shape_description("lean_itm"))
+        self.assertIn("OTM-lean", doctrine.shape_description("lean_otm"))
+        self.assertIn("All shorts ITM", doctrine.shape_description("all_itm"))
+        self.assertIn("All shorts OTM", doctrine.shape_description("all_otm"))
 
     def test_unknown_code_returns_input(self):
-        self.assertEqual(doctrine.array_description("custom_code"), "custom_code")
+        self.assertEqual(doctrine.shape_description("custom_code"), "custom_code")
 
     def test_none_returns_dash(self):
-        self.assertEqual(doctrine.array_description(None), "—")
+        self.assertEqual(doctrine.shape_description(None), "—")
 
 
-class ParseArrayCodeTests(unittest.TestCase):
-    def test_numeric_codes(self):
-        self.assertEqual(doctrine.parse_array_code("2_2"), (2, 2))
-        self.assertEqual(doctrine.parse_array_code("3_3"), (3, 3))
-        # Suffixed numeric codes (e.g. 2_2_otm_lean) still parse to first two ints
-        self.assertEqual(doctrine.parse_array_code("2_2_otm_lean"), (2, 2))
+class ClassifyShapeTests(unittest.TestCase):
+    def test_centered_at_any_count(self):
+        self.assertEqual(doctrine.classify_shape(1, 1), "centered")
+        self.assertEqual(doctrine.classify_shape(3, 3), "centered")
+        self.assertEqual(doctrine.classify_shape(5, 5), "centered")
 
-    def test_qualitative_codes(self):
-        self.assertEqual(doctrine.parse_array_code("all_otm"), (0, None))
-        self.assertEqual(doctrine.parse_array_code("all_itm_3pct_below"), (None, 0))
-        self.assertIsNone(doctrine.parse_array_code("itm_lean"))
-        self.assertIsNone(doctrine.parse_array_code(""))
-        self.assertIsNone(doctrine.parse_array_code(None))
+    def test_itm_lean(self):
+        self.assertEqual(doctrine.classify_shape(4, 2), "lean_itm")
+        self.assertEqual(doctrine.classify_shape(3, 1), "lean_itm")
+
+    def test_otm_lean(self):
+        self.assertEqual(doctrine.classify_shape(1, 3), "lean_otm")
+        self.assertEqual(doctrine.classify_shape(0, 4), "all_otm")  # 0 ITM is the special case
+
+    def test_all_itm_when_no_otm(self):
+        self.assertEqual(doctrine.classify_shape(4, 0), "all_itm")
+
+    def test_all_otm_when_no_itm(self):
+        self.assertEqual(doctrine.classify_shape(0, 4), "all_otm")
+
+    def test_empty(self):
+        self.assertEqual(doctrine.classify_shape(0, 0), "empty")
 
 
-class ArrayGuidanceTests(unittest.TestCase):
-    def test_on_doctrine_2_2(self):
-        g = doctrine.array_guidance(current_itm=2, current_otm=2, target_code="2_2")
+class ShapeGuidanceTests(unittest.TestCase):
+    def test_on_doctrine_centered_3_3(self):
+        # User has 3-3 centered, regime calls for centered → match regardless of count
+        g = doctrine.shape_guidance(current_itm=3, current_otm=3, target_shape="centered")
         self.assertTrue(g["match"])
-        self.assertIn("matches", g["headline"].lower())
 
-    def test_3_3_when_target_is_2_2(self):
-        g = doctrine.array_guidance(current_itm=3, current_otm=3, target_code="2_2")
-        self.assertFalse(g["match"])
-        self.assertEqual(g["delta_itm"], 1)
-        self.assertEqual(g["delta_otm"], 1)
-        # Should suggest closing one of each
-        self.assertTrue(any("Close 1 ITM" in a for a in g["actions"]))
-        self.assertTrue(any("Close 1 OTM" in a for a in g["actions"]))
+    def test_on_doctrine_centered_1_1(self):
+        # User has 1-1, regime calls for centered → also a match (count is operator's choice)
+        g = doctrine.shape_guidance(current_itm=1, current_otm=1, target_shape="centered")
+        self.assertTrue(g["match"])
 
-    def test_2_2_when_target_is_3_3(self):
-        g = doctrine.array_guidance(current_itm=2, current_otm=2, target_code="3_3")
+    def test_on_doctrine_centered_5_5(self):
+        g = doctrine.shape_guidance(current_itm=5, current_otm=5, target_shape="centered")
+        self.assertTrue(g["match"])
+
+    def test_off_doctrine_otm_lean_when_target_centered(self):
+        # User has 2 ITM + 4 OTM (OTM-lean), regime calls for centered → off
+        g = doctrine.shape_guidance(current_itm=2, current_otm=4, target_shape="centered")
         self.assertFalse(g["match"])
-        self.assertEqual(g["delta_itm"], -1)
-        self.assertEqual(g["delta_otm"], -1)
-        self.assertTrue(any("Add 1 ITM" in a for a in g["actions"]))
-        self.assertTrue(any("Add 1 OTM" in a for a in g["actions"]))
+        # Action should suggest rolling some OTM → ITM to re-balance
+        self.assertTrue(any("Roll" in a and ("OTM" in a) for a in g["actions"]))
+
+    def test_off_doctrine_itm_lean_when_target_centered(self):
+        # User has 4 ITM + 2 OTM, regime calls for centered → off
+        g = doctrine.shape_guidance(current_itm=4, current_otm=2, target_shape="centered")
+        self.assertFalse(g["match"])
+        self.assertTrue(any("Roll" in a and ("ITM" in a) for a in g["actions"]))
 
     def test_all_otm_target_with_itm_shorts(self):
-        g = doctrine.array_guidance(current_itm=2, current_otm=2, target_code="all_otm")
+        g = doctrine.shape_guidance(current_itm=2, current_otm=2, target_shape="all_otm")
         self.assertFalse(g["match"])
-        self.assertTrue(any("ITM short" in a for a in g["actions"]))
+        self.assertTrue(any("ITM" in a for a in g["actions"]))
 
-    def test_all_otm_target_when_clean(self):
-        g = doctrine.array_guidance(current_itm=0, current_otm=4, target_code="all_otm")
+    def test_all_otm_target_when_already_all_otm(self):
+        g = doctrine.shape_guidance(current_itm=0, current_otm=4, target_shape="all_otm")
         self.assertTrue(g["match"])
 
-    def test_all_itm_target_with_otm_shorts(self):
-        g = doctrine.array_guidance(current_itm=4, current_otm=1, target_code="all_itm_3pct_below")
+    def test_stand_down_regime(self):
+        g = doctrine.shape_guidance(current_itm=2, current_otm=2, target_shape="stand_down")
         self.assertFalse(g["match"])
-        self.assertTrue(any("OTM short" in a for a in g["actions"]))
+        self.assertIn("Stand down", g["headline"]) if "Stand down" in g["headline"] else self.assertIn("stand down", g["headline"].lower())
 
 
 class DefaultStateSeedTests(unittest.TestCase):

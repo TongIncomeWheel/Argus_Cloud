@@ -103,7 +103,8 @@ def render_pmcc_engine(df_open, settings: dict, spot_prices: Optional[dict] = No
 
 
 def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
-    """The four-block review per Doctrine §10."""
+    """Daily review — advisor-style format: summary → market → array → unified
+    position table → Δ/Θ summary → tripwires → items on watch → action."""
 
     # ── Pull live market state ────────────────────────────────────
     with st.spinner("📊 Loading market state…"):
@@ -122,314 +123,307 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
         )
         cell["vol_axis"] = vol_axis
 
-    # ── BLOCK 1 — MARKET STATE ────────────────────────────────────
-    st.markdown("#### Block 1 — Market State")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric(f"{ticker} Spot", f"${spot:.2f}" if spot else "—")
-    c2.metric(f"{vol_axis}", f"{current_vol:.1f}" if current_vol else "—",
-              delta=f"median {ticker_state.get('vol_median_5yr', '—')}",
-              delta_color="off")
-    c3.metric("HV30", f"{hv30*100:.1f}%" if hv30 else "—")
-    c4.metric("IVR (52w)", f"{ivr:.0f}" if ivr is not None else "—")
-    c5.metric("Regime cell", cell["cell_label"])
-
-    st.info(
-        f"**Posture mandated:** `{cell['posture']}` — {cell.get('description', '')}"
-        + (f"  \n**DTE band:** {cell['dte_weeks'][0]}–{cell['dte_weeks'][1]} weeks." if cell.get("dte_weeks") else "")
-        + (f"  \n**Doctrine target array:** {doctrine.array_description(cell['array'])} "
-           "_(your actual layout shown in Block 2)_"
-           if cell.get("array") else "")
-    )
-
-    # ── BLOCK 2 — POSITION TABLE ──────────────────────────────────
-    st.markdown("#### Block 2 — Position Table")
     longs, shorts = _extract_pmcc_positions(ticker, df_open, spot)
     if not longs and not shorts:
         st.info(f"No PMCC positions found for {ticker}. Add a LEAP + short calls to engage the engine.")
         return
 
+    # ── Aggregate book greeks (need these for the summary) ────────
+    longs_for_book = [{"qty": l.get("qty", 1), "delta": l.get("delta", 0.0), "theta": l.get("theta_per_day", 0.0)} for l in longs]
+    shorts_for_book = [{"qty": s.get("qty", 1), "delta": s.get("delta", 0.0), "theta": s.get("theta_per_day", 0.0)} for s in shorts]
+    greeks = theta_math.book_greeks(longs_for_book, shorts_for_book)
+    tpd = theta_math.theta_per_delta(greeks["net_theta"], greeks["net_delta"])
+    rating = theta_math.theta_per_delta_rating(tpd)
+    yr = theta_math.yield_ratio(
+        [{"strike": s["strike"], "theta_per_day": s.get("theta_per_day", 0.0)} for s in shorts],
+        hv30,
+    ) if hv30 else 0.0
+
+    # ── Tripwires + watch ─────────────────────────────────────────
+    today = date.today()
+    shorts_for_tripwires = [
+        {
+            "strike": s["strike"], "spot": spot,
+            "mark": s.get("mark", 0.0), "dte": s.get("dte", 99),
+            "premium_received": s.get("premium_received", 0.0) or s.get("mark", 0.0),
+            "is_call": s["argus_type"] == "CC",
+            "extrinsic": s.get("extrinsic", 0.0),
+            "theta_per_day": s.get("theta_per_day", 0.0),
+            "label": f"${s['strike']:.0f}",
+        }
+        for s in shorts
+    ]
+    trip_results = triggers_mod.check_all_tripwires(
+        spot=spot, vix=current_vol, shorts=shorts_for_tripwires,
+        state=ticker_state, today=today,
+    )
+    watch_items = triggers_mod.items_on_watch(shorts_for_tripwires, ticker_state, today=today)
+    reopt = posture_mod.reoptimization_check(
+        net_theta=greeks["net_theta"], net_delta=greeks["net_delta"],
+        shorts=[{"strike": s["strike"], "extrinsic": s.get("extrinsic", 0.0)} for s in shorts],
+        spot=spot, array_center_strike=ticker_state.get("array_center_strike"),
+    )
+    breached = [t for t in trip_results if bool(t)]
+    any_leg_triggered = False
+    for s in shorts:
+        st_lbl = triggers_mod.short_status_label({
+            "mark": s.get("mark", 0.0), "strike": s["strike"], "dte": s.get("dte", 99),
+            "premium_received": s.get("premium_received", 0.0) or s.get("mark", 0.0),
+            "is_call": s["argus_type"] == "CC",
+        }, spot=spot)
+        if st_lbl["tier"] == "triggered":
+            any_leg_triggered = True
+
+    # ── PLAIN-ENGLISH SUMMARY (top of report) ─────────────────────
+    closest_watch = watch_items[0] if watch_items else None
+    summary_bits = [
+        f"**{ticker} ${spot:.2f}.**",
+        f"**{vol_axis} {current_vol:.2f}.**",
+        f"Regime: **{cell['cell_label']} → {cell.get('posture', '—')}**.",
+        f"Earning **${greeks['net_theta']:.0f}/day**.",
+    ]
+    if breached:
+        summary_bits.append(f"⚠️ **{len(breached)} tripwire(s) breached.**")
+    elif any_leg_triggered:
+        summary_bits.append("⚠️ Per-leg trigger active.")
+    else:
+        summary_bits.append("**No trigger fired.**")
+    if closest_watch:
+        summary_bits.append(
+            f"_Closest watch: {closest_watch['item']} at {closest_watch['current']} "
+            f"(triggers {closest_watch['trigger']})._"
+        )
+    summary_bits.append("**Hold.**" if not breached and not any_leg_triggered else "**Review action below.**")
+    ts_local = datetime.now()
+    st.markdown(f"_{ts_local.strftime('%a %b %d, %H:%M')} — review for {ticker}_")
+    st.markdown(" ".join(summary_bits))
+
+    # ── MARKET ────────────────────────────────────────────────────
+    st.markdown("#### Market")
+    m_rows = [
+        {"": f"{ticker}", " ": f"**${spot:.2f}**"},
+        {"": vol_axis, " ": f"**{current_vol:.2f}** (median {ticker_state.get('vol_median_5yr', '—')})"},
+        {"": "HV30", " ": f"{hv30*100:.1f}%"},
+        {"": "IVR (52w)", " ": f"{ivr:.0f}" if ivr is not None else "—"},
+        {"": "Regime", " ": f"**{cell['cell_label']} → {cell.get('posture', '—')}**"},
+    ]
+    st.table(pd.DataFrame(m_rows))
+
+    # ── ARRAY ─────────────────────────────────────────────────────
+    st.markdown("#### Array")
+    short_dicts = [{"strike": s["strike"], "label": s.get("expiry", ""), "extrinsic": s.get("extrinsic", 0.0)} for s in shorts]
+    layout = posture_mod.array_layout(spot, short_dicts)
+    target_shape = cell.get("shape") or cell.get("array")   # 'shape' is new, 'array' is legacy alias
+    layout_line = _format_array_line(layout, spot)
+    st.code(layout_line, language="text")
+
+    coverage = posture_mod.coverage_ratios(longs_for_book, shorts_for_book)
+    cov_pct = (coverage["short_total"] / coverage["long_total"] * 100) if coverage["long_total"] else 0
+    current_shape = doctrine.classify_shape(layout["itm_count"], layout["otm_count"])
+    st.markdown(
+        f"**Your array:** {layout['itm_count']} ITM + {layout['otm_count']} OTM "
+        f"= **{doctrine.shape_description(current_shape)}**  \n"
+        f"**PMCC coverage:** {coverage['short_total']} shorts / {coverage['long_total']} LEAPS "
+        f"= **{cov_pct:.0f}% of LEAPS covered**  \n"
+        f"**Regime target shape** ({cell['cell_label']}): {doctrine.shape_description(target_shape)}"
+    )
+    guidance = doctrine.shape_guidance(
+        current_itm=layout["itm_count"], current_otm=layout["otm_count"],
+        target_shape=target_shape,
+    )
+    if guidance["match"]:
+        st.success(f"✅ {guidance['headline']}")
+    else:
+        with st.expander(f"⚠️ {guidance['headline']} — options to align"):
+            for a in guidance.get("actions", []):
+                st.markdown(f"- {a}")
+            if guidance.get("tradeoffs"):
+                st.markdown("**Tradeoffs:**")
+                for t in guidance["tradeoffs"]:
+                    st.markdown(f"  - {t}")
+
+    with st.expander("ℹ️ How the array works — shape vs count, and how the regime guides it"):
+        st.markdown(
+            "**Two separate decisions sit underneath every PMCC array:**\n\n"
+            "1. **Count** — how many short calls to run. This is *your* choice based on "
+            "how many LEAPS you want to cover. In a strict 100%-covered PMCC, the rule is "
+            "**one short per LEAP** — so if you own 6 LEAPS, you'd run 6 shorts; if you own "
+            "2 LEAPS, you'd run 2 shorts. **The doctrine doesn't pick this number for you.**\n\n"
+            "2. **Shape** — where those shorts sit relative to spot. *This* is what the "
+            "regime tells you. Same six shorts can be split 6 ITM (defensive flip), or "
+            "3 ITM + 3 OTM (centered), or 0 ITM + 6 OTM (all-OTM). Same count, different shape.\n\n"
+            "### The shape vocabulary (no numbers — just direction of lean)\n\n"
+            "| Shape | Meaning | Use case |\n"
+            "|-------|---------|----------|\n"
+            "| **Centered** | Equal ITM and OTM shorts | Standard / base case — balanced theta + growth participation |\n"
+            "| **ITM-lean** | More ITM than OTM | Harvest mode — when regime pays for theta capture |\n"
+            "| **OTM-lean** | More OTM than ITM | Growth mode — when vol is rising and ITM assignment risk grows |\n"
+            "| **All-ITM** | Every short ITM | Defensive flip — low vol, low IVR; only ITM theta worth grabbing |\n"
+            "| **All-OTM** | Every short OTM | High vol, high IVR; minimize assignment risk |\n"
+            "| **Stand down** | Don't deploy new shorts | Extreme vol regime — wait for re-rank |\n\n"
+            "### Regime → shape mapping (what the engine surfaces)\n\n"
+            "| Regime cell | Target shape | Why |\n"
+            "|-------------|--------------|-----|\n"
+            "| Band M × IVR neutral (base case) | Centered | Premium typical → balanced split |\n"
+            "| Band L × IVR neutral / rich | Centered | Low vol but still earning — stay balanced |\n"
+            "| Band L × IVR cheap | All-ITM | Premium is dead → only ITM has any theta |\n"
+            "| Band M × IVR rich | ITM-lean | Premium is rich → harvest extra |\n"
+            "| Band M × IVR cheap | OTM-lean | Lean OTM in low-but-rising vol |\n"
+            "| Band H × IVR cheap / neutral | OTM-lean | Vol expansion → reduce ITM assignment exposure |\n"
+            "| Band H × IVR rich | All-OTM | Pay attention to gamma; defensive only |\n"
+            "| Band H × IVR extreme | All-OTM half-size | Half size in shock regime |\n"
+            "| Band X (extreme) | Stand down or half-size OTM | Can't trust the regime |\n\n"
+            f"**Your book right now:** {coverage['long_total']} LEAPS, {coverage['short_total']} shorts → "
+            f"**{cov_pct:.0f}% of LEAPS covered**. Shape = **{doctrine.shape_description(current_shape)}**. "
+            f"Regime target shape = **{doctrine.shape_description(target_shape)}**."
+        )
+
+    # ── POSITION TABLE (unified, advisor-style) ───────────────────
+    st.markdown("#### Position table")
     pos_rows = []
-    for leg in longs + shorts:
+    legs_with_status = []
+    for i, leg in enumerate(longs + shorts, start=1):
+        if leg["side"] == "LONG":
+            status = triggers_mod.leaps_status_label({"delta": leg.get("delta", 0.0), "dte": leg.get("dte", 365)})
+            profit_str = "—"
+        else:
+            status = triggers_mod.short_status_label({
+                "mark": leg.get("mark", 0.0), "strike": leg["strike"],
+                "dte": leg.get("dte", 99),
+                "premium_received": leg.get("premium_received", 0.0) or leg.get("mark", 0.0),
+                "is_call": leg["argus_type"] == "CC",
+            }, spot=spot)
+            premium = leg.get("premium_received", 0.0) or leg.get("mark", 0.0)
+            mark = leg.get("mark", 0.0)
+            profit_pct = ((premium - mark) / premium * 100) if premium > 0 else 0
+            profit_str = f"{profit_pct:+.0f}%"
+        legs_with_status.append((leg, status))
+        delta_dollars = (leg.get("delta") or 0) * 100 * leg.get("qty", 1) * (1 if leg["side"] == "LONG" else -1)
+        theta_dollars = (leg.get("theta_per_day") or 0) * 100 * leg.get("qty", 1)
+        if leg["side"] == "SHORT":
+            theta_dollars = abs(theta_dollars)   # short theta is positive (collected)
+        leg_label = (
+            f"{'Long' if leg['side'] == 'LONG' else 'Short'} ${leg['strike']:.0f}C "
+            f"{_short_expiry(leg.get('expiry'))}"
+        )
         pos_rows.append({
-            "Side": leg["side"],
-            "Type": leg["argus_type"],
-            "Qty": leg.get("qty", 1),
-            "Strike": leg["strike"],
-            "Expiry": leg.get("expiry"),
-            "DTE": leg.get("dte"),
-            "Mark": leg.get("mark"),
-            "Δ/share": leg.get("delta"),
-            "Θ/day": leg.get("theta_per_day"),
+            "#": i,
+            "Leg": leg_label,
+            "delta per $1": delta_dollars,
+            "theta $/day": theta_dollars,
             "Extrinsic": leg.get("extrinsic"),
             "$ from spot": round(leg["strike"] - spot, 2) if spot else None,
-            "Hurdle $/day": theta_math.theta_hurdle(leg["strike"], hv30) if hv30 else None,
-            "Hurdle?": _hurdle_flag(leg, spot, hv30),
+            "DTE": leg.get("dte"),
+            "Profit %": profit_str,
+            "Trigger": status["label"],
         })
     pos_df = pd.DataFrame(pos_rows)
     st.dataframe(
         pos_df, use_container_width=True, hide_index=True,
         column_config={
-            "Mark":       st.column_config.NumberColumn(format="$%.2f", help="Current option mark (mid-of-market)."),
-            "Strike":     st.column_config.NumberColumn(format="$%.2f"),
-            "Δ/share":    st.column_config.NumberColumn(format="%.3f",
-                              help="Delta per share. Long calls positive; short calls show their per-share delta (book-greek sums use sign)."),
-            "Θ/day":      st.column_config.NumberColumn(format="$%.3f",
-                              help="Theta per share, per day. For a short, this is the daily premium decay you collect."),
-            "Extrinsic":  st.column_config.NumberColumn(format="$%.2f",
-                              help="Time value remaining in the mark (mark minus intrinsic). When extrinsic ≈ 0, the short is acting as synthetic stock."),
-            "$ from spot": st.column_config.NumberColumn(format="$%+.2f"),
-            "Hurdle $/day": st.column_config.NumberColumn(format="$%.3f",
-                              help="Minimum daily theta this short must produce to be worth the assignment / gamma risk it carries. Computed dynamically per §2."),
-            "Hurdle?":    st.column_config.TextColumn(
-                              help="✅ short's |Θ/day| ≥ hurdle (earning at spec). ⚠️ below hurdle — flag for strike re-selection on next roll cycle. — long legs don't have a hurdle."),
+            "delta per $1":  st.column_config.NumberColumn(
+                format="$%+.0f",
+                help="Dollar P&L per $1 move in the underlying, per leg. Long = positive, short = negative."),
+            "theta $/day":   st.column_config.NumberColumn(
+                format="$%+.2f",
+                help="Daily theta in dollars. Long = negative (decay against you). Short = positive (decay collected)."),
+            "Extrinsic":     st.column_config.NumberColumn(
+                format="$%.2f",
+                help="Time value remaining in the mark. When extrinsic < $1, the short is acting as synthetic stock."),
+            "$ from spot":   st.column_config.NumberColumn(format="$%+.2f"),
+            "Trigger":       st.column_config.TextColumn(
+                help="Per-leg status. Sit = no signal. Approaching 50% = on track for harvest. "
+                     "Harvest = ≥50% profit reached. Close = ≥80% profit. "
+                     "Extrinsic declining / critical = nearing $1 floor. "
+                     "DTE approaching 10 = forced-roll window. "
+                     "Paper red = ITM short at a paper loss."),
         },
     )
-    with st.expander("ℹ️ What is the Hurdle? (and why OTM legs often fail it on purpose)"):
-        st.markdown(
-            "**Hurdle $/day** is the doctrine §2 dynamic theta floor — the minimum daily theta a "
-            "short option must produce to earn its keep relative to the directional risk it carries.\n\n"
-            "**Formula:** `Hurdle $/day = strike × HV30 / √252 × 0.04`\n\n"
-            "- `strike × HV30 / √252` is the **expected 1σ daily $ move** of the underlying at that strike\n"
-            "- `× 0.04` captures **4%** of that move as time premium per day — the doctrine's calibration rate\n\n"
-            "**Why it's dynamic:** when realized volatility expands, the daily expected move rises and so does "
-            "the hurdle. A short that cleared the floor at 12% HV may underearn at 25% HV without the operator "
-            "changing anything. Static dollar floors break in regime transitions.\n\n"
-            "### Flag interpretation (it depends on ITM vs OTM)\n\n"
-            "| Leg          | Below hurdle | Above hurdle |\n"
-            "|--------------|--------------|--------------|\n"
-            "| **ITM short**| ⚠️ ITM — real concern. ITM legs exist to harvest extrinsic; if they're below the floor the strike/DTE/vol mix needs re-selection on the next roll cycle. | ✅ Earning at spec. |\n"
-            "| **OTM short**| ℹ️ OTM — usually expected. OTM legs are mostly directional headroom + LEAP-cap; their theta capture is typically modest. The doctrine §2 regime caveat explicitly says: *\"in sustained low-vol regimes, even the dynamic hurdle may be unreachable across the OTM surface.\"* Not a roll signal on its own. | ✅ Earning at spec **and** providing growth participation — best of both. |\n\n"
-            "### Why the universal hurdle still matters even with the OTM caveat\n\n"
-            "The hurdle is a uniform yardstick so the **book-level** Yield Ratio in Block 3 has meaning. "
-            "If every OTM leg sits at ℹ️ but every ITM leg sits at ✅, the book can still clear ≥1.0 yield ratio "
-            "because ITM legs carry the income work. If the whole array goes below 1.0, the doctrine offers two responses:\n\n"
-            "1. Accept yield ratio 0.80–0.95 in a low-vol regime and lean OTM for defensive posture\n"
-            "2. Skew ATM / slightly ITM for richer extrinsic, accepting more gamma exposure\n\n"
-            "**Operator decision, not engine override.** State the chosen response in the §10 review when the regime forces it."
-        )
 
-    # ── Array layout visualization ────────────────────────────────
-    short_dicts = [{"strike": s["strike"], "label": s.get("expiry", ""), "extrinsic": s.get("extrinsic", 0.0)} for s in shorts]
-    layout = posture_mod.array_layout(spot, short_dicts)
-    current_array_label = f"{layout['itm_count']}_{layout['otm_count']}"
-    doctrine_array = cell.get("array") or "—"
-    array_match = current_array_label == doctrine_array
-
-    st.markdown(
-        f"**Your shorts:** {layout['itm_count']} ITM + {layout['otm_count']} OTM  ·  "
-        f"**Doctrine target** ({cell['cell_label']}): {doctrine.array_description(doctrine_array)}"
-    )
-    st.caption(
-        "Compares your current short-call placement (how many sit ITM vs OTM of spot) against the doctrine §1 "
-        "target for your regime cell. LEAP-vs-CC ratio is the **Coverage** metric in Block 3 — different thing."
-    )
-    layout_line = _format_array_line(layout, spot)
-    st.code(layout_line, language="text")
-
-    with st.expander("ℹ️ What is a '2-2 array' (or '3-3', or 'all-OTM')?"):
-        st.markdown(
-            "**Your PMCC array is your collection of short call positions at any one time.** "
-            "The notation `N-M` tells you where they sit relative to spot:\n\n"
-            "- **N** = short calls **below** spot (ITM — strike already in the money)\n"
-            "- **M** = short calls **above** spot (OTM — strike still above current price)\n\n"
-            "So **2-2** = 4 short calls total — 2 below spot, 2 above. **3-3** = 6 shorts (3 below, 3 above).\n\n"
-            "### Each side does a different job\n\n"
-            "| Side | Job | Theta | Risk |\n"
-            "|------|-----|-------|------|\n"
-            "| **ITM** (below spot) | Income engine — harvests extrinsic, clears the §2 hurdle | High $/day | Assignment + gamma |\n"
-            "| **OTM** (above spot) | Growth participation — caps LEAPS upside for premium | Low $/day (often below hurdle, intentionally) | Lower assignment risk |\n\n"
-            "### Why two legs per side, not one?\n"
-            "- Diversifies which strike absorbs a move (if one leg's strike is breached, the other is still working)\n"
-            "- Lets you roll one without touching the other\n"
-            "- Satisfies doctrine §6 stagger rule (no two shorts share the same expiry)\n"
-            "- Big enough to clear book-level yield ratio, small enough to manage cleanly\n\n"
-            "### Why different shapes per regime?\n\n"
-            "| Regime | Target | Why |\n"
-            "|--------|--------|-----|\n"
-            "| Band M × IVR neutral (base case) | **3-3** (6 shorts) | Premium is typical → scale up income legs |\n"
-            "| Band L × IVR neutral or rich | **2-2** (4 shorts) | Low vol → thin premium → fewer legs needed |\n"
-            "| Band L × IVR cheap | **All-ITM** (defensive flip) | Premium is dead → only ITM theta is worth grabbing |\n"
-            "| Band H × IVR rich | **All-OTM** | High vol → assignment risk too high for ITM shorts |\n"
-            "| Band X (extreme vol) | **Stand down** or half-size OTM | Don't deploy in a regime you can't trust |\n\n"
-            "**The doctrine doesn't force you to re-shape.** It gives a target and a reason. If your current "
-            "array doesn't match the target, the engine surfaces options to align (or accept off-doctrine "
-            "and document why in the §10 review)."
-        )
-
-    # ── Doctrine guidance — what to do if off-doctrine ────────────
-    guidance = doctrine.array_guidance(
-        current_itm=layout["itm_count"],
-        current_otm=layout["otm_count"],
-        target_code=doctrine_array,
-    )
-    if guidance["match"]:
-        st.success(f"✅ {guidance['headline']}")
-    else:
-        st.warning(f"⚠️ **Doctrine guidance** — {guidance['headline']}")
-        if guidance.get("actions"):
-            st.markdown("**Options to align (or accept off-doctrine):**")
-            for a in guidance["actions"]:
-                st.markdown(f"  - {a}")
-        if guidance.get("tradeoffs"):
-            with st.expander("Tradeoffs of staying off-doctrine vs trimming"):
-                for t in guidance["tradeoffs"]:
-                    st.markdown(f"- {t}")
-                st.markdown(
-                    "\n_Doctrine §1 prescribes the target shape per regime cell, but "
-                    "doesn't force a re-shape. Operators can accept off-doctrine if the "
-                    "rationale is documented in the §10 review (e.g. 'leaning ITM-heavy "
-                    "to harvest while vol re-ranks toward Band M'). The mismatch is a "
-                    "thinking prompt, not an alarm._"
-                )
-
-    # ── BLOCK 3 — AGGREGATE ───────────────────────────────────────
-    st.markdown("#### Block 3 — Aggregate")
-    longs_for_book = [{"qty": l.get("qty", 1), "delta": l.get("delta", 0.0), "theta": l.get("theta_per_day", 0.0)} for l in longs]
-    shorts_for_book = [{"qty": s.get("qty", 1), "delta": s.get("delta", 0.0), "theta": s.get("theta_per_day", 0.0)} for s in shorts]
-    greeks = theta_math.book_greeks(longs_for_book, shorts_for_book)
-
-    yr = theta_math.yield_ratio(
-        [{"strike": s["strike"], "theta_per_day": s.get("theta_per_day", 0.0)} for s in shorts],
-        hv30,
-    ) if hv30 else 0.0
-    tpd = theta_math.theta_per_delta(greeks["net_theta"], greeks["net_delta"])
-    rating = theta_math.theta_per_delta_rating(tpd)
-
-    daily_risk = theta_math.daily_risk_one_sigma(greeks["net_delta"], spot, hv30) if hv30 else 0.0
-    theta_cov = theta_math.theta_coverage(greeks["net_theta"], daily_risk) if daily_risk else 0.0
-
-    coverage = posture_mod.coverage_ratios(longs_for_book, shorts_for_book)
-
-    a1, a2, a3, a4 = st.columns(4)
-    a1.metric("Net Δ ($/$1)", f"${greeks['net_delta']:,.1f}")
-    a2.metric("Net Θ ($/day)", f"${greeks['net_theta']:,.2f}")
-    a3.metric("Θ/Δ", f"${tpd:.2f}",
-              delta=rating,
-              delta_color="normal" if rating == "Optimal" else ("off" if rating == "Acceptable" else "inverse"))
-    a4.metric("Yield ratio", f"{yr:.2f}",
-              delta="above hurdle" if yr >= doctrine.YIELD_RATIO_PASS else "below hurdle",
-              delta_color="normal" if yr >= doctrine.YIELD_RATIO_PASS else "inverse")
-
-    b1, b2, b3, b4 = st.columns(4)
-    b1.metric("1σ daily risk", f"${daily_risk:,.2f}")
-    b2.metric("Θ coverage", f"{theta_cov*100:.0f}%")
-    b3.metric("Coverage (contract)", f"{coverage['long_total']}:{coverage['short_total']}")
-    b4.metric("Coverage (chassis)", f"{coverage['chassis_qty']}:{coverage['short_total']}")
-
-    # ── Tripwire status ───────────────────────────────────────────
-    today = date.today()
-    shorts_for_tripwires = [
-        {
-            "strike": s["strike"],
-            "spot": spot,
-            "mark": s.get("mark", 0.0),
-            "dte": s.get("dte", 99),
-            "premium_received": s.get("premium_received", 0.0) or s.get("mark", 0.0),
-            "is_call": s["argus_type"] == "CC",
-        }
-        for s in shorts
+    # ── DELTA AND THETA SUMMARY ──────────────────────────────────
+    st.markdown("#### Delta and Theta")
+    delta_theta_rows = [
+        {" ": "Longs",       f"delta per $1 {ticker}": f"+${greeks['long_delta']:,.0f}",        "theta $/day": f"−${abs(greeks['long_theta']):,.2f}"},
+        {" ": "Shorts",      f"delta per $1 {ticker}": f"−${greeks['short_delta']:,.0f}",       "theta $/day": f"+${greeks['short_theta']:,.2f}"},
+        {" ": "**Net**",     f"delta per $1 {ticker}": f"**${greeks['net_delta']:+,.0f}**",     "theta $/day": f"**${greeks['net_theta']:+,.2f}**"},
+        {" ": "**theta/delta**", f"delta per $1 {ticker}": f"**${tpd:.2f}**",                  "theta $/day": f"**{rating}** (≥${doctrine.THETA_PER_DELTA_ACCEPTABLE:.2f})"},
     ]
-    trip_results = triggers_mod.check_all_tripwires(
-        spot=spot, vix=current_vol if vol_axis == "VIX" else current_vol,
-        shorts=shorts_for_tripwires, state=ticker_state, today=today,
+    st.table(pd.DataFrame(delta_theta_rows))
+    st.caption(
+        f"Yield ratio: **{yr:.2f}** vs hurdle 1.00 — "
+        f"{'✅ above hurdle' if yr >= doctrine.YIELD_RATIO_PASS else '⚠️ below hurdle'}. "
+        f"PMCC coverage: **{coverage['long_total']}:{coverage['short_total']}** "
+        f"({cov_pct:.0f}% of shorts backed by LEAPS, "
+        f"{coverage['chassis_qty']} of those are chassis-grade 0.78-0.95Δ)."
     )
 
-    st.markdown("**Tripwire status:**")
-    trip_cols = st.columns(len(trip_results))
-    for col, t in zip(trip_cols, trip_results):
-        if t.triggered:
-            col.error(f"🔴 {t.name}")
-            col.caption(t.detail)
-        else:
-            col.success(f"✅ {t.name}")
-            col.caption(t.detail)
+    # ── TRIPWIRES (numbered table) ────────────────────────────────
+    st.markdown("#### Tripwires")
+    trip_rows = []
+    for i, t in enumerate(trip_results, start=1):
+        trip_rows.append({
+            "#": i,
+            "Test": _tripwire_test_description(t.name, ticker_state, current_vol),
+            "Status": "🔴 BREACH" if t.triggered else "✅ Pass",
+            "Detail": t.detail,
+        })
+    st.dataframe(pd.DataFrame(trip_rows), use_container_width=True, hide_index=True)
+    if breached:
+        st.error(f"🔴 **{len(breached)} tripwire(s) breached:** " + ", ".join(t.name for t in breached))
+    else:
+        st.success("**No trigger fired.**")
 
-    # Re-optimization check (§13)
-    reopt = posture_mod.reoptimization_check(
-        net_theta=greeks["net_theta"],
-        net_delta=greeks["net_delta"],
-        shorts=[{"strike": s["strike"], "extrinsic": s.get("extrinsic", 0.0)} for s in shorts],
-        spot=spot,
-        array_center_strike=ticker_state.get("array_center_strike"),
-    )
-    if reopt["reoptimize"]:
-        st.warning("**§13 Re-optimization triggers fired:**\n" + "\n".join(f"  - {r}" for r in reopt["reasons"]))
+    # ── ITEMS ON WATCH ────────────────────────────────────────────
+    st.markdown("#### Items on watch")
+    if watch_items:
+        watch_df = pd.DataFrame([
+            {"Item": w["item"], "Current": w["current"], "Trigger": w["trigger"], "Est. fire": w["est"]}
+            for w in watch_items
+        ])
+        st.dataframe(watch_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Nothing approaching a trigger.")
 
-    # LEAPS refresh triggers (§9)
+    # LEAPS refresh items (separate section if any fire)
+    leaps_warnings = []
     for l in longs:
         rt = triggers_mod.leaps_refresh_trigger({"delta": l.get("delta", 0.0), "dte": l.get("dte", 365)})
         if rt:
             icon = {"forced": "🔴", "immediate": "🔴", "evaluate": "🟡", "schedule": "🟡"}.get(rt.urgency, "ℹ️")
-            st.warning(f"{icon} **LEAPS @ {l['strike']:.2f} ({l.get('expiry')})** — {rt.reason} (urgency: `{rt.urgency}`)")
+            leaps_warnings.append(f"{icon} **LEAPS ${l['strike']:.0f} ({l.get('expiry')})** — {rt.reason} (`{rt.urgency}`)")
+    if leaps_warnings:
+        st.markdown("**LEAPS refresh triggers (§9):**")
+        for w in leaps_warnings:
+            st.markdown(f"- {w}")
 
-    # ── BLOCK 4 — ACTION ──────────────────────────────────────────
-    st.markdown("#### Block 4 — Action")
-
-    # Compute per-leg roll triggers regardless — used to distinguish book-level
-    # tripwire breaches from leg-level forced rolls.
-    action_rows = []
-    any_leg_triggered = False
-    for s in shorts:
-        rt = triggers_mod.short_roll_trigger({
-            "mark": s.get("mark", 0.0),
-            "strike": s["strike"],
-            "dte": s.get("dte", 99),
-            "premium_received": s.get("premium_received", 0.0) or s.get("mark", 0.0),
-            "is_call": s["argus_type"] == "CC",
-        }, spot=spot)
-        if rt.triggered:
-            any_leg_triggered = True
-        action_rows.append({
-            "Leg": f"{s['argus_type']} {s['strike']:.2f} {s.get('expiry')}",
-            "DTE": s.get("dte"),
-            "Trigger?": "🔴 YES" if rt.triggered else "✅ hold",
-            "Reason": rt.reason,
-            "Urgency": rt.urgency,
-        })
-
-    breached_tripwires = [t for t in trip_results if bool(t)]
-    any_book_signal = bool(breached_tripwires) or reopt["reoptimize"]
-
-    if not any_book_signal and not any_leg_triggered:
-        st.success("✅ No tripwires breached. No per-leg roll triggers. Silent days are good days. Hold.")
-    else:
-        # Surface what fired and at which level (book vs leg).
-        if breached_tripwires:
-            st.error(
-                "🔴 **Book-level tripwire(s) breached:**  \n"
-                + "  \n".join(f"  - **{t.name}** — {t.detail}" for t in breached_tripwires)
-            )
-        if reopt["reoptimize"]:
-            st.warning(
-                "🟡 **§13 Re-optimization triggers:**  \n"
-                + "  \n".join(f"  - {r}" for r in reopt["reasons"])
-            )
-
-        if any_leg_triggered:
-            st.markdown("**Per-leg roll evaluation** — at least one leg has its own roll trigger:")
-        else:
-            st.info(
-                "ℹ️ **Per-leg roll evaluation — no individual leg has fired a roll trigger.**  \n"
-                "The book-level signal above is informational: a tripwire flags a regime shift "
-                "or array drift, but the legs themselves don't yet meet the §4 thresholds (profit ≥ 50%, "
-                "DTE ≤ 10 with profit < 50%, or extrinsic < $1.00). "
-                "Options: (a) hold and re-check next session, "
-                "(b) manually evaluate a defensive roll via the **🔁 Roll Simulator**, "
-                "or (c) update tripwire levels in **⚙️ Engine State** if the array has been re-centered."
-            )
-        st.dataframe(pd.DataFrame(action_rows), use_container_width=True, hide_index=True)
-        st.caption(
-            "Per-leg triggers: profit ≥ 50% (harvest) · profit ≥ 80% (close) · extrinsic < $1 · "
-            "DTE ≤ 10 with profit < 50%. Use the **🔁 Roll Simulator** tab to decompose any proposed roll."
+    # ── ACTION (bottom line) ──────────────────────────────────────
+    st.markdown("#### Action")
+    if not breached and not any_leg_triggered and not reopt["reoptimize"]:
+        action_text = (
+            f"**None.** Array {'centered' if guidance['match'] else 'off-doctrine but stable'}, "
+            f"theta/delta at **${tpd:.2f}** ({rating.lower()}), "
+            f"earning **${greeks['net_theta']:.0f}/day**."
         )
+        if watch_items:
+            action_text += f" {len(watch_items)} item(s) on watch — let theta do its work. Next checkpoint when any trigger fires."
+        action_text += "  \n**Hold.**"
+        st.success(action_text)
+    else:
+        bits = []
+        if breached:
+            bits.append(f"🔴 {len(breached)} tripwire breach: {', '.join(t.name for t in breached)}.")
+        if any_leg_triggered:
+            bits.append("Per-leg trigger active — see Position table.")
+        if reopt["reoptimize"]:
+            bits.append(f"§13 re-optimization: {'; '.join(reopt['reasons'])}.")
+        st.error("**Action required.**  \n" + "  \n".join(f"- {b}" for b in bits)
+                 + "  \n\nUse the **🔁 Roll Simulator** tab for any proposed roll.")
 
     # ── Text-form report (collapsible) ────────────────────────────
     with st.expander("📄 Plain-text 4-block report (copy/paste)"):
         agg_for_report = {
-            **greeks,
-            "theta_per_delta": tpd,
-            "theta_per_delta_rating": rating,
-            "coverage": coverage,
+            **greeks, "theta_per_delta": tpd,
+            "theta_per_delta_rating": rating, "coverage": coverage,
         }
         positions_for_report = [
             {
@@ -440,14 +434,36 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
             for l in longs + shorts
         ]
         text_report = review_mod.render_review(
-            ticker=ticker, spot=spot,
-            cell={**cell, "ivr": ivr},
-            aggregate=agg_for_report,
-            positions=positions_for_report,
-            tripwires=trip_results,
-            yield_ratio=yr,
+            ticker=ticker, spot=spot, cell={**cell, "ivr": ivr},
+            aggregate=agg_for_report, positions=positions_for_report,
+            tripwires=trip_results, yield_ratio=yr,
         )
         st.code(text_report, language="text")
+
+
+def _tripwire_test_description(name: str, state: dict, current_vol: float) -> str:
+    """Human-readable description of what each tripwire tests."""
+    tw = (state or {}).get("tripwires", {}) or {}
+    dis = tw.get("disorderly", {}) or {}
+    return {
+        "Upper":       f"Spot ≥ ${tw.get('upper', '?')}",
+        "Lower":       f"Spot ≤ ${tw.get('lower', '?')}",
+        "VIX shock":   f"VIX ≥ {tw.get('vix_shock', '?')}",
+        "Disorderly":  f"Spot ≤ ${dis.get('price', '?')} AND VIX > {dis.get('vix', '?')}",
+        "DTE/profit":  "Any short with DTE ≤ 10, profit <50%",
+        "Ex-div":      "Within 2 TD of ex-div, ITM extrinsic < 1.25 × dividend",
+    }.get(name, name)
+
+
+def _short_expiry(exp) -> str:
+    """Compact expiry label: '2026-06-19' → 'Jun 19'."""
+    if not exp:
+        return ""
+    try:
+        d = datetime.fromisoformat(str(exp).split("T")[0]).date()
+        return d.strftime("%b %-d")
+    except (ValueError, TypeError):
+        return str(exp)
 
 
 # ─── Strike scanner sub-tab ────────────────────────────────────────
@@ -883,35 +899,6 @@ def _extract_pmcc_positions(ticker: str, df_open, spot: float) -> tuple:
             shorts.append(leg)
 
     return longs, shorts
-
-
-def _hurdle_flag(leg: dict, spot: float, hv30: float) -> str:
-    """Per-leg hurdle pass/fail with ITM-vs-OTM context.
-
-    Doctrine §2 hurdle is uniform, but the §2 regime caveat acknowledges that OTM
-    shorts may sit below hurdle in low-vol regimes. The caveat is intentional: OTM
-    legs aren't primarily there to harvest theta — they uncap LEAPS growth and
-    provide directional headroom (§3, §13). So we surface different flags:
-
-      Long leg    →  —      (hurdle doesn't apply)
-      ITM short:
-        above    →  ✅
-        below    →  ⚠️ ITM   (re-evaluate strike on next roll cycle)
-      OTM short:
-        above    →  ✅
-        below    →  ℹ️ OTM   (expected per §2 caveat — growth-participation tradeoff)
-    """
-    if leg.get("side") == "LONG":
-        return "—"
-    theta = leg.get("theta_per_day")
-    strike = leg.get("strike")
-    if theta is None or strike is None or hv30 is None or hv30 <= 0:
-        return "—"
-    hurdle = theta_math.theta_hurdle(strike, hv30)
-    if abs(theta) >= hurdle:
-        return "✅"
-    is_otm = spot is not None and strike >= spot
-    return "ℹ️ OTM" if is_otm else "⚠️ ITM"
 
 
 def _format_array_line(layout: dict, spot: float) -> str:
