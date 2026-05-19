@@ -286,8 +286,15 @@ CVAR_FLAG_MULTIPLIER = 3.0           # CVaR > 3× expected return → flag
 
 # ─── §13 Array Optimization ────────────────────────────────────────
 
-THETA_PER_DELTA_OPTIMAL = 1.50
-THETA_PER_DELTA_ACCEPTABLE = 0.75    # below this → suboptimal
+# θ/Δ rating thresholds. The doctrine §13 table prescribes Optimal ≥$1.50 /
+# Acceptable ≥$0.75 / Suboptimal <$0.75, but real PMCC books on liquid
+# index underlyings rarely clear $1.50 in normal regimes. Calibration below
+# matches the operator's live advisor experience:
+#   Optimal     ≥ $0.75      (book is well-tuned)
+#   Acceptable  $0.40-$0.75  (working as intended; doctrine §13 transition state)
+#   Suboptimal  < $0.40      (carrying directional risk without adequate income)
+THETA_PER_DELTA_OPTIMAL = 0.75
+THETA_PER_DELTA_ACCEPTABLE = 0.40    # below this → suboptimal
 NET_DELTA_TARGET_MIN = 30.0           # $30 per $1 of underlying move
 NET_DELTA_TARGET_MAX = 80.0
 SHORT_DELTA_PCT_OF_LONG_MIN = 0.80

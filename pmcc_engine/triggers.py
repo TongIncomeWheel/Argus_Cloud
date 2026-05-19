@@ -294,3 +294,176 @@ def leaps_refresh_trigger(leg: Mapping) -> RefreshTrigger:
         return RefreshTrigger(True, f"DTE {dte} < {doctrine.LEAPS_REFRESH_TARGET_DTE_MIN} — efficiency trigger",
                               urgency="schedule")
     return RefreshTrigger(False, "hold")
+
+
+# ─── Per-leg status commentary (advisor-style) ─────────────────────
+
+
+def short_status_label(leg: Mapping, spot: float) -> dict:
+    """Nuanced per-leg status — replaces the binary 'YES/hold' trigger output.
+
+    Returns dict with:
+      label    — short text (e.g. "Sit", "Approaching 50% harvest")
+      tier     — "triggered" | "watch" | "ok"
+      reason   — longer-form explanation
+
+    Categories mirror what an experienced PMCC operator would write in their
+    own daily review (e.g. "Paper red — SPY ran through strike",
+    "Extrinsic declining. Not triggered.", "Approaching 50% harvest").
+    """
+    try:
+        mark = float(leg.get("mark", 0.0))
+        strike = float(leg.get("strike", 0.0))
+        dte = int(leg.get("dte", 99))
+        premium = float(leg.get("premium_received", 0.0)) or mark
+        is_call = bool(leg.get("is_call", True))
+    except (TypeError, ValueError):
+        return {"label": "—", "tier": "ok", "reason": "leg data incomplete"}
+
+    ext = extrinsic(mark, spot, strike, is_call=is_call)
+    profit_pct = (premium - mark) / premium if premium > 0 else 0.0
+
+    # ── Triggered (action required) ────────────────────────────
+    if profit_pct >= 0.80:
+        return {"label": "Close — profit ≥80%", "tier": "triggered",
+                "reason": f"profit {profit_pct*100:.0f}% — close, max harvest reached"}
+    if ext < 1.0:
+        return {"label": "Extrinsic critical — roll", "tier": "triggered",
+                "reason": f"extrinsic ${ext:.2f} < $1.00"}
+    if dte <= 10 and profit_pct < 0.50:
+        return {"label": "DTE ≤10, profit <50% — forced roll", "tier": "triggered",
+                "reason": f"DTE {dte} with profit {profit_pct*100:.0f}%"}
+    if profit_pct >= 0.50:
+        return {"label": "Harvest — profit ≥50%", "tier": "triggered",
+                "reason": f"profit {profit_pct*100:.0f}% ≥ 50%"}
+
+    # ── Watch (not triggered, but worth noticing) ─────────────
+    if profit_pct >= 0.25:
+        return {"label": "Approaching 50% harvest", "tier": "watch",
+                "reason": f"profit {profit_pct*100:.0f}%, on track for 50% harvest trigger"}
+    if 1.0 <= ext < 3.0:
+        return {"label": "Extrinsic declining. Not triggered.", "tier": "watch",
+                "reason": f"extrinsic ${ext:.2f} — approaching $1 floor"}
+    if dte <= 14:
+        return {"label": "DTE approaching 10", "tier": "watch",
+                "reason": f"DTE {dte} — within 4 sessions of forced-roll window"}
+    # Paper-red short: mark > premium received AND strike is near/inside spot
+    if profit_pct < 0 and spot > 0 and strike <= spot * 1.02:
+        return {"label": "Paper red — SPY ran through strike", "tier": "watch",
+                "reason": f"loss {profit_pct*100:.0f}%, strike threatened by spot"}
+
+    return {"label": "Sit", "tier": "ok", "reason": "no trigger near"}
+
+
+def leaps_status_label(leg: Mapping) -> dict:
+    """LEAPS status — usually 'Sit' unless a §9 refresh trigger fires."""
+    rt = leaps_refresh_trigger(leg)
+    if not rt.triggered:
+        return {"label": "Sit", "tier": "ok", "reason": "chassis healthy"}
+    urgency_to_tier = {"forced": "triggered", "immediate": "triggered",
+                       "evaluate": "watch", "schedule": "watch"}
+    return {"label": rt.reason, "tier": urgency_to_tier.get(rt.urgency, "watch"),
+            "reason": rt.reason}
+
+
+# ─── Items on Watch (advisor-style proactive surfacing) ────────────
+
+
+def _est_extrinsic_floor_date(current_ext: float, theta_per_day: float, today: date) -> str:
+    """Linear estimate: how many sessions until extrinsic hits ~$1?"""
+    from datetime import timedelta
+    if theta_per_day is None or theta_per_day <= 0 or current_ext <= 1.0:
+        return "—"
+    sessions = max(1, int((current_ext - 1.0) / theta_per_day))
+    # Approximate to calendar days × 7/5
+    est_date = today + timedelta(days=int(sessions * 7 / 5))
+    return f"~{est_date.strftime('%b %-d')} if SPY stays flat"
+
+
+def _est_mark_target_date(current_mark: float, target_mark: float,
+                          theta_per_day: float, today: date) -> str:
+    """Estimate when mark drops to target via theta decay."""
+    from datetime import timedelta
+    if theta_per_day is None or theta_per_day <= 0 or current_mark <= target_mark:
+        return "—"
+    sessions = max(1, int((current_mark - target_mark) / theta_per_day))
+    est_date = today + timedelta(days=int(sessions * 7 / 5))
+    return f"~{est_date.strftime('%b %-d')} if theta works"
+
+
+def items_on_watch(
+    shorts: Sequence[Mapping],
+    state: Mapping,
+    today: Optional[date] = None,
+) -> list:
+    """Surface non-triggered-but-close items. Advisor-style proactive section.
+
+    Returns a list of dicts with: item, current, trigger, est, leg_label.
+    Sorted by estimated fire date (soonest first).
+    """
+    today = today or date.today()
+    items = []
+
+    for s in shorts:
+        try:
+            strike = float(s.get("strike", 0.0))
+            ext = float(s.get("extrinsic", 0.0))
+            mark = float(s.get("mark", 0.0))
+            premium = float(s.get("premium_received", 0.0)) or mark
+            theta = abs(float(s.get("theta_per_day", 0.0)))
+            dte = int(s.get("dte", 99))
+            label = s.get("label") or f"${strike:.0f}"
+        except (TypeError, ValueError):
+            continue
+
+        profit_pct = (premium - mark) / premium if premium > 0 else 0.0
+
+        # Extrinsic approaching $1 floor
+        if 1.0 <= ext < 5.0:
+            items.append({
+                "item": f"{label} extrinsic",
+                "current": f"${ext:.2f}",
+                "trigger": "< $1.00",
+                "est": _est_extrinsic_floor_date(ext, theta, today),
+                "_priority": 1 if ext < 3.0 else 2,
+            })
+
+        # Profit approaching 50% harvest
+        if 0.25 <= profit_pct < 0.50:
+            target_mark = premium * 0.50
+            items.append({
+                "item": f"{label} profit",
+                "current": f"{profit_pct*100:.0f}%",
+                "trigger": f"≥50% (mark drops to ${target_mark:.2f})",
+                "est": _est_mark_target_date(mark, target_mark, theta, today),
+                "_priority": 2 if profit_pct >= 0.35 else 3,
+            })
+
+        # DTE approaching 10
+        if 11 <= dte <= 14:
+            items.append({
+                "item": f"{label} DTE",
+                "current": f"{dte}",
+                "trigger": "≤10 with profit <50%",
+                "est": f"~{dte - 10} sessions",
+                "_priority": 2,
+            })
+
+    # Ex-div approaching
+    cal = (state or {}).get("ex_div_calendar", []) or []
+    next_div = _next_ex_div(cal, today)
+    if next_div:
+        days_to = _business_days_between(today, next_div["date"])
+        if 3 <= days_to <= 30:
+            items.append({
+                "item": f"Ex-div {next_div['date']}",
+                "current": f"T-{days_to}",
+                "trigger": f"T-2 with ITM ext < 1.25×div (${doctrine.EX_DIV_TRIGGER_MULTIPLIER * float(next_div['est_dividend']):.2f})",
+                "est": "Screen at T-5",
+                "_priority": 1 if days_to <= 7 else 3,
+            })
+
+    items.sort(key=lambda x: x.get("_priority", 99))
+    for i in items:
+        i.pop("_priority", None)
+    return items[:8]
