@@ -198,6 +198,86 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
     st.markdown(f"_{ts_local.strftime('%a %b %d, %H:%M')} — review for {ticker}_")
     st.markdown(" ".join(summary_bits))
 
+    # ── REGIME-CHANGE BANNER ──────────────────────────────────────
+    # Compare against last acknowledged review for this ticker. Surfaces
+    # the change once; user clicks "Acknowledge" to update the baseline.
+    # current_shape is computed below in the Array section, but we
+    # build the snapshot here so the banner can fire before the user
+    # scrolls. Recompute current_shape inline:
+    short_dicts_for_snap = [{"strike": s["strike"]} for s in shorts]
+    layout_for_snap = posture_mod.array_layout(spot, short_dicts_for_snap)
+    target_shape_for_snap = cell.get("shape") or cell.get("array")
+    current_shape_for_snap = doctrine.classify_shape(
+        layout_for_snap["itm_count"], layout_for_snap["otm_count"]
+    )
+    current_snapshot = {
+        "timestamp": ts_local.isoformat(),
+        "vol_band": cell.get("vol_band"),
+        "ivr_band": cell.get("ivr_band"),
+        "posture": cell.get("posture"),
+        "target_shape": target_shape_for_snap,
+        "current_shape": current_shape_for_snap,
+    }
+    last_snapshot = state_mod.get_last_review_snapshot(settings, ticker)
+    diff = state_mod.regime_changed_since(last_snapshot, current_snapshot)
+
+    if last_snapshot is None:
+        # First-ever review for this ticker — silently bootstrap.
+        state_mod.save_last_review_snapshot(settings, ticker, current_snapshot)
+        if save_settings_fn:
+            try:
+                save_settings_fn(settings)
+            except Exception:
+                pass   # local file may be read-only; in-memory state still updated
+        st.caption(
+            f"_First review for {ticker} — baseline regime snapshot saved. "
+            "Future regime shifts will be flagged here._"
+        )
+    elif diff["changed"]:
+        ack_key = f"pmcc_regime_ack_{ticker}"
+        last_ts = last_snapshot.get("timestamp", "previous review")
+        try:
+            last_ts_short = datetime.fromisoformat(last_ts).strftime("%a %b %d, %H:%M")
+        except (ValueError, TypeError):
+            last_ts_short = last_ts
+        change_bullets = []
+        for f in diff["fields"]:
+            change_bullets.append(f"  - **{f}**: `{last_snapshot.get(f)}` → `{current_snapshot.get(f)}`")
+        banner_text = (
+            f"🔔 **Regime change since {last_ts_short}**  \n"
+            + "  \n".join(change_bullets)
+        )
+        if diff["shape_changed"]:
+            # Target shape changed — surface implied action
+            new_target_desc = doctrine.shape_description(current_snapshot["target_shape"])
+            old_target_desc = doctrine.shape_description(last_snapshot.get("target_shape"))
+            same_shape_match = current_snapshot["current_shape"] == current_snapshot["target_shape"]
+            if same_shape_match:
+                banner_text += (
+                    f"  \n\n✅ Target shape changed (**{old_target_desc} → {new_target_desc}**) "
+                    "but your current array still matches the new target — no action needed."
+                )
+            else:
+                banner_text += (
+                    f"  \n\n⚠️ **Target shape changed (`{old_target_desc} → {new_target_desc}`) "
+                    f"and your array no longer matches.** See Array section below for roll suggestions."
+                )
+            st.error(banner_text)
+        else:
+            # Only vol_band or ivr_band shifted; shape unchanged
+            st.warning(banner_text + "  \n\n_Target shape unchanged — no action needed._")
+
+        ack_col, _ = st.columns([1, 4])
+        with ack_col:
+            if st.button("✓ Acknowledge regime change", key=ack_key, type="primary"):
+                state_mod.save_last_review_snapshot(settings, ticker, current_snapshot)
+                if save_settings_fn:
+                    try:
+                        save_settings_fn(settings)
+                    except Exception:
+                        pass
+                st.rerun()
+
     # ── MARKET ────────────────────────────────────────────────────
     st.markdown("#### Market")
     m_rows = [

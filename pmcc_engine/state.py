@@ -126,3 +126,53 @@ def add_ex_div_entry(settings: Dict, ticker: str, ex_div: date,
         cal.append({"date": iso, "est_dividend": float(est_dividend)})
     cal.sort(key=lambda e: e["date"])
     return upsert_ticker_state(settings, ticker, {"ex_div_calendar": cal})
+
+
+# ─── Last-review snapshot (for regime-change detection) ─────────────
+
+
+def get_last_review_snapshot(settings: Dict, ticker: str) -> Optional[Dict]:
+    """Return the regime snapshot saved at the user's last acknowledged review,
+    or None if this is the first review for that ticker.
+    """
+    ticker = ticker.upper()
+    all_state = (settings or {}).get(STATE_KEY, {}) or {}
+    user_state = all_state.get(ticker, {}) or {}
+    return user_state.get("last_review_snapshot")
+
+
+def save_last_review_snapshot(settings: Dict, ticker: str, snapshot: Dict) -> Dict:
+    """Persist the current regime snapshot as the new 'last review' baseline.
+
+    Snapshot shape:
+        {
+          'timestamp': ISO datetime,
+          'vol_band': 'L'|'M'|'H'|'X',
+          'ivr_band': 'cheap'|'neutral'|'rich'|'extreme',
+          'posture': str,
+          'target_shape': str,
+          'current_shape': str,
+        }
+    """
+    return upsert_ticker_state(settings, ticker, {"last_review_snapshot": dict(snapshot)})
+
+
+def regime_changed_since(last_snapshot: Optional[Dict], current_snapshot: Dict) -> Dict:
+    """Compare two regime snapshots. Returns:
+        {
+          changed (bool)        — any of vol_band, ivr_band, target_shape differ
+          shape_changed (bool)  — target_shape specifically changed (action-relevant)
+          fields (list[str])    — which fields changed
+        }
+    """
+    if not last_snapshot:
+        return {"changed": False, "shape_changed": False, "fields": []}
+    fields = []
+    for k in ("vol_band", "ivr_band", "posture", "target_shape"):
+        if last_snapshot.get(k) != current_snapshot.get(k):
+            fields.append(k)
+    return {
+        "changed": bool(fields),
+        "shape_changed": "target_shape" in fields,
+        "fields": fields,
+    }
