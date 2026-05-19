@@ -136,7 +136,9 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
     st.info(
         f"**Posture mandated:** `{cell['posture']}` — {cell.get('description', '')}"
         + (f"  \n**DTE band:** {cell['dte_weeks'][0]}–{cell['dte_weeks'][1]} weeks." if cell.get("dte_weeks") else "")
-        + (f"  \n**Array:** {cell['array']}" if cell.get("array") else "")
+        + (f"  \n**Doctrine target array:** `{cell['array']}` "
+           "_(N_ITM_N_OTM short-call placement — your actual layout shown in Block 2)_"
+           if cell.get("array") else "")
     )
 
     # ── BLOCK 2 — POSITION TABLE ──────────────────────────────────
@@ -186,10 +188,23 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
         "`strike × HV30 / √252 × 0.04`. ✅ = passing; ⚠️ = below hurdle (re-evaluate on next roll cycle)."
     )
 
-    # ── Array layout visualization
+    # ── Array layout visualization ────────────────────────────────
     short_dicts = [{"strike": s["strike"], "label": s.get("expiry", ""), "extrinsic": s.get("extrinsic", 0.0)} for s in shorts]
     layout = posture_mod.array_layout(spot, short_dicts)
-    st.markdown("**Array layout** (sorted strikes):")
+    current_array_label = f"{layout['itm_count']}_{layout['otm_count']}"
+    doctrine_array = cell.get("array") or "—"
+    array_match = current_array_label == doctrine_array
+
+    st.markdown(
+        f"**Your array layout** — `{current_array_label}` "
+        f"({layout['itm_count']} ITM + {layout['otm_count']} OTM short calls)  ·  "
+        f"**Doctrine target** for `{cell['cell_label']}`: `{doctrine_array}`  ·  "
+        f"{'✅ on-doctrine' if array_match else '⚠️ off-doctrine'}"
+    )
+    st.caption(
+        "Array notation = `N_ITM`_`N_OTM` short-call placement. Doctrine §1 prescribes a different "
+        "shape per regime cell. LEAP-vs-CC ratio is the **Coverage** metric in Block 3, not this."
+    )
     layout_line = _format_array_line(layout, spot)
     st.code(layout_line, language="text")
 
