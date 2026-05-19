@@ -121,5 +121,41 @@ class DefaultStateSeedTests(unittest.TestCase):
         self.assertEqual(ts["ex_div_calendar"][0]["date"], "2099-01-01")
 
 
+class RegimeChangeDetectionTests(unittest.TestCase):
+    def test_no_last_snapshot_returns_no_change(self):
+        diff = state.regime_changed_since(None, {"vol_band": "M", "ivr_band": "neutral", "target_shape": "centered"})
+        self.assertFalse(diff["changed"])
+
+    def test_same_snapshot_returns_no_change(self):
+        snap = {"vol_band": "M", "ivr_band": "neutral", "posture": "base_case", "target_shape": "centered"}
+        diff = state.regime_changed_since(snap, dict(snap))
+        self.assertFalse(diff["changed"])
+
+    def test_vol_band_shift_detected(self):
+        last = {"vol_band": "M", "ivr_band": "neutral", "target_shape": "centered"}
+        current = {"vol_band": "L", "ivr_band": "neutral", "target_shape": "centered"}
+        diff = state.regime_changed_since(last, current)
+        self.assertTrue(diff["changed"])
+        self.assertIn("vol_band", diff["fields"])
+        self.assertFalse(diff["shape_changed"])
+
+    def test_shape_shift_detected(self):
+        last = {"vol_band": "M", "ivr_band": "neutral", "target_shape": "centered"}
+        current = {"vol_band": "M", "ivr_band": "rich", "target_shape": "lean_itm"}
+        diff = state.regime_changed_since(last, current)
+        self.assertTrue(diff["changed"])
+        self.assertTrue(diff["shape_changed"])
+        self.assertIn("target_shape", diff["fields"])
+
+    def test_save_and_retrieve_snapshot(self):
+        settings = {}
+        snap = {"timestamp": "2026-05-19T13:00", "vol_band": "M", "ivr_band": "neutral",
+                "posture": "base_case", "target_shape": "centered", "current_shape": "centered"}
+        state.save_last_review_snapshot(settings, "SPY", snap)
+        retrieved = state.get_last_review_snapshot(settings, "SPY")
+        self.assertEqual(retrieved["target_shape"], "centered")
+        self.assertEqual(retrieved["vol_band"], "M")
+
+
 if __name__ == "__main__":
     unittest.main()
