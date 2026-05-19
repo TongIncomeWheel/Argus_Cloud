@@ -162,31 +162,51 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
             "Θ/day": leg.get("theta_per_day"),
             "Extrinsic": leg.get("extrinsic"),
             "$ from spot": round(leg["strike"] - spot, 2) if spot else None,
-            "Hurdle/d": theta_math.theta_hurdle(leg["strike"], hv30) if hv30 else None,
+            "Hurdle $/day": theta_math.theta_hurdle(leg["strike"], hv30) if hv30 else None,
             "Hurdle?": (
-                "✅" if (leg.get("theta_per_day") is not None
-                         and hv30 > 0
-                         and abs(leg["theta_per_day"]) >= theta_math.theta_hurdle(leg["strike"], hv30))
-                else ("—" if leg["side"] == "LONG" else "⚠️")
+                "—" if leg["side"] == "LONG"
+                else (
+                    "✅" if (leg.get("theta_per_day") is not None
+                             and hv30 > 0
+                             and abs(leg["theta_per_day"]) >= theta_math.theta_hurdle(leg["strike"], hv30))
+                    else "⚠️"
+                )
             ),
         })
     pos_df = pd.DataFrame(pos_rows)
     st.dataframe(
         pos_df, use_container_width=True, hide_index=True,
         column_config={
-            "Mark":       st.column_config.NumberColumn(format="$%.2f"),
+            "Mark":       st.column_config.NumberColumn(format="$%.2f", help="Current option mark (mid-of-market)."),
             "Strike":     st.column_config.NumberColumn(format="$%.2f"),
-            "Δ/share":    st.column_config.NumberColumn(format="%.3f"),
-            "Θ/day":      st.column_config.NumberColumn(format="$%.3f"),
-            "Extrinsic":  st.column_config.NumberColumn(format="$%.2f"),
+            "Δ/share":    st.column_config.NumberColumn(format="%.3f",
+                              help="Delta per share. Long calls positive; short calls show their per-share delta (book-greek sums use sign)."),
+            "Θ/day":      st.column_config.NumberColumn(format="$%.3f",
+                              help="Theta per share, per day. For a short, this is the daily premium decay you collect."),
+            "Extrinsic":  st.column_config.NumberColumn(format="$%.2f",
+                              help="Time value remaining in the mark (mark minus intrinsic). When extrinsic ≈ 0, the short is acting as synthetic stock."),
             "$ from spot": st.column_config.NumberColumn(format="$%+.2f"),
-            "Hurdle/d":   st.column_config.NumberColumn(format="$%.3f"),
+            "Hurdle $/day": st.column_config.NumberColumn(format="$%.3f",
+                              help="Minimum daily theta this short must produce to be worth the assignment / gamma risk it carries. Computed dynamically per §2."),
+            "Hurdle?":    st.column_config.TextColumn(
+                              help="✅ short's |Θ/day| ≥ hurdle (earning at spec). ⚠️ below hurdle — flag for strike re-selection on next roll cycle. — long legs don't have a hurdle."),
         },
     )
-    st.caption(
-        "Hurdle column tests each short's |Θ/day| against the doctrine §2 dynamic floor: "
-        "`strike × HV30 / √252 × 0.04`. ✅ = passing; ⚠️ = below hurdle (re-evaluate on next roll cycle)."
-    )
+    with st.expander("ℹ️ What is the Hurdle?"):
+        st.markdown(
+            "**Hurdle $/day** is the doctrine §2 dynamic theta floor — the minimum daily theta a "
+            "short option must produce to earn its keep relative to the directional risk it carries.\n\n"
+            "**Formula:** `Hurdle $/day = strike × HV30 / √252 × 0.04`\n\n"
+            "- `strike × HV30 / √252` is the **expected 1σ daily $ move** of the underlying at that strike\n"
+            "- `× 0.04` captures **4%** of that move as time premium per day — the doctrine's calibration rate\n\n"
+            "**Why it's dynamic:** when realized volatility expands, the daily expected move rises and so does "
+            "the hurdle. A short that cleared the floor at 12% HV may underearn at 25% HV without the operator "
+            "changing anything. Static dollar floors break in regime transitions.\n\n"
+            "**What ⚠️ means for a leg:** that short is producing less daily theta than the dynamic floor implies "
+            "it should. It's not an instant-roll trigger — it's a flag to re-evaluate on the next roll cycle "
+            "(could mean wrong strike, wrong DTE, or vol expansion outran the existing premium).\n\n"
+            "Book-level version of this is **Yield ratio** in Block 3."
+        )
 
     # ── Array layout visualization ────────────────────────────────
     short_dicts = [{"strike": s["strike"], "label": s.get("expiry", ""), "extrinsic": s.get("extrinsic", 0.0)} for s in shorts]
@@ -290,30 +310,64 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
 
     # ── BLOCK 4 — ACTION ──────────────────────────────────────────
     st.markdown("#### Block 4 — Action")
-    any_breach = any(bool(t) for t in trip_results) or reopt["reoptimize"]
-    if not any_breach:
-        st.success("✅ No tripwires breached. Silent days are good days. Hold.")
+
+    # Compute per-leg roll triggers regardless — used to distinguish book-level
+    # tripwire breaches from leg-level forced rolls.
+    action_rows = []
+    any_leg_triggered = False
+    for s in shorts:
+        rt = triggers_mod.short_roll_trigger({
+            "mark": s.get("mark", 0.0),
+            "strike": s["strike"],
+            "dte": s.get("dte", 99),
+            "premium_received": s.get("premium_received", 0.0) or s.get("mark", 0.0),
+            "is_call": s["argus_type"] == "CC",
+        }, spot=spot)
+        if rt.triggered:
+            any_leg_triggered = True
+        action_rows.append({
+            "Leg": f"{s['argus_type']} {s['strike']:.2f} {s.get('expiry')}",
+            "DTE": s.get("dte"),
+            "Trigger?": "🔴 YES" if rt.triggered else "✅ hold",
+            "Reason": rt.reason,
+            "Urgency": rt.urgency,
+        })
+
+    breached_tripwires = [t for t in trip_results if bool(t)]
+    any_book_signal = bool(breached_tripwires) or reopt["reoptimize"]
+
+    if not any_book_signal and not any_leg_triggered:
+        st.success("✅ No tripwires breached. No per-leg roll triggers. Silent days are good days. Hold.")
     else:
-        # Surface per-leg roll triggers
-        st.error("⚠️ Action required — tripwire(s) breached. Per-leg roll evaluation:")
-        action_rows = []
-        for s in shorts:
-            rt = triggers_mod.short_roll_trigger({
-                "mark": s.get("mark", 0.0),
-                "strike": s["strike"],
-                "dte": s.get("dte", 99),
-                "premium_received": s.get("premium_received", 0.0) or s.get("mark", 0.0),
-                "is_call": s["argus_type"] == "CC",
-            }, spot=spot)
-            action_rows.append({
-                "Leg": f"{s['argus_type']} {s['strike']:.2f} {s.get('expiry')}",
-                "DTE": s.get("dte"),
-                "Trigger?": "🔴 YES" if rt.triggered else "✅ hold",
-                "Reason": rt.reason,
-                "Urgency": rt.urgency,
-            })
+        # Surface what fired and at which level (book vs leg).
+        if breached_tripwires:
+            st.error(
+                "🔴 **Book-level tripwire(s) breached:**  \n"
+                + "  \n".join(f"  - **{t.name}** — {t.detail}" for t in breached_tripwires)
+            )
+        if reopt["reoptimize"]:
+            st.warning(
+                "🟡 **§13 Re-optimization triggers:**  \n"
+                + "  \n".join(f"  - {r}" for r in reopt["reasons"])
+            )
+
+        if any_leg_triggered:
+            st.markdown("**Per-leg roll evaluation** — at least one leg has its own roll trigger:")
+        else:
+            st.info(
+                "ℹ️ **Per-leg roll evaluation — no individual leg has fired a roll trigger.**  \n"
+                "The book-level signal above is informational: a tripwire flags a regime shift "
+                "or array drift, but the legs themselves don't yet meet the §4 thresholds (profit ≥ 50%, "
+                "DTE ≤ 10 with profit < 50%, or extrinsic < $1.00). "
+                "Options: (a) hold and re-check next session, "
+                "(b) manually evaluate a defensive roll via the **🔁 Roll Simulator**, "
+                "or (c) update tripwire levels in **⚙️ Engine State** if the array has been re-centered."
+            )
         st.dataframe(pd.DataFrame(action_rows), use_container_width=True, hide_index=True)
-        st.caption("Use the **🔁 Roll Simulator** tab to decompose any proposed roll against the §5 template + §12 scorecard.")
+        st.caption(
+            "Per-leg triggers: profit ≥ 50% (harvest) · profit ≥ 80% (close) · extrinsic < $1 · "
+            "DTE ≤ 10 with profit < 50%. Use the **🔁 Roll Simulator** tab to decompose any proposed roll."
+        )
 
     # ── Text-form report (collapsible) ────────────────────────────
     with st.expander("📄 Plain-text 4-block report (copy/paste)"):
