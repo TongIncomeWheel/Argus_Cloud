@@ -60,6 +60,26 @@ POSTURE_DESCRIPTIONS = {
 }
 
 
+# Plain-English description of array codenames used in REGIME_GRID["array"].
+# Used by the UI so users never see cryptic codes like "2_2" or "all_itm_3pct_below".
+ARRAY_DESCRIPTIONS = {
+    "2_2":                  "2 ITM + 2 OTM short calls",
+    "3_3":                  "3 ITM + 3 OTM short calls",
+    "2_2_otm_lean":         "2 ITM + 2 OTM short calls (OTM-weighted)",
+    "itm_lean":             "ITM-leaning short array",
+    "all_otm":              "All shorts OTM",
+    "all_otm_half":         "All shorts OTM, half size",
+    "all_itm_3pct_below":   "All shorts ITM (~3% below spot, defensive flip)",
+}
+
+
+def array_description(code) -> str:
+    """Translate a regime-grid array codename to plain English for UI display."""
+    if not code:
+        return "—"
+    return ARRAY_DESCRIPTIONS.get(code, code)
+
+
 # ─── §2 Theta Hurdle ───────────────────────────────────────────────
 
 # Daily theta hurdle = (strike × HV30 / √252) × HURDLE_CAPTURE_RATE.

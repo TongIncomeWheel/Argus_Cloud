@@ -136,8 +136,8 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
     st.info(
         f"**Posture mandated:** `{cell['posture']}` — {cell.get('description', '')}"
         + (f"  \n**DTE band:** {cell['dte_weeks'][0]}–{cell['dte_weeks'][1]} weeks." if cell.get("dte_weeks") else "")
-        + (f"  \n**Doctrine target array:** `{cell['array']}` "
-           "_(N_ITM_N_OTM short-call placement — your actual layout shown in Block 2)_"
+        + (f"  \n**Doctrine target array:** {doctrine.array_description(cell['array'])} "
+           "_(your actual layout shown in Block 2)_"
            if cell.get("array") else "")
     )
 
@@ -163,15 +163,7 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
             "Extrinsic": leg.get("extrinsic"),
             "$ from spot": round(leg["strike"] - spot, 2) if spot else None,
             "Hurdle $/day": theta_math.theta_hurdle(leg["strike"], hv30) if hv30 else None,
-            "Hurdle?": (
-                "—" if leg["side"] == "LONG"
-                else (
-                    "✅" if (leg.get("theta_per_day") is not None
-                             and hv30 > 0
-                             and abs(leg["theta_per_day"]) >= theta_math.theta_hurdle(leg["strike"], hv30))
-                    else "⚠️"
-                )
-            ),
+            "Hurdle?": _hurdle_flag(leg, spot, hv30),
         })
     pos_df = pd.DataFrame(pos_rows)
     st.dataframe(
@@ -192,7 +184,7 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
                               help="✅ short's |Θ/day| ≥ hurdle (earning at spec). ⚠️ below hurdle — flag for strike re-selection on next roll cycle. — long legs don't have a hurdle."),
         },
     )
-    with st.expander("ℹ️ What is the Hurdle?"):
+    with st.expander("ℹ️ What is the Hurdle? (and why OTM legs often fail it on purpose)"):
         st.markdown(
             "**Hurdle $/day** is the doctrine §2 dynamic theta floor — the minimum daily theta a "
             "short option must produce to earn its keep relative to the directional risk it carries.\n\n"
@@ -202,10 +194,18 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
             "**Why it's dynamic:** when realized volatility expands, the daily expected move rises and so does "
             "the hurdle. A short that cleared the floor at 12% HV may underearn at 25% HV without the operator "
             "changing anything. Static dollar floors break in regime transitions.\n\n"
-            "**What ⚠️ means for a leg:** that short is producing less daily theta than the dynamic floor implies "
-            "it should. It's not an instant-roll trigger — it's a flag to re-evaluate on the next roll cycle "
-            "(could mean wrong strike, wrong DTE, or vol expansion outran the existing premium).\n\n"
-            "Book-level version of this is **Yield ratio** in Block 3."
+            "### Flag interpretation (it depends on ITM vs OTM)\n\n"
+            "| Leg          | Below hurdle | Above hurdle |\n"
+            "|--------------|--------------|--------------|\n"
+            "| **ITM short**| ⚠️ ITM — real concern. ITM legs exist to harvest extrinsic; if they're below the floor the strike/DTE/vol mix needs re-selection on the next roll cycle. | ✅ Earning at spec. |\n"
+            "| **OTM short**| ℹ️ OTM — usually expected. OTM legs are mostly directional headroom + LEAP-cap; their theta capture is typically modest. The doctrine §2 regime caveat explicitly says: *\"in sustained low-vol regimes, even the dynamic hurdle may be unreachable across the OTM surface.\"* Not a roll signal on its own. | ✅ Earning at spec **and** providing growth participation — best of both. |\n\n"
+            "### Why the universal hurdle still matters even with the OTM caveat\n\n"
+            "The hurdle is a uniform yardstick so the **book-level** Yield Ratio in Block 3 has meaning. "
+            "If every OTM leg sits at ℹ️ but every ITM leg sits at ✅, the book can still clear ≥1.0 yield ratio "
+            "because ITM legs carry the income work. If the whole array goes below 1.0, the doctrine offers two responses:\n\n"
+            "1. Accept yield ratio 0.80–0.95 in a low-vol regime and lean OTM for defensive posture\n"
+            "2. Skew ATM / slightly ITM for richer extrinsic, accepting more gamma exposure\n\n"
+            "**Operator decision, not engine override.** State the chosen response in the §10 review when the regime forces it."
         )
 
     # ── Array layout visualization ────────────────────────────────
@@ -216,14 +216,13 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
     array_match = current_array_label == doctrine_array
 
     st.markdown(
-        f"**Your array layout** — `{current_array_label}` "
-        f"({layout['itm_count']} ITM + {layout['otm_count']} OTM short calls)  ·  "
-        f"**Doctrine target** for `{cell['cell_label']}`: `{doctrine_array}`  ·  "
+        f"**Your shorts:** {layout['itm_count']} ITM + {layout['otm_count']} OTM  ·  "
+        f"**Doctrine target** ({cell['cell_label']}): {doctrine.array_description(doctrine_array)}  ·  "
         f"{'✅ on-doctrine' if array_match else '⚠️ off-doctrine'}"
     )
     st.caption(
-        "Array notation = `N_ITM`_`N_OTM` short-call placement. Doctrine §1 prescribes a different "
-        "shape per regime cell. LEAP-vs-CC ratio is the **Coverage** metric in Block 3, not this."
+        "Compares your current short-call placement (how many sit ITM vs OTM of spot) against the doctrine §1 "
+        "target for your regime cell. LEAP-vs-CC ratio is the **Coverage** metric in Block 3 — different thing."
     )
     layout_line = _format_array_line(layout, spot)
     st.code(layout_line, language="text")
@@ -829,6 +828,35 @@ def _extract_pmcc_positions(ticker: str, df_open, spot: float) -> tuple:
             shorts.append(leg)
 
     return longs, shorts
+
+
+def _hurdle_flag(leg: dict, spot: float, hv30: float) -> str:
+    """Per-leg hurdle pass/fail with ITM-vs-OTM context.
+
+    Doctrine §2 hurdle is uniform, but the §2 regime caveat acknowledges that OTM
+    shorts may sit below hurdle in low-vol regimes. The caveat is intentional: OTM
+    legs aren't primarily there to harvest theta — they uncap LEAPS growth and
+    provide directional headroom (§3, §13). So we surface different flags:
+
+      Long leg    →  —      (hurdle doesn't apply)
+      ITM short:
+        above    →  ✅
+        below    →  ⚠️ ITM   (re-evaluate strike on next roll cycle)
+      OTM short:
+        above    →  ✅
+        below    →  ℹ️ OTM   (expected per §2 caveat — growth-participation tradeoff)
+    """
+    if leg.get("side") == "LONG":
+        return "—"
+    theta = leg.get("theta_per_day")
+    strike = leg.get("strike")
+    if theta is None or strike is None or hv30 is None or hv30 <= 0:
+        return "—"
+    hurdle = theta_math.theta_hurdle(strike, hv30)
+    if abs(theta) >= hurdle:
+        return "✅"
+    is_otm = spot is not None and strike >= spot
+    return "ℹ️ OTM" if is_otm else "⚠️ ITM"
 
 
 def _format_array_line(layout: dict, spot: float) -> str:
