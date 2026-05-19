@@ -34,17 +34,32 @@ STATE_KEY = "pmcc_engine_state"
 
 
 def get_ticker_state(settings: Dict, ticker: str) -> Dict:
-    """Return the engine state dict for `ticker`, merging defaults for missing fields."""
+    """Return the engine state dict for `ticker`, merging defaults for missing fields.
+
+    User-stored values always win when present. The default seed in
+    doctrine.DEFAULT_TICKER_STATE fills any gaps — including the ex-dividend
+    calendar, so a fresh install of ARGUS on SPY/QQQ/IWM gets known ex-div
+    dates without manual entry. Edits in the State Editor overwrite the seed.
+    """
     ticker = ticker.upper()
     all_state = (settings or {}).get(STATE_KEY, {}) or {}
     user_state = all_state.get(ticker, {}) or {}
     seed = doctrine.DEFAULT_TICKER_STATE.get(ticker, {})
+
+    # ex_div_calendar: user wins if they've explicitly stored any entries.
+    # Empty list from user is interpreted as "user has not configured" → use seed.
+    user_cal = user_state.get("ex_div_calendar")
+    if user_cal:
+        ex_div_calendar = user_cal
+    else:
+        ex_div_calendar = list(seed.get("ex_div_calendar", []))
+
     merged = {
         "vol_median_5yr": user_state.get("vol_median_5yr", seed.get("vol_median_5yr", 20.0)),
         "vol_axis": user_state.get("vol_axis", seed.get("vol_axis", "IV30")),
         "quarterly_dividend": user_state.get("quarterly_dividend", seed.get("quarterly_dividend", 0.0)),
         "tripwires": user_state.get("tripwires", {}) or {},
-        "ex_div_calendar": user_state.get("ex_div_calendar", []) or [],
+        "ex_div_calendar": ex_div_calendar,
         "array_center_strike": user_state.get("array_center_strike"),
         "notes": user_state.get("notes", ""),
     }

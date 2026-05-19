@@ -80,6 +80,140 @@ def array_description(code) -> str:
     return ARRAY_DESCRIPTIONS.get(code, code)
 
 
+def parse_array_code(code: str):
+    """Parse a regime-grid array code to (target_itm, target_otm) where numeric.
+
+    Returns None for codes that don't map to a simple N+M count
+    (e.g. 'itm_lean' has no fixed numbers — operator interprets).
+    """
+    if not code:
+        return None
+    if code == "all_otm":
+        return (0, None)         # 0 ITM, OTM count operator-set
+    if code == "all_otm_half":
+        return (0, None)
+    if code == "all_itm_3pct_below":
+        return (None, 0)         # ITM count operator-set, 0 OTM
+    parts = code.split("_")
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        return (int(parts[0]), int(parts[1]))
+    return None
+
+
+def array_guidance(current_itm: int, current_otm: int, target_code: str) -> dict:
+    """Compare current short placement to doctrine target. Returns plain-English guidance.
+
+    Output dict:
+        match (bool)             — true if current matches target shape
+        target (str)             — plain-English target description
+        delta_itm, delta_otm     — (current - target) where target is numeric
+        actions (list[str])      — concrete trim/add instructions
+        tradeoffs (list[str])    — what the operator gives up either way
+        headline (str)           — one-line takeaway
+    """
+    target = parse_array_code(target_code)
+    target_desc = array_description(target_code)
+
+    # Variable-count targets (all_otm, all_itm)
+    if target == (0, None):
+        on_doctrine = current_itm == 0
+        actions = (
+            [f"Close or roll your {current_itm} ITM short(s) to OTM strikes."]
+            if not on_doctrine else
+            ["Already all-OTM — on doctrine."]
+        )
+        return {
+            "match": on_doctrine,
+            "target": target_desc,
+            "current": (current_itm, current_otm),
+            "actions": actions,
+            "tradeoffs": [
+                "All-OTM = lower theta capture, more directional headroom for LEAPS.",
+                "Doctrine prescribes this when vol is rich + IVR extreme, or in shock regimes.",
+            ],
+            "headline": "On doctrine (all-OTM)." if on_doctrine else f"Off doctrine — trim {current_itm} ITM short(s) to reach all-OTM.",
+        }
+    if target == (None, 0):
+        on_doctrine = current_otm == 0
+        actions = (
+            [f"Close or roll your {current_otm} OTM short(s) to ITM strikes (~3% below spot)."]
+            if not on_doctrine else
+            ["Already all-ITM — on doctrine."]
+        )
+        return {
+            "match": on_doctrine,
+            "target": target_desc,
+            "current": (current_itm, current_otm),
+            "actions": actions,
+            "tradeoffs": [
+                "All-ITM = max defensive theta, but caps LEAPS upside and concentrates assignment risk.",
+                "Doctrine prescribes this in low-vol-cheap-IVR regimes (defensive flip).",
+            ],
+            "headline": "On doctrine (all-ITM defensive flip)." if on_doctrine else f"Off doctrine — close/roll {current_otm} OTM short(s) to ITM.",
+        }
+
+    # Qualitative targets without numeric mapping
+    if target is None:
+        return {
+            "match": False,
+            "target": target_desc,
+            "current": (current_itm, current_otm),
+            "actions": [f"Doctrine target is qualitative (`{target_code}`) — interpret per regime cell description."],
+            "tradeoffs": [],
+            "headline": f"Doctrine target: {target_desc} — operator interprets.",
+        }
+
+    # Numeric N_M target (e.g. 2_2, 3_3)
+    target_itm, target_otm = target
+    delta_itm = current_itm - target_itm
+    delta_otm = current_otm - target_otm
+
+    if delta_itm == 0 and delta_otm == 0:
+        return {
+            "match": True,
+            "target": target_desc,
+            "current": (current_itm, current_otm),
+            "actions": ["On doctrine — no change needed."],
+            "tradeoffs": [],
+            "headline": "✅ Array matches doctrine target.",
+        }
+
+    actions = []
+    if delta_itm > 0:
+        actions.append(f"**Close {delta_itm} ITM short(s)** — extras vs doctrine. Pick the one with lowest extrinsic + closest to expiry (cheapest to BTC).")
+    elif delta_itm < 0:
+        actions.append(f"**Add {-delta_itm} ITM short(s)** — below target. Sell ~3% below spot per §3, hurdle-checked.")
+    if delta_otm > 0:
+        actions.append(f"**Close {delta_otm} OTM short(s)** — extras vs doctrine. These uncap LEAPS upside, so closing returns headroom.")
+    elif delta_otm < 0:
+        actions.append(f"**Add {-delta_otm} OTM short(s)** — below target. Sell above nearest resistance per §3.")
+
+    tradeoffs = []
+    if delta_itm > 0 or delta_otm > 0:
+        tradeoffs.append("Holding extras vs target: more gross theta, but more gamma + assignment exposure and more capital deployed than the regime calls for.")
+        tradeoffs.append("Trimming to target: lower income but cleaner regime alignment + less roll-cost exposure in a vol shock.")
+    if delta_itm < 0:
+        tradeoffs.append("Under-ITM: leaving income on the table; ITM legs do the §2 hurdle work.")
+    if delta_otm < 0:
+        tradeoffs.append("Under-OTM: LEAPS uncapped (potential upside), but no growth-participation premium collected.")
+
+    headline = (
+        f"⚠️ Off doctrine: you have {current_itm} ITM + {current_otm} OTM "
+        f"vs target {target_itm} ITM + {target_otm} OTM."
+    )
+    return {
+        "match": False,
+        "target": target_desc,
+        "current": (current_itm, current_otm),
+        "target_counts": (target_itm, target_otm),
+        "delta_itm": delta_itm,
+        "delta_otm": delta_otm,
+        "actions": actions,
+        "tradeoffs": tradeoffs,
+        "headline": headline,
+    }
+
+
 # ─── §2 Theta Hurdle ───────────────────────────────────────────────
 
 # Daily theta hurdle = (strike × HV30 / √252) × HURDLE_CAPTURE_RATE.
@@ -166,10 +300,48 @@ ITM_DEAD_WEIGHT_EXTRINSIC_FLOOR = 2.0  # extrinsic < $2 → dead weight
 
 # Used when a ticker has no engine state yet. The vol_median values are
 # rough seeds — operators should refine with empirical 5y data.
+#
+# ex_div_calendar entries are SPY/QQQ/IWM quarterly dividend dates (3rd Friday
+# of Mar / Jun / Sep / Dec). Dividend estimates are placeholders close to
+# recent prints — refine as actual ex-divs print and rates step.
 DEFAULT_TICKER_STATE = {
-    "SPY":  {"vol_median_5yr": 18.0, "vol_axis": "VIX",  "quarterly_dividend": 1.85},
-    "QQQ":  {"vol_median_5yr": 22.0, "vol_axis": "VIX",  "quarterly_dividend": 0.65},
-    "IWM":  {"vol_median_5yr": 24.0, "vol_axis": "VIX",  "quarterly_dividend": 0.60},
+    "SPY": {
+        "vol_median_5yr": 18.0, "vol_axis": "VIX", "quarterly_dividend": 1.85,
+        "ex_div_calendar": [
+            {"date": "2026-06-19", "est_dividend": 1.85},
+            {"date": "2026-09-18", "est_dividend": 1.85},
+            {"date": "2026-12-18", "est_dividend": 1.85},
+            {"date": "2027-03-20", "est_dividend": 1.90},
+            {"date": "2027-06-18", "est_dividend": 1.90},
+            {"date": "2027-09-17", "est_dividend": 1.90},
+            {"date": "2027-12-17", "est_dividend": 1.95},
+            {"date": "2028-03-17", "est_dividend": 1.95},
+        ],
+    },
+    "QQQ": {
+        "vol_median_5yr": 22.0, "vol_axis": "VIX", "quarterly_dividend": 0.85,
+        "ex_div_calendar": [
+            {"date": "2026-06-19", "est_dividend": 0.85},
+            {"date": "2026-09-18", "est_dividend": 0.85},
+            {"date": "2026-12-18", "est_dividend": 0.85},
+            {"date": "2027-03-20", "est_dividend": 0.90},
+            {"date": "2027-06-18", "est_dividend": 0.90},
+            {"date": "2027-09-17", "est_dividend": 0.90},
+            {"date": "2027-12-17", "est_dividend": 0.95},
+        ],
+    },
+    "IWM": {
+        "vol_median_5yr": 24.0, "vol_axis": "VIX", "quarterly_dividend": 0.55,
+        "ex_div_calendar": [
+            {"date": "2026-06-19", "est_dividend": 0.55},
+            {"date": "2026-09-18", "est_dividend": 0.55},
+            {"date": "2026-12-18", "est_dividend": 0.60},
+            {"date": "2027-03-20", "est_dividend": 0.60},
+            {"date": "2027-06-18", "est_dividend": 0.60},
+            {"date": "2027-09-17", "est_dividend": 0.65},
+            {"date": "2027-12-17", "est_dividend": 0.65},
+        ],
+    },
     "MSFT": {"vol_median_5yr": 28.0, "vol_axis": "IV30", "quarterly_dividend": 0.83},
     "GOOG": {"vol_median_5yr": 32.0, "vol_axis": "IV30", "quarterly_dividend": 0.20},
     "AAPL": {"vol_median_5yr": 30.0, "vol_axis": "IV30", "quarterly_dividend": 0.25},
