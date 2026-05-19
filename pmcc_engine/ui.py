@@ -226,6 +226,36 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
     layout_line = _format_array_line(layout, spot)
     st.code(layout_line, language="text")
 
+    with st.expander("ℹ️ What is a '2-2 array' (or '3-3', or 'all-OTM')?"):
+        st.markdown(
+            "**Your PMCC array is your collection of short call positions at any one time.** "
+            "The notation `N-M` tells you where they sit relative to spot:\n\n"
+            "- **N** = short calls **below** spot (ITM — strike already in the money)\n"
+            "- **M** = short calls **above** spot (OTM — strike still above current price)\n\n"
+            "So **2-2** = 4 short calls total — 2 below spot, 2 above. **3-3** = 6 shorts (3 below, 3 above).\n\n"
+            "### Each side does a different job\n\n"
+            "| Side | Job | Theta | Risk |\n"
+            "|------|-----|-------|------|\n"
+            "| **ITM** (below spot) | Income engine — harvests extrinsic, clears the §2 hurdle | High $/day | Assignment + gamma |\n"
+            "| **OTM** (above spot) | Growth participation — caps LEAPS upside for premium | Low $/day (often below hurdle, intentionally) | Lower assignment risk |\n\n"
+            "### Why two legs per side, not one?\n"
+            "- Diversifies which strike absorbs a move (if one leg's strike is breached, the other is still working)\n"
+            "- Lets you roll one without touching the other\n"
+            "- Satisfies doctrine §6 stagger rule (no two shorts share the same expiry)\n"
+            "- Big enough to clear book-level yield ratio, small enough to manage cleanly\n\n"
+            "### Why different shapes per regime?\n\n"
+            "| Regime | Target | Why |\n"
+            "|--------|--------|-----|\n"
+            "| Band M × IVR neutral (base case) | **3-3** (6 shorts) | Premium is typical → scale up income legs |\n"
+            "| Band L × IVR neutral or rich | **2-2** (4 shorts) | Low vol → thin premium → fewer legs needed |\n"
+            "| Band L × IVR cheap | **All-ITM** (defensive flip) | Premium is dead → only ITM theta is worth grabbing |\n"
+            "| Band H × IVR rich | **All-OTM** | High vol → assignment risk too high for ITM shorts |\n"
+            "| Band X (extreme vol) | **Stand down** or half-size OTM | Don't deploy in a regime you can't trust |\n\n"
+            "**The doctrine doesn't force you to re-shape.** It gives a target and a reason. If your current "
+            "array doesn't match the target, the engine surfaces options to align (or accept off-doctrine "
+            "and document why in the §10 review)."
+        )
+
     # ── Doctrine guidance — what to do if off-doctrine ────────────
     guidance = doctrine.array_guidance(
         current_itm=layout["itm_count"],
