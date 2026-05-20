@@ -114,14 +114,20 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
             spot = float(recent[-1]) if recent else 0.0
         hv30 = data_io.hv30_from_ticker(ticker) or 0.0
         vol_axis = (ticker_state.get("vol_axis") or "VIX").upper()
-        current_vol = data_io.current_iv_signal(ticker, vol_axis=vol_axis) or 0.0
+        current_vol, vol_source = data_io.current_iv_signal_with_source(ticker, vol_axis=vol_axis)
+        current_vol = current_vol or 0.0
         ivr = data_io.ivr_for_ticker(ticker, vol_axis=vol_axis)
+        median_vol = ticker_state.get("vol_median_5yr", 18.0)
         cell = regime_mod.regime_cell(
             current_vol=current_vol,
-            median_vol=ticker_state.get("vol_median_5yr", 18.0),
+            median_vol=median_vol,
             ivr=ivr if ivr is not None else 50.0,
         )
         cell["vol_axis"] = vol_axis
+        boundary = regime_mod.band_boundary_proximity(
+            current_vol=current_vol, median_vol=median_vol,
+            ivr=ivr if ivr is not None else 50.0,
+        )
 
     longs, shorts = _extract_pmcc_positions(ticker, df_open, spot)
     if not longs and not shorts:
@@ -280,14 +286,41 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
 
     # ── MARKET ────────────────────────────────────────────────────
     st.markdown("#### Market")
+    _vol_source_label = {
+        "fast_info": "yfinance live tick",
+        "intraday": "yfinance 1-min bar",
+        "daily_close": "yfinance daily close (lagging — may be prior session)",
+        "HV30": "computed HV30",
+    }.get(vol_source, "yfinance")
     m_rows = [
         {"": f"{ticker}", " ": f"**${spot:.2f}**"},
-        {"": vol_axis, " ": f"**{current_vol:.2f}** (median {ticker_state.get('vol_median_5yr', '—')})"},
+        {"": vol_axis, " ": f"**{current_vol:.2f}** (median {median_vol}) · src: {_vol_source_label}"},
         {"": "HV30", " ": f"{hv30*100:.1f}%"},
         {"": "IVR (52w)", " ": f"{ivr:.0f}" if ivr is not None else "—"},
         {"": "Regime", " ": f"**{cell['cell_label']} → {cell.get('posture', '—')}**"},
     ]
     st.table(pd.DataFrame(m_rows))
+    if vol_source == "daily_close":
+        st.caption(
+            "⚠️ Vol axis is on **yfinance daily close** — fast_info and 1-min intraday were "
+            "unavailable. This can lag a full session. Treat the regime band as provisional "
+            "until a live tick is available."
+        )
+
+    # ── BAND BOUNDARY PROXIMITY ──────────────────────────────────
+    # At a band edge, a tiny vol/IVR wobble flips the regime cell and can
+    # change the target shape. Surface that fragility deliberately.
+    if boundary["any_near"]:
+        warn_lines = ["**⚠️ Regime is near a band boundary — classification is fragile right now.**"]
+        if boundary["vol_near"]:
+            warn_lines.append(f"- {boundary['vol_detail']}")
+        if boundary["ivr_near"]:
+            warn_lines.append(f"- {boundary['ivr_detail']}")
+        warn_lines.append(
+            "_Cross-check the vol print against a second source (CBOE / broker terminal) "
+            "before acting on a shape change. yfinance free-tier VIX can be ~15 min delayed._"
+        )
+        st.warning("  \n".join(warn_lines))
 
     # ── ARRAY ─────────────────────────────────────────────────────
     st.markdown("#### Array")

@@ -78,22 +78,62 @@ def moving_average(ticker: str, window: int = 20) -> Optional[float]:
 # ─── VIX ───────────────────────────────────────────────────────────
 
 
-@_cache_data(ttl=300, show_spinner=False)
+@_cache_data(ttl=60, show_spinner=False)
 def get_vix() -> Optional[float]:
-    """Current VIX level via yfinance (^VIX). 5-minute cache."""
+    """Current VIX level. 1-minute cache.
+
+    Source priority (best freshness first):
+      1. yfinance fast_info.last_price — closest to a live tick (≈15-min delayed
+         on free CBOE feed but no daily-close lag)
+      2. 1-minute intraday history — last bar within the session
+      3. Daily history last close — fallback only (can lag a full day)
+
+    On a non-trading day or after-hours, daily close is the most recent data
+    point and is returned.
+    """
+    return get_vix_with_source()[0]
+
+
+def get_vix_with_source() -> tuple:
+    """Same as get_vix() but also returns the source label.
+
+    Returns (value, source_label) where source_label is one of:
+      'fast_info' | 'intraday' | 'daily_close' | None.
+    """
     try:
         import yfinance as yf
     except ImportError:
-        return None
+        return None, None
     try:
         v = yf.Ticker("^VIX")
-        hist = v.history(period="5d")
-        if hist.empty:
-            return None
-        return float(hist["Close"].iloc[-1])
+        # 1) fast_info — closest to live
+        try:
+            fi = getattr(v, "fast_info", None)
+            if fi is not None:
+                price = (
+                    fi.get("last_price")
+                    or fi.get("lastPrice")
+                    or fi.get("regular_market_price")
+                )
+                if price and float(price) > 0:
+                    return float(price), "fast_info"
+        except Exception:
+            pass
+        # 2) 1-minute intraday
+        try:
+            intraday = v.history(period="1d", interval="1m")
+            if not intraday.empty:
+                return float(intraday["Close"].dropna().iloc[-1]), "intraday"
+        except Exception:
+            pass
+        # 3) Daily close fallback
+        daily = v.history(period="5d")
+        if daily.empty:
+            return None, None
+        return float(daily["Close"].iloc[-1]), "daily_close"
     except Exception as e:
         logger.warning("VIX fetch failed: %s", e)
-        return None
+        return None, None
 
 
 @_cache_data(ttl=3600, show_spinner=False)
@@ -149,11 +189,20 @@ def current_iv_signal(ticker: str, vol_axis: str = "VIX") -> Optional[float]:
     For single stocks, use the ticker's RV30 (HV30 ×100) as the IV30 proxy
     (Alpaca free tier doesn't give 52w IV history).
     """
+    return current_iv_signal_with_source(ticker, vol_axis)[0]
+
+
+def current_iv_signal_with_source(ticker: str, vol_axis: str = "VIX") -> tuple:
+    """Same as current_iv_signal() but also returns a source label.
+
+    Returns (value, source) where source is 'fast_info' / 'intraday' /
+    'daily_close' for VIX, or 'HV30' for single-stock axes, or None.
+    """
     axis = (vol_axis or "VIX").upper()
     if axis == "VIX":
-        return get_vix()
+        return get_vix_with_source()
     hv = hv30_from_ticker(ticker)
-    return hv * 100.0 if hv else None
+    return (hv * 100.0, "HV30") if hv else (None, None)
 
 
 def ivr_for_ticker(ticker: str, vol_axis: str = "VIX") -> Optional[float]:

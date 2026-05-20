@@ -79,5 +79,46 @@ class IVR52wTests(unittest.TestCase):
         self.assertIsNone(regime.compute_ivr_52w(current_iv=20.0, iv_history=[10.0, 11.0]))
 
 
+class BandBoundaryProximityTests(unittest.TestCase):
+    def test_vix_just_below_lm_boundary_flagged(self):
+        # VIX 17.99, median 18.0 → boundary at 18.0, dist 0.01 → near
+        result = regime.band_boundary_proximity(
+            current_vol=17.99, median_vol=18.0, ivr=45.0)
+        self.assertTrue(result["vol_near"])
+        self.assertIn("L/M", result["vol_detail"])
+        self.assertTrue(result["any_near"])
+
+    def test_vix_comfortably_inside_band_not_flagged(self):
+        # VIX 14.0, median 18.0 → ratio 0.78, well inside Band L
+        result = regime.band_boundary_proximity(
+            current_vol=14.0, median_vol=18.0, ivr=45.0)
+        self.assertFalse(result["vol_near"])
+
+    def test_ivr_near_neutral_rich_boundary_flagged(self):
+        # IVR 48 → 2 pts below the 50 boundary → near
+        result = regime.band_boundary_proximity(
+            current_vol=14.0, median_vol=18.0, ivr=48.0)
+        self.assertTrue(result["ivr_near"])
+        self.assertIn("neutral/rich", result["ivr_detail"])
+
+    def test_ivr_mid_band_not_flagged(self):
+        # IVR 38 → 12+ pts from both 25 and 50 → not near
+        result = regime.band_boundary_proximity(
+            current_vol=14.0, median_vol=18.0, ivr=38.0)
+        self.assertFalse(result["ivr_near"])
+
+    def test_both_axes_near(self):
+        result = regime.band_boundary_proximity(
+            current_vol=18.1, median_vol=18.0, ivr=26.0)
+        self.assertTrue(result["vol_near"])
+        self.assertTrue(result["ivr_near"])
+        self.assertTrue(result["any_near"])
+
+    def test_handles_missing_inputs(self):
+        result = regime.band_boundary_proximity(
+            current_vol=0.0, median_vol=0.0, ivr=None)
+        self.assertFalse(result["any_near"])
+
+
 if __name__ == "__main__":
     unittest.main()
