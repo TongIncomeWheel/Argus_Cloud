@@ -160,11 +160,16 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices,
         }
         for s in shorts
     ]
+    # Auto-derive tripwires from the live array when the ticker has none
+    # configured — the engine never shows '??' and the Action block always
+    # has concrete bounds. User-set values in Engine State always win.
+    effective_tripwires, tripwires_auto = _effective_tripwires(ticker_state, spot, shorts)
+    effective_state = {**ticker_state, "tripwires": effective_tripwires}
     trip_results = triggers_mod.check_all_tripwires(
         spot=spot, vix=current_vol, shorts=shorts_for_tripwires,
-        state=ticker_state, today=today,
+        state=effective_state, today=today,
     )
-    watch_items = triggers_mod.items_on_watch(shorts_for_tripwires, ticker_state, today=today)
+    watch_items = triggers_mod.items_on_watch(shorts_for_tripwires, effective_state, today=today)
     reopt = posture_mod.reoptimization_check(
         net_theta=greeks["net_theta"], net_delta=greeks["net_delta"],
         shorts=[{"strike": s["strike"], "extrinsic": s.get("extrinsic", 0.0)} for s in shorts],
@@ -477,11 +482,17 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices,
     for i, t in enumerate(trip_results, start=1):
         trip_rows.append({
             "#": i,
-            "Test": _tripwire_test_description(t.name, ticker_state, current_vol),
+            "Test": _tripwire_test_description(t.name, effective_state, current_vol),
             "Status": "🔴 BREACH" if t.triggered else "✅ Pass",
             "Detail": t.detail,
         })
     st.dataframe(pd.DataFrame(trip_rows), use_container_width=True, hide_index=True)
+    if tripwires_auto:
+        st.caption(
+            "ℹ️ Tripwire levels **auto-derived from your current array** "
+            "(lower = lowest ITM short, upper = highest OTM short − $5, VIX shock = 24.50). "
+            "Set explicit levels in the **⚙️ Engine State** tab to override."
+        )
     if breached:
         st.error(f"🔴 **{len(breached)} tripwire(s) breached:** " + ", ".join(t.name for t in breached))
     else:
@@ -510,28 +521,72 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices,
         for w in leaps_warnings:
             st.markdown(f"- {w}")
 
-    # ── ACTION (bottom line) ──────────────────────────────────────
+    # ── ACTION (bottom line, range-bound) ─────────────────────────
     st.markdown("#### Action")
+    upper = effective_tripwires.get("upper")
+    lower = effective_tripwires.get("lower")
+    vix_shock = effective_tripwires.get("vix_shock")
+
     if not breached and not any_leg_triggered and not reopt["reoptimize"]:
-        action_text = (
-            f"**None.** Array {'centered' if guidance['match'] else 'off-doctrine but stable'}, "
-            f"theta/delta at **${tpd:.2f}** ({rating.lower()}), "
-            f"earning **${greeks['net_theta']:.0f}/day**."
-        )
+        lines = ["**None — Hold.**", ""]
+        # Explicit hold range
+        range_bits = []
+        if lower and upper:
+            range_bits.append(f"{ticker} **${lower:,.2f}–${upper:,.2f}**")
+        if vix_shock:
+            range_bits.append(f"{vol_axis} **< {vix_shock:.2f}**")
+        if range_bits:
+            lines.append(
+                f"**Hold range:** {'  ·  '.join(range_bits)}  \n"
+                f"While {ticker} stays in this band and {vol_axis} is calm, the array earns "
+                f"**${greeks['net_theta']:.0f}/day** with no action needed."
+            )
+        # What's being watched (with levels)
         if watch_items:
-            action_text += f" {len(watch_items)} item(s) on watch — let theta do its work. Next checkpoint when any trigger fires."
-        action_text += "  \n**Hold.**"
-        st.success(action_text)
+            lines.append("")
+            lines.append("**Watching:**")
+            for w in watch_items[:4]:
+                lines.append(f"- {w['item']} {w['current']} → fires {w['trigger']} · est. {w['est']}")
+        # Concrete re-evaluation triggers
+        lines.append("")
+        lines.append("**Re-evaluate immediately if:**")
+        if upper:
+            lines.append(f"- {ticker} ≥ **${upper:,.2f}** → evaluate OTM runner rolls")
+        if lower:
+            lines.append(f"- {ticker} ≤ **${lower:,.2f}** → harvest ITM short profits")
+        if vix_shock:
+            lines.append(f"- {vol_axis} ≥ **{vix_shock:.2f}** → lock array, harvest IV crush")
+        lines.append("")
+        lines.append(
+            f"θ/Δ **${tpd:.2f}** ({rating.lower()}) · array **{doctrine.shape_description(current_shape)}** "
+            f"({'on-doctrine' if guidance['match'] else 'off-doctrine — see Array section'})."
+        )
+        st.success("  \n".join(lines))
     else:
-        bits = []
+        lines = ["**Action required.**", ""]
         if breached:
-            bits.append(f"🔴 {len(breached)} tripwire breach: {', '.join(t.name for t in breached)}.")
+            for t in breached:
+                lines.append(f"- 🔴 **{t.name}** breached — {t.detail}")
         if any_leg_triggered:
-            bits.append("Per-leg trigger active — see Position table.")
+            for leg, status in legs_with_status:
+                if status["tier"] == "triggered" and leg["side"] == "SHORT":
+                    lines.append(
+                        f"- 🔴 **{leg['argus_type']} ${leg['strike']:.0f}C "
+                        f"{_short_expiry(leg.get('expiry'))}** — {status['label']} "
+                        f"({status['reason']})"
+                    )
         if reopt["reoptimize"]:
-            bits.append(f"§13 re-optimization: {'; '.join(reopt['reasons'])}.")
-        st.error("**Action required.**  \n" + "  \n".join(f"- {b}" for b in bits)
-                 + "  \n\nUse the **🔁 Roll Simulator** tab for any proposed roll.")
+            for r in reopt["reasons"]:
+                lines.append(f"- 🟡 §13 re-optimization: {r}")
+        lines.append("")
+        if lower and upper:
+            lines.append(
+                f"**Post-action hold range:** {ticker} **${lower:,.2f}–${upper:,.2f}**, "
+                f"{vol_axis} < **{vix_shock:.2f}**."
+            )
+        lines.append("**Next:** decompose the proposed roll in the **🔁 Roll Simulator** tab "
+                     "(§5 decomposition + §12 scorecard) before executing.")
+        st.error("  \n".join(lines))
 
     # ── Text-form report (collapsible) ────────────────────────────
     with st.expander("📄 Plain-text 4-block report (copy/paste)"):
@@ -555,17 +610,63 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices,
         st.code(text_report, language="text")
 
 
+def _effective_tripwires(ticker_state: dict, spot: float, shorts: list) -> tuple:
+    """Resolve the tripwire levels to use for this review.
+
+    Returns (tripwires_dict, is_auto_derived).
+
+    If the ticker has explicit upper/lower/vix_shock configured in Engine
+    State, those are used as-is. Otherwise the levels are auto-derived from
+    the live array via state.suggest_tripwires — so the engine never prints
+    '??' and the Action block always has concrete bounds. Any individual
+    level the user HAS set still wins over the derived value.
+    """
+    tw = (ticker_state or {}).get("tripwires") or {}
+    required = ("upper", "lower", "vix_shock")
+    if all(tw.get(k) for k in required):
+        return tw, False
+
+    short_dicts = [{"strike": s["strike"]} for s in shorts if s.get("strike")]
+    derived = state_mod.suggest_tripwires(spot, short_dicts)
+
+    merged = dict(derived)
+    for k, v in tw.items():
+        if k == "disorderly":
+            continue
+        if v:
+            merged[k] = v
+    if isinstance(tw.get("disorderly"), dict):
+        merged_dis = dict(derived.get("disorderly", {}) or {})
+        for k, v in tw["disorderly"].items():
+            if v:
+                merged_dis[k] = v
+        merged["disorderly"] = merged_dis
+    return merged, True
+
+
+def _fmt_level(v) -> str:
+    """Format a tripwire numeric level, or 'not set' if missing."""
+    try:
+        return f"${float(v):,.2f}"
+    except (TypeError, ValueError):
+        return "not set"
+
+
 def _tripwire_test_description(name: str, state: dict, current_vol: float) -> str:
     """Human-readable description of what each tripwire tests."""
     tw = (state or {}).get("tripwires", {}) or {}
     dis = tw.get("disorderly", {}) or {}
+    vix_shock = tw.get("vix_shock")
+    vix_str = f"{float(vix_shock):.2f}" if vix_shock else "not set"
+    dis_vix = dis.get("vix")
+    dis_vix_str = f"{float(dis_vix):.2f}" if dis_vix else "not set"
     return {
-        "Upper":       f"Spot ≥ ${tw.get('upper', '?')}",
-        "Lower":       f"Spot ≤ ${tw.get('lower', '?')}",
-        "VIX shock":   f"VIX ≥ {tw.get('vix_shock', '?')}",
-        "Disorderly":  f"Spot ≤ ${dis.get('price', '?')} AND VIX > {dis.get('vix', '?')}",
-        "DTE/profit":  "Any short with DTE ≤ 10, profit <50%",
-        "Ex-div":      "Within 2 TD of ex-div, ITM extrinsic < 1.25 × dividend",
+        "Upper":       f"Spot ≥ {_fmt_level(tw.get('upper'))}",
+        "Lower":       f"Spot ≤ {_fmt_level(tw.get('lower'))}",
+        "VIX shock":   f"VIX ≥ {vix_str}",
+        "Disorderly":  f"Spot ≤ {_fmt_level(dis.get('price'))} AND VIX > {dis_vix_str}",
+        "DTE/profit":  "Any short with DTE ≤ 10 and profit < 50%",
+        "Ex-div":      "Within 2 trading days of ex-div, ITM extrinsic < 1.25 × dividend",
     }.get(name, name)
 
 
