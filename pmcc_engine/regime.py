@@ -109,3 +109,75 @@ def is_base_case(cell: dict) -> bool:
 def is_stand_down(cell: dict) -> bool:
     """True if the regime calls for standing down (no new short deployment)."""
     return cell.get("posture", "").startswith("stand_down")
+
+
+def band_boundary_proximity(
+    current_vol: float,
+    median_vol: float,
+    ivr: float,
+    vol_pct_threshold: float = 0.03,
+    ivr_pt_threshold: float = 5.0,
+) -> dict:
+    """Detect when the regime classification sits near a band boundary.
+
+    At a boundary, a tiny data wobble (e.g. VIX 17.99 vs 18.02, or a stale vs
+    live print) can flip the regime cell and change the target shape. This
+    helper surfaces that fragility so the operator watches it deliberately.
+
+    Vol-band boundaries live in ratio space at 1.0, 1.4, 2.0 × median.
+    IVR-band boundaries are at 25, 50, 75.
+
+    Returns:
+        {
+          vol_near (bool), vol_detail (str),
+          ivr_near (bool), ivr_detail (str),
+          any_near (bool),
+        }
+    """
+    result = {
+        "vol_near": False, "vol_detail": "",
+        "ivr_near": False, "ivr_detail": "",
+        "any_near": False,
+    }
+
+    # ── Vol axis ──────────────────────────────────────────────
+    if current_vol and median_vol and median_vol > 0 and current_vol > 0:
+        boundaries = [
+            (doctrine.VOL_BAND_L_MAX, "L", "M"),   # ratio 1.0
+            (doctrine.VOL_BAND_M_MAX, "M", "H"),   # ratio 1.4
+            (doctrine.VOL_BAND_H_MAX, "H", "X"),   # ratio 2.0
+        ]
+        for b_ratio, lo_band, hi_band in boundaries:
+            b_vol = median_vol * b_ratio
+            dist = abs(current_vol - b_vol)
+            dist_pct = dist / current_vol
+            if dist_pct <= vol_pct_threshold:
+                side = "below" if current_vol < b_vol else "at/above"
+                result["vol_near"] = True
+                result["vol_detail"] = (
+                    f"Vol {current_vol:.2f} is {dist:.2f} ({dist_pct*100:.1f}%) {side} the "
+                    f"Band {lo_band}/{hi_band} boundary ({b_vol:.2f}). "
+                    f"A small move flips the band — verify the print against a live source."
+                )
+                break
+
+    # ── IVR axis ──────────────────────────────────────────────
+    if ivr is not None:
+        ivr_boundaries = [
+            (doctrine.IVR_CHEAP_MAX, "cheap", "neutral"),     # 25
+            (doctrine.IVR_NEUTRAL_MAX, "neutral", "rich"),    # 50
+            (doctrine.IVR_RICH_MAX, "rich", "extreme"),       # 75
+        ]
+        for b_ivr, lo_band, hi_band in ivr_boundaries:
+            dist = abs(ivr - b_ivr)
+            if dist <= ivr_pt_threshold:
+                side = "below" if ivr < b_ivr else "at/above"
+                result["ivr_near"] = True
+                result["ivr_detail"] = (
+                    f"IVR {ivr:.0f} is {dist:.0f} pt(s) {side} the "
+                    f"{lo_band}/{hi_band} boundary ({b_ivr:.0f}). A small move flips the IVR band."
+                )
+                break
+
+    result["any_near"] = result["vol_near"] or result["ivr_near"]
+    return result
