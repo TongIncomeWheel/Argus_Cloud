@@ -88,7 +88,7 @@ def render_pmcc_engine(df_open, settings: dict, spot_prices: Optional[dict] = No
     ])
 
     with tab_review:
-        _render_review_block(ticker, df_open, settings, ticker_state, spot_prices)
+        _render_review_block(ticker, df_open, settings, ticker_state, spot_prices, save_settings_fn)
     with tab_scanner:
         _render_strike_scanner(ticker, df_open, settings, ticker_state, spot_prices)
     with tab_roll:
@@ -102,7 +102,8 @@ def render_pmcc_engine(df_open, settings: dict, spot_prices: Optional[dict] = No
 # ─── Block 1-4 review ──────────────────────────────────────────────
 
 
-def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices):
+def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices,
+                         save_settings_fn=None):
     """Daily review — advisor-style format: summary → market → array → unified
     position table → Δ/Θ summary → tripwires → items on watch → action."""
 
