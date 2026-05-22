@@ -4488,8 +4488,10 @@ def main():
             ].reset_index(drop=True)
         render_risk(df_open, summary, settings, spot_prices, df_orders=df_orders_full_for_risk)
     elif active == "lookup":
-        # Combined research tab: contract pricer + IV-Rank scanner
-        lookup_a, lookup_b = st.tabs(["🔎 Contract Price Lookup", "📊 IV Rank Scanner"])
+        # Combined research tab: contract pricer + IV-Rank scanner + Theta scanner
+        lookup_a, lookup_b, lookup_c = st.tabs([
+            "🔎 Contract Price Lookup", "📊 IV Rank Scanner", "θ Theta Scanner",
+        ])
         with lookup_a:
             try:
                 from contract_price_lookup import render_contract_price_lookup
@@ -4498,6 +4500,13 @@ def main():
                 st.error(f"Contract lookup unavailable: {e}")
         with lookup_b:
             render_iv_scanner(df_open, settings)
+        with lookup_c:
+            try:
+                from theta_scanner.ui import render_theta_scanner
+                render_theta_scanner(df_open, settings)
+            except Exception as e:
+                st.error(f"Theta Scanner error: {e}")
+                logger.exception("Theta Scanner render failed")
     elif active == "config":
         render_config(settings, save_settings_dict)
     elif active == "pmcc":
