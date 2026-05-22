@@ -1,20 +1,20 @@
-"""CSP candidate scoring — pure functions, no I/O, no Streamlit.
+"""Scoring math for the Scanner — pure functions, no I/O, no Streamlit.
 
-A cash-secured put ties up `strike × 100` in collateral and collects
-`premium × 100`. The scanner scores each candidate on four axes the operator
-named — yield, distance, delta — and blends them into a 0-100 composite.
-(Yield captures both 'juicy premium' and 'RoR' — for a CSP they are the same
-dimension: premium relative to collateral.)
+Handles both wheel legs:
+  - PUT  → cash-secured put: collateral is strike × 100.
+  - CALL → covered call: basis is the 100 shares you hold (≈ spot × 100).
+
+All percentage outputs are in display units (2.3 means 2.3%), so the
+composite-score scaling constants below are also in percent.
 """
 from __future__ import annotations
 
-from typing import Mapping, Optional
+from typing import Optional
 
-# ─── Composite-score scaling targets ───────────────────────────────
-# Each axis is scaled to 0-100, then blended by the weights below.
-ANN_ROR_FULL_MARKS = 0.35      # 35%+ annualized return on collateral → 100 on the yield axis
-DISTANCE_FULL_MARKS = 0.10     # 10%+ OTM → 100 on the safety axis
-DELTA_TARGET = 0.25            # delta sweet spot for a CSP
+# ─── Composite-score scaling targets (percent units) ──────────────
+ANN_YIELD_FULL_MARKS = 35.0    # 35%+ annualized yield → 100 on the yield axis
+DISTANCE_FULL_MARKS = 10.0     # 10%+ OTM → 100 on the safety axis
+DELTA_TARGET = 0.25            # delta sweet spot
 DELTA_BANDWIDTH = 0.25         # delta score decays to 0 at |delta| 0.00 or 0.50
 
 W_YIELD = 0.40
@@ -23,9 +23,9 @@ W_DELTA = 0.30
 
 # ─── Liquidity floors ──────────────────────────────────────────────
 MIN_OPEN_INTEREST = 100
-MAX_SPREAD_PCT = 0.08          # bid/ask spread ≤ 8% of mid
+MAX_SPREAD_PCT = 8.0           # bid/ask spread ≤ 8% of mid
 
-# ─── Verdict cutoffs (composite 0-100) ─────────────────────────────
+# ─── Verdict cutoffs (option score 0-100) ──────────────────────────
 VERDICT_STRONG = 75.0
 VERDICT_GOOD = 60.0
 VERDICT_MARGINAL = 45.0
@@ -35,97 +35,147 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
-# ─── Core CSP math ─────────────────────────────────────────────────
+def _is_put(option_type: str) -> bool:
+    return str(option_type).upper().startswith("P")
 
 
-def csp_collateral(strike: float) -> float:
-    """Cash secured per contract = strike × 100."""
-    return float(strike) * 100.0
+# ─── Per-contract economics ────────────────────────────────────────
 
 
-def csp_ror(premium: float, strike: float) -> float:
-    """Single-cycle return on collateral (decimal). premium/strike."""
-    if strike <= 0:
-        return 0.0
-    return float(premium) / float(strike)
+def option_economics(option_type: str, spot: float, strike: float,
+                      premium: float, dte, delta) -> dict:
+    """Return on capital, annualized yield, %OTM, breakeven, PoP.
 
-
-def csp_annualized_ror(premium: float, strike: float, dte: float) -> float:
-    """Annualized return on collateral (decimal)."""
-    if strike <= 0 or dte is None or dte <= 0:
-        return 0.0
-    return (float(premium) / float(strike)) * (365.0 / float(dte))
-
-
-def distance_to_spot_pct(spot: float, strike: float) -> float:
-    """Fraction the strike sits below spot. Positive = OTM put (the safe side)."""
-    if spot is None or spot <= 0:
-        return 0.0
-    return (float(spot) - float(strike)) / float(spot)
-
-
-def pop_from_delta(delta_abs: float) -> float:
-    """Probability of profit for a short option ≈ 1 − |delta|."""
-    if delta_abs is None:
-        return 0.0
-    return _clamp(1.0 - abs(float(delta_abs)))
-
-
-def breakeven(strike: float, premium: float) -> float:
-    """Effective cost basis if assigned: strike − premium."""
-    return float(strike) - float(premium)
-
-
-# ─── Per-axis scores (0-100) ───────────────────────────────────────
-
-
-def yield_score(annualized_ror: float) -> float:
-    return _clamp(annualized_ror / ANN_ROR_FULL_MARKS) * 100.0
-
-
-def distance_score(distance_pct: float) -> float:
-    return _clamp(distance_pct / DISTANCE_FULL_MARKS) * 100.0
-
-
-def delta_score(delta_abs: float) -> float:
-    """Tent function — peaks at DELTA_TARGET, 0 at the band edges.
-
-    A CSP with delta near 0 has no premium; near 0.50 is a coin-flip on
-    assignment. The sweet spot is the middle.
+    Percentages are in display units. `dte`/`delta` may be None.
     """
+    spot = float(spot or 0)
+    strike = float(strike or 0)
+    premium = float(premium or 0)
+    is_put = _is_put(option_type)
+
+    # Collateral basis: strike for a CSP, spot for a covered call.
+    basis = strike if is_put else spot
+    roc = (premium / basis * 100.0) if basis > 0 else 0.0
+
+    try:
+        d = float(dte)
+    except (TypeError, ValueError):
+        d = 0.0
+    annual_yield = roc * (365.0 / d) if d > 0 else 0.0
+
+    if spot > 0:
+        # Positive %OTM = the safe side for either leg.
+        pct_otm = ((spot - strike) / spot * 100.0) if is_put else ((strike - spot) / spot * 100.0)
+    else:
+        pct_otm = 0.0
+
+    breakeven = (strike - premium) if is_put else (spot - premium)
+
+    delta_abs = abs(float(delta)) if delta is not None else None
+    pop = (1.0 - delta_abs) * 100.0 if delta_abs is not None else None
+
+    return {
+        "roc": roc,
+        "annual_yield": annual_yield,
+        "pct_otm": pct_otm,
+        "breakeven": breakeven,
+        "pop": pop,
+    }
+
+
+# ─── Composite axis scores (0-100) ─────────────────────────────────
+
+
+def yield_score(annual_yield_pct: float) -> float:
+    return _clamp(annual_yield_pct / ANN_YIELD_FULL_MARKS) * 100.0
+
+
+def distance_score(pct_otm: float) -> float:
+    return _clamp(pct_otm / DISTANCE_FULL_MARKS) * 100.0
+
+
+def delta_score(delta_abs: Optional[float]) -> float:
+    """Tent function — peaks at DELTA_TARGET, 0 at the band edges."""
     if delta_abs is None:
         return 0.0
     return _clamp(1.0 - abs(abs(float(delta_abs)) - DELTA_TARGET) / DELTA_BANDWIDTH) * 100.0
 
 
-def composite_score(annualized_ror: float, distance_pct: float, delta_abs: float,
-                     w_yield: float = W_YIELD, w_distance: float = W_DISTANCE,
-                     w_delta: float = W_DELTA) -> float:
-    """Weighted 0-100 blend of the three scoring axes."""
+def option_score(annual_yield_pct: float, pct_otm: float,
+                 delta_abs: Optional[float]) -> float:
+    """Blended 0-100 desirability of a contract to sell."""
     return (
-        w_yield * yield_score(annualized_ror)
-        + w_distance * distance_score(distance_pct)
-        + w_delta * delta_score(delta_abs)
+        W_YIELD * yield_score(annual_yield_pct)
+        + W_DISTANCE * distance_score(pct_otm)
+        + W_DELTA * delta_score(delta_abs)
     )
 
 
-def verdict(composite: float) -> str:
-    """Map a composite score to a verdict label."""
-    if composite >= VERDICT_STRONG:
+def verdict(score: float) -> str:
+    if score >= VERDICT_STRONG:
         return "Strong"
-    if composite >= VERDICT_GOOD:
+    if score >= VERDICT_GOOD:
         return "Good"
-    if composite >= VERDICT_MARGINAL:
+    if score >= VERDICT_MARGINAL:
         return "Marginal"
     return "Weak"
+
+
+# ─── Underlying-level scores ───────────────────────────────────────
+
+
+def stock_rating(price: Optional[float], ma20: Optional[float],
+                 ma50: Optional[float], ma200: Optional[float],
+                 rsi: Optional[float], perf_quarter: Optional[float]) -> Optional[float]:
+    """0-100 technical health of the underlying.
+
+    Blend of trend (price vs moving averages), momentum (quarterly
+    performance) and an RSI-health tent. Returns None if nothing is known.
+    """
+    parts: list = []
+    weights: list = []
+
+    if price and price > 0 and any(m for m in (ma20, ma50, ma200)):
+        hits = sum(1 for m in (ma20, ma50, ma200) if m and price > m)
+        seen = sum(1 for m in (ma20, ma50, ma200) if m)
+        parts.append((hits / seen) * 100.0)
+        weights.append(0.45)
+
+    if perf_quarter is not None:
+        # -20%..+20% quarterly → 0..100
+        parts.append(_clamp((float(perf_quarter) + 20.0) / 40.0) * 100.0)
+        weights.append(0.30)
+
+    if rsi is not None:
+        # Health tent: peaks at RSI 55, 0 at 25 or 85.
+        parts.append(_clamp(1.0 - abs(float(rsi) - 55.0) / 30.0) * 100.0)
+        weights.append(0.25)
+
+    if not parts:
+        return None
+    total_w = sum(weights)
+    return sum(p * w for p, w in zip(parts, weights)) / total_w
+
+
+def rel_strength(perf_year: Optional[float],
+                 benchmark_perf_year: Optional[float]) -> Optional[float]:
+    """0-100 relative strength vs a benchmark. 50 = matches the benchmark."""
+    if perf_year is None or benchmark_perf_year is None:
+        return None
+    rel = float(perf_year) - float(benchmark_perf_year)
+    # -50pp..+50pp relative → 0..100
+    return _clamp((rel + 50.0) / 100.0) * 100.0
+
+
+# ─── Liquidity gate ────────────────────────────────────────────────
 
 
 def liquidity_ok(open_interest: Optional[float], bid: Optional[float],
                  ask: Optional[float], mid: Optional[float]) -> bool:
     """Open-interest floor + bid/ask spread ceiling.
 
-    Missing bid/ask is not treated as a fail (data gap, not a real defect) —
-    only an explicitly-wide spread rejects.
+    A missing quote is a data gap, not a defect — only an explicitly-wide
+    spread rejects.
     """
     try:
         if open_interest is not None and float(open_interest) < MIN_OPEN_INTEREST:
@@ -133,63 +183,19 @@ def liquidity_ok(open_interest: Optional[float], bid: Optional[float],
     except (TypeError, ValueError):
         pass
     try:
-        if bid is None or ask is None or mid in (None, 0):
+        if bid is None or ask is None or not mid or float(mid) <= 0:
             return True
-        if float(mid) <= 0:
-            return True
-        return (float(ask) - float(bid)) / float(mid) <= MAX_SPREAD_PCT
+        return (float(ask) - float(bid)) / float(mid) * 100.0 <= MAX_SPREAD_PCT
     except (TypeError, ValueError):
         return True
 
 
-def score_csp_candidate(spot: float, row: Mapping) -> dict:
-    """Score one put-chain row as a CSP candidate.
-
-    `row` needs: strike, mid (or bid/ask), dte, delta. Optional: bid, ask,
-    open_interest, iv, expiry, symbol.
-
-    Returns a dict with every metric the UI shows plus the composite + verdict.
-    """
-    strike = float(row.get("strike", 0) or 0)
-    mid = row.get("mid")
-    bid = row.get("bid")
-    ask = row.get("ask")
-    if mid is None and bid is not None and ask is not None:
-        mid = (float(bid) + float(ask)) / 2.0
-    mid = float(mid or 0.0)
-    dte = row.get("dte")
-    delta_raw = row.get("delta")
-    delta_abs = abs(float(delta_raw)) if delta_raw is not None else None
-    oi = row.get("open_interest")
-
-    ror = csp_ror(mid, strike)
-    ann_ror = csp_annualized_ror(mid, strike, dte)
-    dist = distance_to_spot_pct(spot, strike)
-    pop = pop_from_delta(delta_abs) if delta_abs is not None else None
-    comp = composite_score(ann_ror, dist, delta_abs if delta_abs is not None else 0.0)
-    liq = liquidity_ok(oi, bid, ask, mid)
-
-    return {
-        "symbol": row.get("symbol"),
-        "expiry": row.get("expiry"),
-        "strike": strike,
-        "dte": dte,
-        "premium": mid,
-        "bid": bid,
-        "ask": ask,
-        "collateral": csp_collateral(strike),
-        "ror_pct": ror * 100.0,
-        "annualized_ror_pct": ann_ror * 100.0,
-        "distance_pct": dist * 100.0,
-        "delta": delta_abs,
-        "pop_pct": pop * 100.0 if pop is not None else None,
-        "breakeven": breakeven(strike, mid),
-        "open_interest": oi,
-        "iv": row.get("iv"),
-        "yield_score": yield_score(ann_ror),
-        "distance_score": distance_score(dist),
-        "delta_score": delta_score(delta_abs if delta_abs is not None else 0.0),
-        "composite": comp,
-        "verdict": verdict(comp),
-        "liquidity_ok": liq,
-    }
+def spread_pct(bid: Optional[float], ask: Optional[float],
+               mid: Optional[float]) -> Optional[float]:
+    """Bid/ask spread as a percent of mid, or None if not computable."""
+    try:
+        if bid is None or ask is None or not mid or float(mid) <= 0:
+            return None
+        return (float(ask) - float(bid)) / float(mid) * 100.0
+    except (TypeError, ValueError):
+        return None
