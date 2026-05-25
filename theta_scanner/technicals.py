@@ -134,3 +134,11 @@ def load_technicals(tickers_tuple: tuple, progress_cb=None) -> dict:
         if progress_cb:
             progress_cb(i, total, t)
     return out
+
+
+def clear_caches() -> None:
+    """Drop every cached entry — called by the UI's 'Load new data' button."""
+    try:
+        compute_technicals.clear()
+    except Exception:
+        pass

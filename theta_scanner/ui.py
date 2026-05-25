@@ -239,10 +239,9 @@ def _render_stats(df: pd.DataFrame, result: scan_mod.ScanResult) -> None:
 def _reload_data() -> None:
     """Clear the scanner's own caches and re-run the last scan."""
     from . import technicals as tech_mod
-    for fn in (tech_mod.compute_technicals, fund_mod._fmp_fundamentals,
-               fund_mod._yf_fundamentals):
+    for mod in (tech_mod, fund_mod):
         try:
-            fn.clear()
+            mod.clear_caches()
         except Exception:
             pass
     args = st.session_state.get(SS_LAST_ARGS)
