@@ -425,12 +425,21 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices,
             f"{'Long' if leg['side'] == 'LONG' else 'Short'} ${leg['strike']:.0f}C "
             f"{_short_expiry(leg.get('expiry'))}"
         )
+        proj_ext = None
+        if leg["side"] == "SHORT" and spot:
+            forecast = rolls_mod.extrinsic_forecast(
+                {"mark": leg.get("mark", 0.0), "strike": leg["strike"],
+                 "theta": leg.get("theta_per_day", 0.0)},
+                spot=spot, days=3, is_call=(leg["argus_type"] == "CC"),
+            )
+            proj_ext = round(forecast.projected_extrinsic / 100.0, 2)  # back to per-share $
         pos_rows.append({
             "#": i,
             "Leg": leg_label,
             "delta per $1": delta_dollars,
             "theta $/day": theta_dollars,
             "Extrinsic": leg.get("extrinsic"),
+            "Ext in 3 TD": proj_ext,
             "$ from spot": round(leg["strike"] - spot, 2) if spot else None,
             "DTE": leg.get("dte"),
             "Profit %": profit_str,
@@ -449,6 +458,11 @@ def _render_review_block(ticker, df_open, settings, ticker_state, spot_prices,
             "Extrinsic":     st.column_config.NumberColumn(
                 format="$%.2f",
                 help="Time value remaining in the mark. When extrinsic < $1, the short is acting as synthetic stock."),
+            "Ext in 3 TD":   st.column_config.NumberColumn(
+                format="$%.2f",
+                help="Projected extrinsic 3 trading days from now at current theta. "
+                     "If projected ≈ current → little to harvest by waiting; if projected → 0 → "
+                     "extrinsic dies on its own, no rush to roll."),
             "$ from spot":   st.column_config.NumberColumn(format="$%+.2f"),
             "Trigger":       st.column_config.TextColumn(
                 help="Per-leg status. Sit = no signal. Approaching 50% = on track for harvest. "
@@ -861,6 +875,27 @@ def _render_roll_simulator(ticker, df_open, settings, ticker_state, spot_prices)
     getattr(e2, color)(f"**§5 Verdict: {decomp.verdict.upper()}**  \n"
                       f"Positive metrics: {', '.join(decomp.positive_metrics) or 'none'}"
                       + (f"  \n_{decomp.rejection_reason}_" if decomp.rejection_reason else ""))
+
+    # ── §7 Wait-vs-roll-now ───────────────────────────────────────
+    st.markdown("**§7 Wait-vs-roll-now check:**")
+    wait_days = st.number_input(
+        "Wait window (trading days)", min_value=1, max_value=15, value=3, step=1,
+        key="pmcc_wait_days",
+        help="How many TD to consider holding before rolling. Default 3 ≈ next review cadence.",
+    )
+    wait = rolls_mod.wait_vs_roll(old_leg, new_leg, spot=spot, wait_days=int(wait_days), is_call=True)
+    w1, w2, w3, w4 = st.columns(4)
+    w1.metric("Current extrinsic", f"${wait.current_extrinsic:,.2f}",
+              help="Time value left on the old leg. Floor is intrinsic — can't harvest below zero.")
+    w2.metric(f"Savings ({wait.wait_days} TD)", f"${wait.extrinsic_savings:,.2f}",
+              help="Extrinsic the old leg sheds while you wait. Capped at current extrinsic.")
+    w3.metric("Opportunity cost", f"${wait.opportunity_cost:,.2f}",
+              help="Fresh-leg theta you'd have collected over the same window.")
+    w4.metric("Net advantage", f"${wait.net_advantage:+,.2f}",
+              delta="wait" if wait.net_advantage > 0 else "roll now",
+              delta_color="normal" if wait.net_advantage > 0 else "inverse")
+    verdict_box = st.success if wait.verdict == "wait" else st.info
+    verdict_box(f"**§7 Verdict: {wait.verdict.upper()}** — {wait.reason}")
 
 
 # ─── Scorecard sub-tab ─────────────────────────────────────────────
