@@ -226,6 +226,105 @@ def load_open_positions(pmcc_tickers_tuple: tuple = ()) -> pd.DataFrame:
 from pathlib import Path as _Path
 
 _MLEG_CACHE_PATH = _Path(__file__).parent.parent / "data" / "mleg_cache.parquet"
+_MLEG_GSHEET_TAB = "MLEG_Cache"
+
+
+def _flatten_mleg_cache(cache: dict) -> list:
+    """Cache dict {order_id: [leg dicts]} → flat list of row dicts.
+
+    Each row carries `_mleg_order_id`; the inverse is `_inflate_mleg_cache`.
+    Used by both the parquet writer and the gSheet mirror so the wire
+    format is identical.
+    """
+    rows = []
+    for oid, legs in cache.items():
+        for leg in legs:
+            r = dict(leg)
+            r["_mleg_order_id"] = str(oid)
+            rows.append(r)
+    return rows
+
+
+def _inflate_mleg_cache(rows) -> dict:
+    """Inverse of `_flatten_mleg_cache`: list of row dicts → cache dict."""
+    cache: dict = {}
+    for r in rows or []:
+        oid = str(r.get("_mleg_order_id", "")).strip()
+        if not oid:
+            continue
+        leg = {k: v for k, v in r.items() if k != "_mleg_order_id"}
+        cache.setdefault(oid, []).append(leg)
+    return cache
+
+
+def _save_mleg_cache_to_gsheet(cache: dict) -> bool:
+    """Mirror the MLEG cache to a dedicated gSheet tab.
+
+    The local parquet at `_MLEG_CACHE_PATH` lives on the Streamlit Cloud
+    container's ephemeral filesystem — every container restart wipes it
+    and the next cold start re-expands every combo via Tiger (~1.05s
+    each, so 42 combos ≈ 85s minimum). The gSheet mirror is canonical:
+    restoring from it on cold start cuts that to a single read.
+    """
+    if not cache:
+        return False
+    try:
+        from config import INCOME_WHEEL_SHEET_ID
+        from gsheet_handler import GSheetHandler
+        if not INCOME_WHEEL_SHEET_ID:
+            return False
+        handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
+        try:
+            ws = handler.spreadsheet.worksheet(_MLEG_GSHEET_TAB)
+        except Exception:
+            ws = handler.spreadsheet.add_worksheet(
+                title=_MLEG_GSHEET_TAB, rows=2000, cols=30,
+            )
+
+        rows = _flatten_mleg_cache(cache)
+        if not rows:
+            return False
+        df = pd.DataFrame(rows).fillna("")
+        for c in df.columns:
+            df[c] = df[c].astype(str)
+        values = [list(df.columns)] + df.values.tolist()
+        try:
+            ws.resize(rows=max(len(values), 100), cols=max(len(df.columns), 10))
+        except Exception:
+            pass
+        ws.clear()
+        ws.update(values=values, range_name="A1")
+        logger.info(
+            "MLEG cache mirrored to gSheet (%d combos · %d legs)",
+            len(cache), len(rows),
+        )
+        return True
+    except Exception as e:
+        logger.warning("MLEG gSheet mirror save failed: %s", e)
+        return False
+
+
+def _load_mleg_cache_from_gsheet() -> dict:
+    """Restore the MLEG cache dict from the dedicated gSheet tab."""
+    try:
+        from config import INCOME_WHEEL_SHEET_ID
+        from gsheet_handler import GSheetHandler
+        if not INCOME_WHEEL_SHEET_ID:
+            return {}
+        handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
+        try:
+            ws = handler.spreadsheet.worksheet(_MLEG_GSHEET_TAB)
+        except Exception:
+            return {}   # first-time setup — tab doesn't exist yet
+        raw = ws.get_all_values()
+        if not raw or len(raw) < 2:
+            return {}
+        header, body = raw[0], raw[1:]
+        rows = [dict(zip(header, r)) for r in body]
+        return _inflate_mleg_cache(rows)
+    except Exception as e:
+        logger.warning("MLEG gSheet mirror read failed: %s", e)
+        return {}
 
 
 def _seed_mleg_cache_from_archive() -> dict:
@@ -285,43 +384,65 @@ def _seed_mleg_cache_from_archive() -> dict:
 def _load_mleg_cache() -> dict:
     """Read the parquet cache → dict[order_id_str, list[leg_row_dict]].
 
-    On Cloud cold start (parquet wiped), automatically seeds from the gSheet
-    archive — avoids 60-90s of Tiger API re-expansion.
+    Recovery order on Cloud cold start (parquet wiped):
+      1. local parquet (fast path),
+      2. dedicated gSheet `MLEG_Cache` tab (direct mirror — most reliable),
+      3. legacy seed from the gSheet Orders_Archive (covers users who
+         archived manually before the mirror existed).
     """
     if _MLEG_CACHE_PATH.exists():
         try:
             df = pd.read_parquet(_MLEG_CACHE_PATH)
             if not df.empty and "_mleg_order_id" in df.columns:
-                cache = {}
-                for oid, grp in df.groupby("_mleg_order_id"):
-                    cache[str(oid)] = grp.drop(columns=["_mleg_order_id"]).to_dict("records")
+                cache = _inflate_mleg_cache(df.to_dict("records"))
                 if cache:
                     return cache
         except Exception as e:
             logger.warning("MLEG cache read failed: %s", e)
 
-    # Parquet missing or empty — seed from archive (Cloud cold-start recovery)
-    logger.info("MLEG parquet cache missing — seeding from gSheet archive")
+    # Parquet missing — try the dedicated gSheet mirror first.
+    cache = _load_mleg_cache_from_gsheet()
+    if cache:
+        logger.info(
+            "MLEG cache restored from gSheet mirror: %d combos (%d legs)",
+            len(cache), sum(len(v) for v in cache.values()),
+        )
+        # Rehydrate parquet for the rest of this session (no re-mirror needed).
+        try:
+            _MLEG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            rows = _flatten_mleg_cache(cache)
+            if rows:
+                pd.DataFrame(rows).to_parquet(_MLEG_CACHE_PATH, index=False)
+        except Exception:
+            pass
+        return cache
+
+    # Legacy fallback — reconstruct from MLEG-LEG rows in the Orders_Archive.
+    logger.info("MLEG mirror empty — falling back to Orders_Archive seed")
     return _seed_mleg_cache_from_archive()
 
 
 def _save_mleg_cache(cache: dict) -> None:
-    """Persist dict[order_id_str, list[leg_row_dict]] back to parquet."""
+    """Persist the cache to parquet AND mirror to gSheet.
+
+    The parquet write is fast and ephemeral. The gSheet mirror is the
+    canonical copy — survives Streamlit Cloud restarts that wipe the
+    local filesystem.
+    """
     if not cache:
         return
     try:
         _MLEG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        rows = []
-        for oid, legs in cache.items():
-            for leg in legs:
-                row = dict(leg)
-                row["_mleg_order_id"] = str(oid)
-                rows.append(row)
+        rows = _flatten_mleg_cache(cache)
         if rows:
             df = pd.DataFrame(rows)
             df.to_parquet(_MLEG_CACHE_PATH, index=False)
     except Exception as e:
         logger.warning("MLEG cache write failed: %s", e)
+
+    # Canonical write — fire-and-forget; local save above is the
+    # guarantee, this is for surviving Cloud restarts.
+    _save_mleg_cache_to_gsheet(cache)
 
 
 def clear_mleg_cache() -> bool:
