@@ -1,4 +1,4 @@
-"""Tests for CSP scoring math."""
+"""Tests for Scanner scoring math."""
 from __future__ import annotations
 
 import unittest
@@ -6,81 +6,119 @@ import unittest
 from theta_scanner import scoring
 
 
-class CoreMathTests(unittest.TestCase):
-    def test_collateral(self):
-        self.assertEqual(scoring.csp_collateral(100.0), 10_000.0)
+class PutEconomicsTests(unittest.TestCase):
+    """Cash-secured put: collateral basis is the strike."""
 
-    def test_ror(self):
-        # $2 premium on a $100 strike → 2% single-cycle RoR
-        self.assertAlmostEqual(scoring.csp_ror(2.0, 100.0), 0.02)
+    def setUp(self):
+        # spot 100, OTM put strike 92, $2.10 premium, 35 DTE, delta -0.24
+        self.e = scoring.option_economics("Put", 100.0, 92.0, 2.10, 35, -0.24)
 
-    def test_annualized_ror(self):
-        # 2% over 30 DTE → 2% × (365/30) ≈ 24.3% annualized
-        ann = scoring.csp_annualized_ror(2.0, 100.0, 30)
-        self.assertAlmostEqual(ann, 0.02 * (365 / 30), places=4)
+    def test_roc_on_strike(self):
+        self.assertAlmostEqual(self.e["roc"], 2.10 / 92.0 * 100.0, places=4)
 
-    def test_annualized_ror_zero_dte(self):
-        self.assertEqual(scoring.csp_annualized_ror(2.0, 100.0, 0), 0.0)
+    def test_annual_yield(self):
+        self.assertAlmostEqual(
+            self.e["annual_yield"], (2.10 / 92.0 * 100.0) * (365.0 / 35.0), places=3)
 
-    def test_distance_to_spot(self):
-        # strike 90, spot 100 → 10% OTM
-        self.assertAlmostEqual(scoring.distance_to_spot_pct(100.0, 90.0), 0.10)
-
-    def test_distance_negative_when_itm(self):
-        # strike 105 above spot 100 → -5% (ITM put)
-        self.assertAlmostEqual(scoring.distance_to_spot_pct(100.0, 105.0), -0.05)
-
-    def test_pop_from_delta(self):
-        self.assertAlmostEqual(scoring.pop_from_delta(0.25), 0.75)
-        self.assertAlmostEqual(scoring.pop_from_delta(0.0), 1.0)
+    def test_pct_otm_positive_below_spot(self):
+        self.assertAlmostEqual(self.e["pct_otm"], 8.0, places=4)
 
     def test_breakeven(self):
-        # strike 90, premium 2 → cost basis 88 if assigned
-        self.assertEqual(scoring.breakeven(90.0, 2.0), 88.0)
+        self.assertAlmostEqual(self.e["breakeven"], 89.90, places=2)
+
+    def test_pop_from_abs_delta(self):
+        self.assertAlmostEqual(self.e["pop"], 76.0, places=4)
+
+
+class CallEconomicsTests(unittest.TestCase):
+    """Covered call: collateral basis is the held shares (≈ spot)."""
+
+    def setUp(self):
+        # spot 100, OTM call strike 108, $1.80 premium, 30 DTE, delta 0.22
+        self.e = scoring.option_economics("Call", 100.0, 108.0, 1.80, 30, 0.22)
+
+    def test_roc_on_spot(self):
+        self.assertAlmostEqual(self.e["roc"], 1.80 / 100.0 * 100.0, places=4)
+
+    def test_pct_otm_positive_above_spot(self):
+        self.assertAlmostEqual(self.e["pct_otm"], 8.0, places=4)
+
+    def test_breakeven_below_spot(self):
+        self.assertAlmostEqual(self.e["breakeven"], 98.20, places=2)
+
+
+class EconomicsGuardTests(unittest.TestCase):
+    def test_zero_dte_no_annualization(self):
+        e = scoring.option_economics("Put", 100.0, 95.0, 1.0, 0, -0.2)
+        self.assertEqual(e["annual_yield"], 0.0)
+
+    def test_none_delta_yields_none_pop(self):
+        e = scoring.option_economics("Put", 100.0, 95.0, 1.0, 30, None)
+        self.assertIsNone(e["pop"])
 
 
 class AxisScoreTests(unittest.TestCase):
-    def test_yield_score_clamps_at_full_marks(self):
-        self.assertEqual(scoring.yield_score(scoring.ANN_ROR_FULL_MARKS), 100.0)
-        self.assertEqual(scoring.yield_score(scoring.ANN_ROR_FULL_MARKS * 2), 100.0)
+    def test_yield_score_clamps(self):
+        self.assertEqual(scoring.yield_score(scoring.ANN_YIELD_FULL_MARKS), 100.0)
+        self.assertEqual(scoring.yield_score(scoring.ANN_YIELD_FULL_MARKS * 3), 100.0)
         self.assertEqual(scoring.yield_score(0.0), 0.0)
 
     def test_distance_score_clamps(self):
         self.assertEqual(scoring.distance_score(scoring.DISTANCE_FULL_MARKS), 100.0)
         self.assertEqual(scoring.distance_score(0.0), 0.0)
 
-    def test_delta_score_peaks_at_target(self):
+    def test_delta_score_tent(self):
         self.assertAlmostEqual(scoring.delta_score(scoring.DELTA_TARGET), 100.0)
-        # At the band edges (0.0 and 0.50) the score should hit 0
         self.assertAlmostEqual(scoring.delta_score(0.0), 0.0, places=4)
         self.assertAlmostEqual(scoring.delta_score(0.50), 0.0, places=4)
+        self.assertEqual(scoring.delta_score(None), 0.0)
 
     def test_delta_score_symmetric(self):
-        # equal distance either side of target → equal score
-        below = scoring.delta_score(scoring.DELTA_TARGET - 0.10)
-        above = scoring.delta_score(scoring.DELTA_TARGET + 0.10)
-        self.assertAlmostEqual(below, above, places=4)
+        self.assertAlmostEqual(
+            scoring.delta_score(scoring.DELTA_TARGET - 0.1),
+            scoring.delta_score(scoring.DELTA_TARGET + 0.1), places=4)
 
 
 class CompositeTests(unittest.TestCase):
-    def test_perfect_candidate_scores_high(self):
-        # full yield, full distance, perfect delta → 100
-        comp = scoring.composite_score(
-            annualized_ror=scoring.ANN_ROR_FULL_MARKS,
-            distance_pct=scoring.DISTANCE_FULL_MARKS,
-            delta_abs=scoring.DELTA_TARGET,
-        )
+    def test_perfect_contract(self):
+        comp = scoring.option_score(
+            scoring.ANN_YIELD_FULL_MARKS, scoring.DISTANCE_FULL_MARKS,
+            scoring.DELTA_TARGET)
         self.assertAlmostEqual(comp, 100.0, places=2)
 
-    def test_zero_candidate_scores_low(self):
-        comp = scoring.composite_score(annualized_ror=0.0, distance_pct=0.0, delta_abs=0.0)
-        self.assertAlmostEqual(comp, 0.0, places=2)
+    def test_zero_contract(self):
+        self.assertAlmostEqual(scoring.option_score(0.0, 0.0, 0.0), 0.0, places=2)
 
     def test_verdict_bands(self):
         self.assertEqual(scoring.verdict(80), "Strong")
         self.assertEqual(scoring.verdict(65), "Good")
         self.assertEqual(scoring.verdict(50), "Marginal")
-        self.assertEqual(scoring.verdict(30), "Weak")
+        self.assertEqual(scoring.verdict(20), "Weak")
+
+
+class StockScoreTests(unittest.TestCase):
+    def test_stock_rating_strong_uptrend(self):
+        # price above all three MAs, healthy RSI, positive quarter
+        r = scoring.stock_rating(price=110, ma20=105, ma50=100, ma200=95,
+                                 rsi=55, perf_quarter=10)
+        self.assertGreater(r, 80.0)
+
+    def test_stock_rating_none_when_no_data(self):
+        self.assertIsNone(scoring.stock_rating(None, None, None, None, None, None))
+
+    def test_stock_rating_partial_data(self):
+        # only RSI known — still produces a number
+        r = scoring.stock_rating(None, None, None, None, rsi=55, perf_quarter=None)
+        self.assertAlmostEqual(r, 100.0, places=2)
+
+    def test_rel_strength_outperformer(self):
+        self.assertAlmostEqual(scoring.rel_strength(20.0, 10.0), 60.0, places=2)
+
+    def test_rel_strength_matches_benchmark(self):
+        self.assertAlmostEqual(scoring.rel_strength(8.0, 8.0), 50.0, places=2)
+
+    def test_rel_strength_none_without_benchmark(self):
+        self.assertIsNone(scoring.rel_strength(10.0, None))
 
 
 class LiquidityTests(unittest.TestCase):
@@ -89,37 +127,15 @@ class LiquidityTests(unittest.TestCase):
         self.assertTrue(scoring.liquidity_ok(500, 1.0, 1.05, 1.025))
 
     def test_wide_spread_rejected(self):
-        # 20% spread → reject
         self.assertFalse(scoring.liquidity_ok(500, 1.0, 1.20, 1.10))
 
     def test_missing_quote_not_rejected(self):
-        # No bid/ask → data gap, not a real defect
         self.assertTrue(scoring.liquidity_ok(500, None, None, None))
 
-
-class ScoreCandidateTests(unittest.TestCase):
-    def test_full_candidate_dict(self):
-        # spot 100, OTM put strike 92, $2.10 premium, 35 DTE, delta -0.24
-        row = {
-            "symbol": "XYZ260101P00092000", "strike": 92.0, "mid": 2.10,
-            "bid": 2.05, "ask": 2.15, "dte": 35, "delta": -0.24,
-            "open_interest": 800, "expiry": "2026-01-01", "iv": 0.30,
-        }
-        sc = scoring.score_csp_candidate(spot=100.0, row=row)
-        self.assertAlmostEqual(sc["distance_pct"], 8.0, places=1)
-        self.assertEqual(sc["delta"], 0.24)              # abs value
-        self.assertAlmostEqual(sc["ror_pct"], 2.10 / 92.0 * 100, places=2)
-        self.assertAlmostEqual(sc["breakeven"], 89.90, places=2)
-        self.assertTrue(sc["liquidity_ok"])
-        self.assertIn(sc["verdict"], ("Strong", "Good", "Marginal", "Weak"))
-        self.assertGreaterEqual(sc["composite"], 0.0)
-        self.assertLessEqual(sc["composite"], 100.0)
-
-    def test_mid_derived_from_bid_ask_when_absent(self):
-        row = {"strike": 90.0, "bid": 1.0, "ask": 1.40, "dte": 30, "delta": -0.20,
-               "open_interest": 500}
-        sc = scoring.score_csp_candidate(spot=100.0, row=row)
-        self.assertAlmostEqual(sc["premium"], 1.20, places=2)
+    def test_spread_pct(self):
+        self.assertAlmostEqual(scoring.spread_pct(1.0, 1.05, 1.025),
+                               0.05 / 1.025 * 100.0, places=4)
+        self.assertIsNone(scoring.spread_pct(None, 1.0, 1.0))
 
 
 if __name__ == "__main__":
