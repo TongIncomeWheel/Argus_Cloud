@@ -1,0 +1,80 @@
+name: Keep ARGUS warm
+
+# Pings the Streamlit Cloud app URL every 10 minutes so it never crosses
+# the free-tier inactivity threshold (which kicks in after roughly 7 days
+# of zero traffic). HTTP requests count as activity — no WebSocket or
+# user click required.
+#
+# Setup (one-time):
+#   1. Open your Streamlit Cloud app, copy its URL (e.g.
+#      https://your-app.streamlit.app)
+#   2. In this GitHub repo: Settings → Secrets and variables → Actions →
+#      New repository secret. Name: STREAMLIT_APP_URL. Value: the URL.
+#   3. (Optional) Trigger this workflow once manually from the Actions
+#      tab to confirm the ping works.
+#
+# Notes:
+#   - GitHub Actions cron is best-effort and can be delayed by a few
+#     minutes during platform load. A 10-minute interval has plenty of
+#     margin for the 7-day inactivity threshold.
+#   - Scheduled workflows get auto-disabled after 60 days of repo
+#     inactivity. As long as someone commits to this repo at least once
+#     every two months, this keeps running forever.
+#   - We deliberately don't fail the job on non-200 responses — Streamlit
+#     Cloud can momentarily return 5xx during a restart, and we don't
+#     want a noisy failure email for transient blips.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+# Avoid stacking up runs if a ping hangs.
+concurrency:
+  group: keep-warm
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping ARGUS
+        env:
+          APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
+        run: |
+          set -u
+          if [ -z "$APP_URL" ]; then
+            echo "::error::STREAMLIT_APP_URL secret is not set on this repo."
+            echo "Add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+          # Strip a trailing slash, then try the lightweight Streamlit
+          # health endpoint first.
+          base="${APP_URL%/}"
+          health="${base}/_stcore/health"
+          echo "→ Ping $health"
+          status=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 30 -L "$health" || echo "000")
+          echo "   HTTP $status"
+
+          # If the health endpoint isn't 200, fall back to the app root —
+          # different Streamlit versions/configurations expose the health
+          # check differently, but every app responds at /.
+          if [ "$status" != "200" ]; then
+            echo "→ Falling back to $base/"
+            status=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 60 -L "$base/" || echo "000")
+            echo "   HTTP $status"
+          fi
+
+          if [ "$status" = "200" ]; then
+            echo "✅ ARGUS is awake."
+          else
+            echo "::warning::Non-200 response ($status) — Streamlit Cloud may be restarting. Will try again next tick."
+          fi
+          # Always exit 0 — we never want a failure email for transient
+          # platform blips during a Streamlit restart.
+          exit 0
