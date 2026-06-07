@@ -52,38 +52,16 @@ st.set_page_config(
 )
 
 # ─── Background keep-alive ────────────────────────────────────────
-# Auto-refresh the page every 2 hours so the Streamlit Cloud container stays
-# warm and the data caches stay current — no MLEG re-expansion penalty on the
-# next visit. Manual refresh buttons throughout the app still work as normal
-# for live updates during trading hours. Zero extra dependency: a hidden iframe
-# scheduling a single parent-page reload via setTimeout.
-from streamlit.components.v1 import html as _argus_keepalive_html
+# Soft auto-refresh every 2 hours of *idle* — `st_autorefresh` triggers a
+# Streamlit script rerun (NOT a browser reload), so widget state, scroll
+# position, and filters stay put. With `debounce=True` (default) every user
+# interaction resets the timer, so the rerun only fires when the tab has
+# genuinely been idle. Cache TTLs handle the "skip refetch if fresh" decision
+# at the API layer, so a tick on truly-unchanged data is essentially free.
+# Manual refresh buttons throughout the app continue to work as normal.
+from streamlit_autorefresh import st_autorefresh
 
-_ARGUS_KEEPALIVE_MS = 2 * 60 * 60 * 1000   # 2 hours
-
-_argus_keepalive_html(
-    f"""
-    <script>
-      // Use the parent window as the "scheduled" flag so the timer isn't
-      // re-scheduled on every Streamlit rerun (iframe re-creation).
-      try {{
-        if (!window.parent._argus_keepalive) {{
-          window.parent._argus_keepalive = true;
-          setTimeout(function() {{
-            try {{ window.parent.location.reload(); }}
-            catch (e) {{ window.location.reload(); }}
-          }}, {_ARGUS_KEEPALIVE_MS});
-        }}
-      }} catch (e) {{
-        // Cross-origin guard — fall back to a local-scoped timer.
-        setTimeout(function() {{
-          try {{ window.parent.location.reload(); }} catch (e) {{}}
-        }}, {_ARGUS_KEEPALIVE_MS});
-      }}
-    </script>
-    """,
-    height=0,
-)
+st_autorefresh(interval=2 * 60 * 60 * 1000, key="argus_keepalive")
 
 # Tighter, terminal-feeling CSS
 st.markdown("""
