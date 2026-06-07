@@ -51,6 +51,40 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# ─── Background keep-alive ────────────────────────────────────────
+# Auto-refresh the page every 2 hours so the Streamlit Cloud container stays
+# warm and the data caches stay current — no MLEG re-expansion penalty on the
+# next visit. Manual refresh buttons throughout the app still work as normal
+# for live updates during trading hours. Zero extra dependency: a hidden iframe
+# scheduling a single parent-page reload via setTimeout.
+from streamlit.components.v1 import html as _argus_keepalive_html
+
+_ARGUS_KEEPALIVE_MS = 2 * 60 * 60 * 1000   # 2 hours
+
+_argus_keepalive_html(
+    f"""
+    <script>
+      // Use the parent window as the "scheduled" flag so the timer isn't
+      // re-scheduled on every Streamlit rerun (iframe re-creation).
+      try {{
+        if (!window.parent._argus_keepalive) {{
+          window.parent._argus_keepalive = true;
+          setTimeout(function() {{
+            try {{ window.parent.location.reload(); }}
+            catch (e) {{ window.location.reload(); }}
+          }}, {_ARGUS_KEEPALIVE_MS});
+        }}
+      }} catch (e) {{
+        // Cross-origin guard — fall back to a local-scoped timer.
+        setTimeout(function() {{
+          try {{ window.parent.location.reload(); }} catch (e) {{}}
+        }}, {_ARGUS_KEEPALIVE_MS});
+      }}
+    </script>
+    """,
+    height=0,
+)
+
 # Tighter, terminal-feeling CSS
 st.markdown("""
 <style>
