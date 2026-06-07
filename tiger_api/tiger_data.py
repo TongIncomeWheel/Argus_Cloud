@@ -293,7 +293,13 @@ def _save_mleg_cache_to_gsheet(cache: dict) -> bool:
         except Exception:
             pass
         ws.clear()
-        ws.update(values=values, range_name="A1")
+        # value_input_option="RAW" is critical: Tiger order IDs are
+        # 17-19-digit integers, and Sheets' default "USER_ENTERED" mode
+        # coerces them to floats (53-bit mantissa) and silently rounds.
+        # The cache key written here ("43135232355205120") then doesn't
+        # match `str(tiger_order.id)` on the read side, so every lookup
+        # misses and every cold start re-expands from scratch.
+        ws.update(values=values, range_name="A1", value_input_option="RAW")
         logger.info(
             "MLEG cache mirrored to gSheet (%d combos · %d legs)",
             len(cache), len(rows),
@@ -310,20 +316,29 @@ def _load_mleg_cache_from_gsheet() -> dict:
         from config import INCOME_WHEEL_SHEET_ID
         from gsheet_handler import GSheetHandler
         if not INCOME_WHEEL_SHEET_ID:
+            logger.info("MLEG mirror: no INCOME_WHEEL_SHEET_ID configured")
             return {}
         handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
         try:
             ws = handler.spreadsheet.worksheet(_MLEG_GSHEET_TAB)
-        except Exception:
-            return {}   # first-time setup — tab doesn't exist yet
+        except Exception as e:
+            logger.info("MLEG mirror: tab '%s' not found yet (%s)", _MLEG_GSHEET_TAB, e)
+            return {}
         raw = ws.get_all_values()
         if not raw or len(raw) < 2:
+            logger.info("MLEG mirror: tab '%s' empty (%d rows)", _MLEG_GSHEET_TAB, len(raw))
             return {}
         header, body = raw[0], raw[1:]
         rows = [dict(zip(header, r)) for r in body]
-        return _inflate_mleg_cache(rows)
+        cache = _inflate_mleg_cache(rows)
+        logger.info(
+            "MLEG mirror: read %d rows from gSheet → inflated to %d combos",
+            len(body), len(cache),
+        )
+        return cache
     except Exception as e:
-        logger.warning("MLEG gSheet mirror read failed: %s", e)
+        logger.warning("MLEG gSheet mirror read failed: %s: %s",
+                       type(e).__name__, e)
         return {}
 
 
