@@ -412,7 +412,6 @@ Full plan exists at `C:\Users\ashtz\.claude\plans\hidden-dancing-avalanche.md`:
 ### Legacy (preserved, not used by current app)
 | File | Notes |
 |------|-------|
-| `app_legacy.py` | Old CSV-driven app, preserved for fallback |
 | `excel_handler.py` | Old Excel-based data handler |
 | `calculations.py` | Old capital calculations |
 | `pnl_calculator.py` | Old P&L calculator |
@@ -420,10 +419,8 @@ Full plan exists at `C:\Users\ashtz\.claude\plans\hidden-dancing-avalanche.md`:
 | `tiger_etl*.py` | Old ETL scripts |
 | `data_access.py`, `data_schema.py` | Old data layer |
 | `market_data/` | Old multi-provider market data service |
-| `ai_chat.py` | Old AI chat feature (Gemini/Claude) |
 | `strategy_*.py` | Old strategy UI |
 | `income_scanner_ui.py` | Old scanner |
-| `daily_report.py` | Old CIO report generator |
 | `sheets_handler.py` | Old sheets handler |
 | `web_search.py` | Old web search |
 
