@@ -5,15 +5,13 @@ Supports multiple portfolios (Income Wheel, Active Core, etc.)
 """
 import json
 from pathlib import Path
-from typing import Dict, Optional, Set, List
-from datetime import datetime, timedelta
+from typing import Dict, Set, List
+from datetime import datetime
 import logging
 
 logger = logging.getLogger(__name__)
 
 PERSISTENCE_FILE = Path(__file__).parent / "data" / "user_settings.json"
-CHAT_HISTORY_FILE = Path(__file__).parent / "data" / "ai_chat_history.json"
-CHAT_RETENTION_DAYS = 10  # Keep chat history for 10 days
 
 
 def get_portfolio_key(portfolio: str = "Income Wheel") -> str:
@@ -363,151 +361,6 @@ def save_tiger_vault_balance(vault_balance: float, portfolio: str = "Income Whee
 
 
 # ============================================================
-# AI CHAT HISTORY PERSISTENCE (Model-Agnostic, 7-10 Day Retention)
-# ============================================================
-
-def load_chat_history() -> List[Dict]:
-    """
-    Load chat history from JSON file
-    Automatically filters out messages older than retention period
-    Returns empty list if file doesn't exist or is invalid
-    """
-    if not CHAT_HISTORY_FILE.exists():
-        return []
-    
-    try:
-        with open(CHAT_HISTORY_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            
-        # Get all messages
-        messages = data.get('messages', [])
-        
-        # Filter by retention period (remove messages older than retention_days)
-        cutoff_date = datetime.now() - timedelta(days=CHAT_RETENTION_DAYS)
-        filtered_messages = []
-        
-        for msg in messages:
-            timestamp_str = msg.get('timestamp', '')
-            if timestamp_str:
-                try:
-                    msg_date = datetime.fromisoformat(timestamp_str)
-                    if msg_date >= cutoff_date:
-                        filtered_messages.append(msg)
-                except (ValueError, TypeError):
-                    # Invalid timestamp, skip this message
-                    continue
-            else:
-                # No timestamp, keep it (assume recent)
-                filtered_messages.append(msg)
-        
-        # If we filtered out old messages, save the cleaned version
-        if len(filtered_messages) < len(messages):
-            save_chat_history(filtered_messages)
-            logger.info(f"Cleaned chat history: removed {len(messages) - len(filtered_messages)} old messages")
-        
-        return filtered_messages
-        
-    except Exception as e:
-        logger.warning(f"Could not load chat history: {e}")
-        return []
-
-
-def save_chat_history(messages: List[Dict]):
-    """
-    Save chat history to JSON file
-    Automatically filters out messages older than retention period before saving
-    
-    Args:
-        messages: List of message dicts with 'role', 'content', 'timestamp'
-    """
-    try:
-        # Filter by retention period
-        cutoff_date = datetime.now() - timedelta(days=CHAT_RETENTION_DAYS)
-        filtered_messages = []
-        
-        for msg in messages:
-            timestamp_str = msg.get('timestamp', '')
-            if timestamp_str:
-                try:
-                    msg_date = datetime.fromisoformat(timestamp_str)
-                    if msg_date >= cutoff_date:
-                        filtered_messages.append(msg)
-                except (ValueError, TypeError):
-                    # Invalid timestamp, skip this message
-                    continue
-            else:
-                # No timestamp, add current timestamp and keep
-                msg['timestamp'] = datetime.now().isoformat()
-                filtered_messages.append(msg)
-        
-        # Save to file
-        CHAT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            'last_updated': datetime.now().isoformat(),
-            'retention_days': CHAT_RETENTION_DAYS,
-            'message_count': len(filtered_messages),
-            'messages': filtered_messages
-        }
-        
-        with open(CHAT_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        
-        logger.info(f"Chat history saved: {len(filtered_messages)} messages (retention: {CHAT_RETENTION_DAYS} days)")
-        
-    except Exception as e:
-        logger.error(f"Could not save chat history: {e}")
-
-
-def clear_chat_history():
-    """Clear all chat history from persistent storage"""
-    try:
-        if CHAT_HISTORY_FILE.exists():
-            CHAT_HISTORY_FILE.unlink()
-        logger.info("Chat history cleared")
-    except Exception as e:
-        logger.error(f"Could not clear chat history: {e}")
-
-
-def get_chat_history_stats() -> Dict:
-    """Get statistics about stored chat history"""
-    if not CHAT_HISTORY_FILE.exists():
-        return {
-            'total_messages': 0,
-            'oldest_message': None,
-            'newest_message': None,
-            'retention_days': CHAT_RETENTION_DAYS
-        }
-    
-    try:
-        messages = load_chat_history()
-        if not messages:
-            return {
-                'total_messages': 0,
-                'oldest_message': None,
-                'newest_message': None,
-                'retention_days': CHAT_RETENTION_DAYS
-            }
-        
-        timestamps = [msg.get('timestamp') for msg in messages if msg.get('timestamp')]
-        timestamps = [datetime.fromisoformat(ts) for ts in timestamps if ts]
-        
-        return {
-            'total_messages': len(messages),
-            'oldest_message': min(timestamps).isoformat() if timestamps else None,
-            'newest_message': max(timestamps).isoformat() if timestamps else None,
-            'retention_days': CHAT_RETENTION_DAYS
-        }
-    except Exception as e:
-        logger.warning(f"Could not get chat history stats: {e}")
-        return {
-            'total_messages': 0,
-            'oldest_message': None,
-            'newest_message': None,
-            'retention_days': CHAT_RETENTION_DAYS
-        }
-
-
-# ============================================================
 # OPEN LOTS & MARKET PRICES PERSISTENCE (For LLM Reference & Future API Integration)
 # ============================================================
 
@@ -655,39 +508,3 @@ def get_market_data_summary(portfolio: str = "Income Wheel") -> Dict:
         }
     
     return summary
-
-
-# ─────────────────────────────────────────────
-# DAILY CIO REPORT PERSISTENCE
-# ─────────────────────────────────────────────
-
-DAILY_REPORT_FILE = Path(__file__).parent / "data" / "daily_report.json"
-
-
-def save_daily_report(report_data: dict) -> None:
-    """
-    Save the generated CIO daily report to disk.
-    report_data keys: markdown, generated_at, portfolio, model
-    """
-    try:
-        DAILY_REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(DAILY_REPORT_FILE, 'w', encoding='utf-8') as f:
-            json.dump(report_data, f, indent=2, ensure_ascii=False)
-        logger.info("Daily report saved to %s", DAILY_REPORT_FILE)
-    except Exception as e:
-        logger.error("Failed to save daily report: %s", e)
-
-
-def load_daily_report() -> Optional[dict]:
-    """
-    Load the last saved CIO daily report from disk.
-    Returns None if no report has been saved yet.
-    """
-    if not DAILY_REPORT_FILE.exists():
-        return None
-    try:
-        with open(DAILY_REPORT_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error("Failed to load daily report: %s", e)
-        return None
