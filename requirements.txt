@@ -13,3 +13,4 @@ gspread>=6.0.0
 google-auth>=2.0.0
 setuptools>=70.0.0
 tigeropen>=3.5.0
+mcp>=1.0.0

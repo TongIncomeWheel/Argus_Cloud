@@ -67,6 +67,11 @@ Branch: pre-pilot-stable  ← legacy snapshot before Tiger API rebuild
 │    ├── iv_scanner.py    IV Rank via realized vol proxy        │
 │    └── stress.py        stress test via BS reprice            │
 │                                                               │
+│  mcp_servers/                                                  │
+│    └── tiger/                                                  │
+│      ├── server.py      FastMCP server — 12 read-only tools    │
+│      └── auth.py        bootstrap config from TIGER_* env vars │
+│                                                               │
 │  persistence.py     settings (local JSON + gSheet canonical)  │
 │  gsheet_handler.py  gspread CRUD for Google Sheets            │
 │  config.py          paths, secrets, constants                 │
@@ -402,6 +407,9 @@ Full plan exists at `C:\Users\ashtz\.claude\plans\hidden-dancing-avalanche.md`:
 | `tiger_api/rolls.py` | ~175 | Active, roll tracker |
 | `tiger_api/iv_scanner.py` | ~95 | Active, IV rank scanner |
 | `tiger_api/stress.py` | ~135 | Active, stress tester |
+| `mcp_servers/tiger/server.py` | ~220 | Active, Tiger MCP server (read-only) |
+| `mcp_servers/tiger/auth.py` | ~75 | Active, env-var → .properties bootstrap |
+| `.mcp.json` | ~6 | Active, declares the tiger MCP server |
 | `persistence.py` | ~695 | Active, settings persistence |
 | `gsheet_handler.py` | ~500 | Active, gSheet CRUD |
 | `config.py` | ~65 | Active, config/secrets |
