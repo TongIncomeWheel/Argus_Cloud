@@ -31,10 +31,17 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from mcp.server.auth.settings import AuthSettings
+from mcp.server.auth.settings import (
+    AuthSettings,
+    ClientRegistrationOptions,
+    RevocationOptions,
+)
 from mcp.server.fastmcp import FastMCP
 
 from mcp_servers.tiger.auth import BearerTokenVerifier, bootstrap_from_env
+from mcp_servers.tiger.oauth.consent import make_consent_routes
+from mcp_servers.tiger.oauth.provider import TigerOAuthProvider
+from mcp_servers.tiger.oauth.storage import InMemoryStorage
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("tiger-mcp")
@@ -43,11 +50,18 @@ bootstrap_from_env()
 
 
 def _build_server() -> FastMCP:
-    """Configure FastMCP with bearer auth iff MCP_BEARER_TOKEN is set.
+    """Build FastMCP with the right auth mode for the runtime config.
 
-    Without a token, the server runs unauthenticated — only safe for stdio
-    transport (process-local, spawned by Claude Code) or for local
-    development against a private SSE port.
+    Three modes, picked by env vars present:
+
+    1. MCP_OAUTH_OWNER_PASSWORD set  →  full OAuth 2.1 + PKCE + DCR. Required
+       for Claude.ai consumer Custom Connectors. The owner password gates
+       the consent step inside the OAuth flow.
+    2. MCP_BEARER_TOKEN set          →  static bearer-only gate. Suitable
+       for Claude Code over HTTP (which lets you set a header) but not for
+       the Claude consumer app.
+    3. Neither set                   →  unauthenticated. Only safe for
+       stdio transport (process-local, spawned by Claude Code).
     """
     name = "tiger"
     instructions = (
@@ -59,13 +73,41 @@ def _build_server() -> FastMCP:
     # MCP_PORT first (explicit), then PORT (Cloud Run / Heroku convention),
     # then 8080 (Cloud Run default).
     port = int(os.environ.get("MCP_PORT") or os.environ.get("PORT") or "8080")
+    base_url = os.environ.get("MCP_BASE_URL", f"http://{host}:{port}")
+
+    if os.environ.get("MCP_OAUTH_OWNER_PASSWORD", "").strip():
+        logger.info("Building FastMCP with OAuth 2.1 + PKCE + DCR")
+        storage = InMemoryStorage()
+        provider = TigerOAuthProvider(storage, base_url)
+        mcp_instance = FastMCP(
+            name,
+            instructions=instructions,
+            host=host,
+            port=port,
+            auth_server_provider=provider,
+            auth=AuthSettings(
+                issuer_url=base_url,
+                resource_server_url=base_url,
+                required_scopes=["tiger:read"],
+                client_registration_options=ClientRegistrationOptions(
+                    enabled=True,
+                    valid_scopes=["tiger:read"],
+                    default_scopes=["tiger:read"],
+                ),
+                revocation_options=RevocationOptions(enabled=True),
+            ),
+        )
+        render, handle = make_consent_routes(provider)
+        mcp_instance.custom_route("/consent", methods=["GET"])(render)
+        mcp_instance.custom_route("/consent", methods=["POST"])(handle)
+        return mcp_instance
 
     bearer = os.environ.get("MCP_BEARER_TOKEN", "").strip()
     if not bearer:
         logger.warning("MCP_BEARER_TOKEN not set — HTTP transport will be UNAUTHENTICATED")
         return FastMCP(name, instructions=instructions, host=host, port=port)
 
-    base_url = os.environ.get("MCP_BASE_URL", f"http://{host}:{port}")
+    logger.info("Building FastMCP with static bearer auth")
     return FastMCP(
         name,
         instructions=instructions,
