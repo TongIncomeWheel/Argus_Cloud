@@ -118,5 +118,80 @@ class ServerToolRegistrationTests(unittest.TestCase):
         self.assertFalse(missing, f"Missing tools: {missing}")
 
 
+class BuildServerTests(unittest.TestCase):
+    """_build_server() switches auth wiring based on env vars."""
+
+    def setUp(self) -> None:
+        # Save and restore env; nuke MCP_* between tests.
+        self._saved = {k: os.environ.get(k) for k in (
+            "MCP_BEARER_TOKEN", "MCP_BASE_URL", "MCP_HOST", "MCP_PORT",
+        )}
+        for k in self._saved:
+            os.environ.pop(k, None)
+
+    def tearDown(self) -> None:
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_no_bearer_token_builds_unauthenticated_server(self) -> None:
+        from mcp_servers.tiger.server import _build_server
+        m = _build_server()
+        self.assertEqual(m.name, "tiger")
+        # No auth settings → settings.auth is None
+        self.assertIsNone(m.settings.auth)
+
+    def test_bearer_token_wires_auth_settings(self) -> None:
+        os.environ["MCP_BEARER_TOKEN"] = "s3cret"
+        os.environ["MCP_BASE_URL"] = "https://argus-tiger-mcp.fly.dev"
+        from mcp_servers.tiger.server import _build_server
+        m = _build_server()
+        self.assertIsNotNone(m.settings.auth)
+        self.assertEqual(str(m.settings.auth.issuer_url), "https://argus-tiger-mcp.fly.dev/")
+        self.assertIn("tiger:read", m.settings.auth.required_scopes or [])
+
+
+class BearerTokenVerifierTests(unittest.TestCase):
+    def test_correct_token_returns_access_token(self) -> None:
+        from mcp_servers.tiger.auth import BearerTokenVerifier
+
+        v = BearerTokenVerifier("s3cret")
+        result = asyncio.run(v.verify_token("s3cret"))
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.token, "s3cret")
+        self.assertEqual(result.client_id, "argus-tiger-mcp")
+        self.assertIn("tiger:read", result.scopes)
+
+    def test_wrong_token_returns_none(self) -> None:
+        from mcp_servers.tiger.auth import BearerTokenVerifier
+
+        v = BearerTokenVerifier("s3cret")
+        self.assertIsNone(asyncio.run(v.verify_token("wrong")))
+
+    def test_empty_token_returns_none(self) -> None:
+        from mcp_servers.tiger.auth import BearerTokenVerifier
+
+        v = BearerTokenVerifier("s3cret")
+        self.assertIsNone(asyncio.run(v.verify_token("")))
+
+    def test_empty_expected_rejected_at_construction(self) -> None:
+        from mcp_servers.tiger.auth import BearerTokenVerifier
+
+        with self.assertRaises(ValueError):
+            BearerTokenVerifier("")
+
+    def test_constant_time_compare_used(self) -> None:
+        """Same-length wrong tokens are still rejected — guards against the
+        regression of switching to a plain == compare that short-circuits."""
+        from mcp_servers.tiger.auth import BearerTokenVerifier
+
+        v = BearerTokenVerifier("abcdef")
+        self.assertIsNone(asyncio.run(v.verify_token("abcdeg")))
+        self.assertIsNone(asyncio.run(v.verify_token("zbcdef")))
+
+
 if __name__ == "__main__":
     unittest.main()

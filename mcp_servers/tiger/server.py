@@ -1,43 +1,84 @@
 """Tiger MCP server — read-only Tiger Open API tools.
 
 Wraps `tiger_api.client.TigerClient` and exposes its read-only methods as
-MCP tools. Launched by Claude Code at session start via the project's
-.mcp.json declaration.
+MCP tools. Two transports supported via `--transport`:
 
-Tools intentionally limited to READ operations in this phase. Write
-operations (execute_roll, place_order, cancel_order) will land in a
-separate follow-up with a preview + confirmation flow.
+  stdio              — launched per-session by Claude Code via .mcp.json
+                        (default; no auth, credentials via env vars)
+  sse                — long-lived HTTP server suitable for Fly.io / Cloud Run
+                        (requires MCP_BEARER_TOKEN; clients send
+                         `Authorization: Bearer <token>` on every request)
+
+Phase 2a auth = bearer token only. Phase 2b will replace this with OAuth 2.1
+so the Claude.ai consumer Custom Connectors flow can authenticate.
+
+Tools are intentionally read-only here. Write operations (execute_roll,
+place_order, cancel_order) will land in a separate follow-up with a
+preview + confirmation gate.
 """
 from __future__ import annotations
 
+import argparse
 import logging
+import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 # Make the repo root importable when launched as `python -m mcp_servers.tiger.server`
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 
-from mcp_servers.tiger.auth import bootstrap_from_env
+from mcp_servers.tiger.auth import BearerTokenVerifier, bootstrap_from_env
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("tiger-mcp")
 
 bootstrap_from_env()
 
-mcp = FastMCP(
-    "tiger",
-    instructions=(
+
+def _build_server() -> FastMCP:
+    """Configure FastMCP with bearer auth iff MCP_BEARER_TOKEN is set.
+
+    Without a token, the server runs unauthenticated — only safe for stdio
+    transport (process-local, spawned by Claude Code) or for local
+    development against a private SSE port.
+    """
+    name = "tiger"
+    instructions = (
         "Read-only access to the user's Tiger Brokers account via the official "
         "tigeropen SDK. Use these tools to inspect positions, orders, funding, "
         "and NAV history. No order placement, modification, or cancellation."
-    ),
-)
+    )
+    host = os.environ.get("MCP_HOST", "0.0.0.0")
+    port = int(os.environ.get("MCP_PORT", "8000"))
+
+    bearer = os.environ.get("MCP_BEARER_TOKEN", "").strip()
+    if not bearer:
+        logger.warning("MCP_BEARER_TOKEN not set — HTTP transport will be UNAUTHENTICATED")
+        return FastMCP(name, instructions=instructions, host=host, port=port)
+
+    base_url = os.environ.get("MCP_BASE_URL", f"http://{host}:{port}")
+    return FastMCP(
+        name,
+        instructions=instructions,
+        host=host,
+        port=port,
+        token_verifier=BearerTokenVerifier(bearer),
+        auth=AuthSettings(
+            issuer_url=base_url,
+            resource_server_url=base_url,
+            required_scopes=["tiger:read"],
+        ),
+    )
+
+
+mcp = _build_server()
 
 _client = None
 
@@ -233,7 +274,19 @@ def get_nav_history(days: int = 30) -> dict:
 
 
 def main() -> None:
-    mcp.run(transport="stdio")
+    parser = argparse.ArgumentParser(
+        prog="mcp_servers.tiger.server",
+        description="Tiger MCP server — read-only Tiger Brokers tools.",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "streamable-http"],
+        default=os.environ.get("MCP_TRANSPORT", "stdio"),
+        help="MCP transport (default: stdio; sse/streamable-http for hosted use)",
+    )
+    args = parser.parse_args()
+    logger.info("Starting tiger MCP server on transport=%s", args.transport)
+    mcp.run(transport=args.transport)
 
 
 if __name__ == "__main__":

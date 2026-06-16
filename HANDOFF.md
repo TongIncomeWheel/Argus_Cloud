@@ -69,8 +69,10 @@ Branch: pre-pilot-stable  ← legacy snapshot before Tiger API rebuild
 │                                                               │
 │  mcp_servers/                                                  │
 │    └── tiger/                                                  │
-│      ├── server.py      FastMCP server — 12 read-only tools    │
-│      └── auth.py        bootstrap config from TIGER_* env vars │
+│      ├── server.py      FastMCP — 12 read-only tools           │
+│      │                  --transport stdio|sse|streamable-http  │
+│      ├── auth.py        env-var bootstrap + BearerTokenVerifier│
+│      └── deploy/        Fly.io Dockerfile + fly.toml + README  │
 │                                                               │
 │  persistence.py     settings (local JSON + gSheet canonical)  │
 │  gsheet_handler.py  gspread CRUD for Google Sheets            │
@@ -407,9 +409,10 @@ Full plan exists at `C:\Users\ashtz\.claude\plans\hidden-dancing-avalanche.md`:
 | `tiger_api/rolls.py` | ~175 | Active, roll tracker |
 | `tiger_api/iv_scanner.py` | ~95 | Active, IV rank scanner |
 | `tiger_api/stress.py` | ~135 | Active, stress tester |
-| `mcp_servers/tiger/server.py` | ~220 | Active, Tiger MCP server (read-only) |
-| `mcp_servers/tiger/auth.py` | ~75 | Active, env-var → .properties bootstrap |
-| `.mcp.json` | ~6 | Active, declares the tiger MCP server |
+| `mcp_servers/tiger/server.py` | ~260 | Active, Tiger MCP server (stdio + SSE) |
+| `mcp_servers/tiger/auth.py` | ~120 | Active, env-var bootstrap + bearer verifier |
+| `mcp_servers/tiger/deploy/` | ~170 | Active, Fly.io deploy artifacts |
+| `.mcp.json` | ~6 | Active, declares the stdio tiger MCP server |
 | `persistence.py` | ~695 | Active, settings persistence |
 | `gsheet_handler.py` | ~500 | Active, gSheet CRUD |
 | `config.py` | ~65 | Active, config/secrets |
