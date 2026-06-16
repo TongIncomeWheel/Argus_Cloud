@@ -1,0 +1,6 @@
+# Minimal deps for the hosted MCP server. Keeps the deploy image small —
+# excludes streamlit, plotly, gspread, alpaca-py, yfinance, etc. that only the
+# Argus UI needs.
+tigeropen>=3.5.0
+mcp>=1.0.0
+pandas>=2.0.0
