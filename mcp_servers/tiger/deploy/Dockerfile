@@ -1,8 +1,11 @@
-# Tiger MCP server image — runs the SSE transport for Fly.io / Cloud Run.
+# Tiger MCP server image — runs the SSE transport for Google Cloud Run.
 #
-# Build context expects the repo root as build context (so tiger_api/ and
-# requirements.txt are accessible). From the repo root:
+# Build context is the repo root (so tiger_api/ is accessible). From the
+# repo root:
 #   docker build -f mcp_servers/tiger/deploy/Dockerfile -t tiger-mcp .
+#
+# Cloud Run sets the PORT env var to 8080 by default; the server reads
+# either MCP_PORT or PORT.
 
 FROM python:3.11-slim
 
@@ -13,22 +16,22 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Install runtime deps. We deliberately do NOT install streamlit/plotly etc.
-# from the full requirements.txt — the MCP server only needs the Tiger SDK,
-# the MCP SDK, and pandas (used by funding history).
+# Install only what the MCP server needs — not the full Argus
+# requirements.txt (no streamlit/plotly/gspread/alpaca-py/yfinance).
 COPY mcp_servers/tiger/deploy/requirements-mcp.txt /tmp/req.txt
 RUN pip install -r /tmp/req.txt
 
-# Copy only what the MCP server needs to keep the image small.
+# Copy the bits we actually run.
 COPY tiger_api ./tiger_api
 COPY mcp_servers ./mcp_servers
 
 ENV MCP_TRANSPORT=sse \
     MCP_HOST=0.0.0.0 \
-    MCP_PORT=8000
+    PORT=8080
 
-EXPOSE 8000
+EXPOSE 8080
 
-# Fly.io healthchecks hit "/sse" on FastMCP's SSE transport. No special
-# entrypoint needed — the server logs its bind address on startup.
+# Cloud Run probes "/" by default; FastMCP's SSE transport responds on
+# /sse. No custom healthcheck needed — Cloud Run treats any 2xx-or-3xx
+# on /sse as healthy when --no-cpu-throttling is on.
 CMD ["python", "-m", "mcp_servers.tiger.server", "--transport", "sse"]

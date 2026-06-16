@@ -56,7 +56,9 @@ def _build_server() -> FastMCP:
         "and NAV history. No order placement, modification, or cancellation."
     )
     host = os.environ.get("MCP_HOST", "0.0.0.0")
-    port = int(os.environ.get("MCP_PORT", "8000"))
+    # MCP_PORT first (explicit), then PORT (Cloud Run / Heroku convention),
+    # then 8080 (Cloud Run default).
+    port = int(os.environ.get("MCP_PORT") or os.environ.get("PORT") or "8080")
 
     bearer = os.environ.get("MCP_BEARER_TOKEN", "").strip()
     if not bearer:
