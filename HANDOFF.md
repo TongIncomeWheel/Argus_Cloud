@@ -71,7 +71,12 @@ Branch: pre-pilot-stable  ← legacy snapshot before Tiger API rebuild
 │    └── tiger/                                                  │
 │      ├── server.py      FastMCP — 12 read-only tools           │
 │      │                  --transport stdio|sse|streamable-http  │
+│      │                  3 auth modes: none / bearer / OAuth    │
 │      ├── auth.py        env-var bootstrap + BearerTokenVerifier│
+│      ├── oauth/         OAuth 2.1 + PKCE + DCR provider        │
+│      │   ├── provider.py  AS implementation (token lifecycle)  │
+│      │   ├── storage.py   in-memory state                      │
+│      │   └── consent.py   password-gated consent page          │
 │      └── deploy/        Cloud Run Dockerfile + yaml + README   │
 │                                                               │
 │  persistence.py     settings (local JSON + gSheet canonical)  │
