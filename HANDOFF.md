@@ -69,9 +69,10 @@ Branch: pre-pilot-stable  ← legacy snapshot before Tiger API rebuild
 │                                                               │
 │  mcp_servers/                                                  │
 │    └── tiger/                                                  │
-│      ├── server.py      FastMCP — 12 read-only tools           │
+│      ├── server.py      FastMCP — 12 read + 3 write tools      │
 │      │                  --transport stdio|sse|streamable-http  │
 │      │                  3 auth modes: none / bearer / OAuth    │
+│      │                  writes preview by default              │
 │      ├── auth.py        env-var bootstrap + BearerTokenVerifier│
 │      ├── oauth/         OAuth 2.1 + PKCE + DCR provider        │
 │      │   ├── provider.py  AS implementation (token lifecycle)  │

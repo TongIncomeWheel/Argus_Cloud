@@ -104,6 +104,10 @@ class ServerToolRegistrationTests(unittest.TestCase):
         "get_funding_history",
         "get_spot_prices",
         "get_nav_history",
+        # Phase 2c write tools
+        "place_option_order",
+        "cancel_order",
+        "execute_roll",
     }
 
     def test_expected_tools_registered(self) -> None:
@@ -116,6 +120,78 @@ class ServerToolRegistrationTests(unittest.TestCase):
         registered = asyncio.run(gather_names())
         missing = self.EXPECTED - registered
         self.assertFalse(missing, f"Missing tools: {missing}")
+
+
+class WriteToolPreviewGateTests(unittest.TestCase):
+    """confirm=False MUST NOT touch the TigerClient.
+
+    A real Tiger call would either fail (no credentials in this env) or place
+    a live order. Neither is acceptable for a preview, so we set _client to a
+    sentinel that explodes loudly if any method is called.
+    """
+
+    def setUp(self) -> None:
+        from mcp_servers.tiger import server
+
+        class _Boom:
+            def __getattr__(self, name):
+                raise AssertionError(f"TigerClient.{name} called during preview — preview gate broken")
+
+        # Save current state
+        self._prev_client = server._client
+        server._client = _Boom()  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        from mcp_servers.tiger import server
+        server._client = self._prev_client  # type: ignore[assignment]
+
+    def test_place_option_order_preview_returns_spec_no_client_call(self) -> None:
+        from mcp_servers.tiger.server import place_option_order
+        result = place_option_order(
+            symbol="MSTR", expiry="2026-07-18", strike=250.0, right="PUT",
+            side="SELL_TO_OPEN", quantity=2, limit_price=5.50,
+        )
+        self.assertTrue(result["preview"])
+        self.assertFalse(result["placed"])
+        self.assertEqual(result["spec"]["symbol"], "MSTR")
+        self.assertEqual(result["spec"]["quantity"], 2)
+        self.assertEqual(result["spec"]["premium_per_contract_usd"], 550.0)
+        self.assertEqual(result["spec"]["total_premium_usd"], 1100.0)
+        self.assertIn("SELL_TO_OPEN 2x MSTR", result["summary"])
+
+    def test_cancel_order_preview_returns_spec_no_client_call(self) -> None:
+        from mcp_servers.tiger.server import cancel_order
+        result = cancel_order(order_id="ABC123")
+        self.assertTrue(result["preview"])
+        self.assertFalse(result["placed"])
+        self.assertEqual(result["spec"]["order_id"], "ABC123")
+
+    def test_execute_roll_preview_returns_spec_no_client_call(self) -> None:
+        from mcp_servers.tiger.server import execute_roll
+        result = execute_roll(
+            symbol="MSTR",
+            close_expiry="2026-07-18", close_strike=250.0, close_right="PUT",
+            new_expiry="2026-08-15", new_strike=240.0,
+            quantity=1, net_credit_limit=1.25,
+        )
+        self.assertTrue(result["preview"])
+        self.assertFalse(result["placed"])
+        self.assertEqual(result["spec"]["close_leg"]["side"], "BUY_TO_CLOSE")
+        self.assertEqual(result["spec"]["open_leg"]["side"], "SELL_TO_OPEN")
+        self.assertEqual(result["spec"]["net_credit_limit_total_usd"], 125.0)
+        self.assertIn("credit", result["summary"])
+
+    def test_execute_roll_preview_negative_credit_is_debit(self) -> None:
+        from mcp_servers.tiger.server import execute_roll
+        result = execute_roll(
+            symbol="MSTR",
+            close_expiry="2026-07-18", close_strike=250.0, close_right="PUT",
+            new_expiry="2026-08-15", new_strike=260.0,
+            quantity=1, net_credit_limit=-0.50,
+        )
+        self.assertTrue(result["preview"])
+        self.assertIn("debit", result["summary"])
+        self.assertEqual(result["spec"]["net_credit_limit_per_contract_usd"], -0.50)
 
 
 class BuildServerTests(unittest.TestCase):

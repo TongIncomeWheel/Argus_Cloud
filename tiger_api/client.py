@@ -1,12 +1,15 @@
-"""TigerClient — read-only wrapper around tigeropen SDK.
+"""TigerClient — wrapper around tigeropen SDK.
 
 Single entry point for ARGUS to call Tiger Open API. Handles:
 - Auth from .streamlit/tiger_openapi_config.properties (or path from $TIGER_CONFIG_PATH)
-- Read-only fetches: account assets, stock + option positions, filled orders, funding
+- Read fetches: account assets, stock + option positions, filled orders, funding
+- Write operations: place / cancel option orders, execute combo rolls
 - Lazy client init (so importing this module doesn't hit the network)
 - Defensive error handling with clear messages
 
-This module NEVER places, modifies, or cancels orders. Read-only by design.
+Write operations were added in Phase 2c for the MCP server. They are still
+exposed only through the MCP server's preview-then-confirm tools — the
+Streamlit Argus app continues to use read-only flows.
 """
 from __future__ import annotations
 
@@ -480,3 +483,197 @@ class TigerClient:
         except Exception as e:
             logger.warning("get_nav_history failed: %s", e)
             return {}
+
+    # ── WRITE OPERATIONS (Phase 2c) ──────────────────────────────
+    #
+    # These methods place / cancel real orders against the configured
+    # Tiger account. Callers MUST gate user intent before calling — the
+    # MCP server tools wrap each one behind a preview-then-confirm
+    # interaction. Argus's Streamlit UI does not call any of these.
+    #
+    # All methods raise on hard errors and log the raw SDK response so
+    # production logs capture the audit trail.
+
+    def place_option_order(
+        self,
+        symbol: str,
+        expiry: str,            # YYYY-MM-DD
+        strike: float,
+        right: str,             # "PUT" | "CALL"
+        side: str,              # "SELL_TO_OPEN" | "BUY_TO_CLOSE" | "BUY_TO_OPEN" | "SELL_TO_CLOSE"
+        quantity: int,
+        limit_price: float,
+        time_in_force: str = "DAY",  # "DAY" | "GTC"
+    ) -> dict:
+        """Submit a single-leg option order with a limit price.
+
+        Returns the placed order's id and status as a dict.
+        """
+        from tigeropen.common.consts import OrderType
+        from tigeropen.common.util.contract_utils import option_contract
+        from tigeropen.common.util.order_utils import limit_order
+
+        action, open_close = _split_side(side)
+        right_norm = right.strip().upper()
+        if right_norm not in ("PUT", "CALL"):
+            raise ValueError(f"right must be PUT or CALL, got {right!r}")
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+        if limit_price <= 0:
+            raise ValueError(f"limit_price must be > 0, got {limit_price}")
+        tif = time_in_force.strip().upper()
+        if tif not in ("DAY", "GTC"):
+            raise ValueError(f"time_in_force must be DAY or GTC, got {time_in_force!r}")
+
+        contract = option_contract(
+            symbol=symbol.strip().upper(),
+            expiry=_tiger_expiry(expiry),
+            strike=float(strike),
+            put_call=right_norm,
+            currency="USD",
+        )
+        order = limit_order(
+            account=self._account,
+            contract=contract,
+            action=action,
+            quantity=int(quantity),
+            limit_price=float(limit_price),
+        )
+        # Tiger SDK fields not exposed via limit_order() helper
+        order.time_in_force = tif
+        if open_close is not None:
+            order.open_close = open_close  # e.g. "OPEN" / "CLOSE"
+
+        logger.info(
+            "place_option_order: %s %s %s %s%s exp=%s qty=%s @ %s %s",
+            self._account, side, symbol, right_norm, strike, expiry, quantity, limit_price, tif,
+        )
+        placed = self._trade_client.place_order(order)
+        logger.info("place_option_order placed: id=%s", getattr(order, "id", None))
+        return {
+            "order_id": getattr(order, "id", None),
+            "status": getattr(order, "status", None),
+            "placed": bool(placed),
+        }
+
+    def cancel_order(self, order_id) -> dict:
+        """Cancel a working order by id. Returns {ok, status}."""
+        logger.info("cancel_order: %s", order_id)
+        result = self._trade_client.cancel_order(account=self._account, id=order_id)
+        return {"ok": bool(result), "order_id": order_id}
+
+    def execute_combo_roll(
+        self,
+        symbol: str,
+        close_expiry: str,      # YYYY-MM-DD
+        close_strike: float,
+        close_right: str,       # "PUT" | "CALL"
+        new_expiry: str,        # YYYY-MM-DD
+        new_strike: float,
+        quantity: int,
+        net_credit_limit: float,  # POSITIVE = receive net credit; NEGATIVE = pay net debit
+        time_in_force: str = "DAY",
+    ) -> dict:
+        """Atomic two-leg combo: BUY_TO_CLOSE the existing short option leg and
+        SELL_TO_OPEN a replacement at a different strike/expiry. Same underlying
+        and same right (PUT or CALL) on both legs.
+
+        `net_credit_limit > 0` requires receiving at least that net credit per
+        contract on fill; `< 0` accepts paying that as a net debit.
+        """
+        from tigeropen.common.util.contract_utils import option_contract
+        from tigeropen.common.util.order_utils import limit_order
+
+        right_norm = close_right.strip().upper()
+        if right_norm not in ("PUT", "CALL"):
+            raise ValueError(f"right must be PUT or CALL, got {close_right!r}")
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+
+        sym = symbol.strip().upper()
+        close_leg = option_contract(
+            symbol=sym, expiry=_tiger_expiry(close_expiry),
+            strike=float(close_strike), put_call=right_norm, currency="USD",
+        )
+        open_leg = option_contract(
+            symbol=sym, expiry=_tiger_expiry(new_expiry),
+            strike=float(new_strike), put_call=right_norm, currency="USD",
+        )
+
+        # Tiger MLEG combo: build a combo contract with both legs and one
+        # net limit order. Net credit is expressed by the action+price sign
+        # convention used by tigeropen — we route credits via a SELL action
+        # on the combo with a positive premium, debits via BUY with positive.
+        try:
+            from tigeropen.common.util.contract_utils import combo_contract
+        except ImportError as e:
+            raise RuntimeError(
+                "tigeropen build does not expose combo_contract — combo "
+                "rolls require tigeropen with multi-leg support. Upgrade or "
+                "switch to two sequential single-leg orders."
+            ) from e
+
+        if net_credit_limit >= 0:
+            combo_action, combo_price = "SELL", float(net_credit_limit)
+        else:
+            combo_action, combo_price = "BUY", float(-net_credit_limit)
+
+        combo = combo_contract(
+            symbol=sym,
+            contract_legs=[
+                {"contract": close_leg, "action": "BUY",  "ratio": 1},
+                {"contract": open_leg,  "action": "SELL", "ratio": 1},
+            ],
+        )
+        order = limit_order(
+            account=self._account,
+            contract=combo,
+            action=combo_action,
+            quantity=int(quantity),
+            limit_price=combo_price,
+        )
+        order.time_in_force = time_in_force.strip().upper()
+
+        logger.info(
+            "execute_combo_roll: %s %s close %s@%s exp=%s -> open %s@%s exp=%s qty=%s net_limit=%s",
+            self._account, sym, right_norm, close_strike, close_expiry,
+            right_norm, new_strike, new_expiry, quantity, net_credit_limit,
+        )
+        placed = self._trade_client.place_order(order)
+        logger.info("execute_combo_roll placed: id=%s", getattr(order, "id", None))
+        return {
+            "order_id": getattr(order, "id", None),
+            "status": getattr(order, "status", None),
+            "placed": bool(placed),
+            "net_limit_per_contract": net_credit_limit,
+        }
+
+
+_SIDE_MAP = {
+    "SELL_TO_OPEN":  ("SELL", "OPEN"),
+    "BUY_TO_OPEN":   ("BUY",  "OPEN"),
+    "SELL_TO_CLOSE": ("SELL", "CLOSE"),
+    "BUY_TO_CLOSE":  ("BUY",  "CLOSE"),
+}
+
+
+def _split_side(side: str) -> tuple[str, str | None]:
+    s = side.strip().upper().replace(" ", "_").replace("-", "_")
+    if s in _SIDE_MAP:
+        return _SIDE_MAP[s]
+    if s in ("BUY", "SELL"):
+        return s, None
+    raise ValueError(
+        f"side must be one of {sorted(_SIDE_MAP)} (or BUY/SELL), got {side!r}"
+    )
+
+
+def _tiger_expiry(iso_date: str) -> str:
+    """Convert ISO YYYY-MM-DD to Tiger's YYYYMMDD expiry string."""
+    s = iso_date.strip()
+    if "-" in s:
+        y, m, d = s.split("-")
+        return f"{y}{m.zfill(2)}{d.zfill(2)}"
+    if len(s) == 8 and s.isdigit():
+        return s
+    raise ValueError(f"expiry must be YYYY-MM-DD or YYYYMMDD, got {iso_date!r}")
