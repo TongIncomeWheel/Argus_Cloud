@@ -254,6 +254,64 @@ class OptionIdentifierTests(unittest.TestCase):
         self.assertEqual(result, ["MSTR  260718P00250000"])
 
 
+class FractionalSharePositionTests(unittest.TestCase):
+    """Tiger reports some fractional-share positions with quantity scaled by 1e5.
+    The position dict normalizer detects the mismatch with market_value and
+    substitutes the value/price-derived quantity."""
+
+    class _FakeContract:
+        symbol = "NVDA"
+        sec_type = "STK"
+        right = None
+        strike = None
+        expiry = None
+        currency = "USD"
+
+    class _FakeFractionalPos:
+        contract = None
+        quantity = 45155        # Tiger's scaled-integer report
+        market_price = 207.32
+        market_value = 93.62    # Implies 0.45155 actual shares
+        average_cost = 0.0
+        unrealized_pnl = None
+        realized_pnl = None
+
+    class _FakeWholeSharePos:
+        contract = None
+        quantity = 100
+        market_price = 50.0
+        market_value = 5000.0  # qty * price match — no normalization
+        average_cost = 45.0
+        unrealized_pnl = 500.0
+        realized_pnl = 0.0
+
+    def setUp(self) -> None:
+        ctr = self._FakeContract()
+        self.frac = self._FakeFractionalPos()
+        self.frac.contract = ctr
+        self.whole = self._FakeWholeSharePos()
+        self.whole.contract = ctr
+
+    def test_fractional_share_quantity_normalized(self) -> None:
+        from mcp_servers.tiger.server import _position_to_dict
+        row = _position_to_dict(self.frac)
+        # quantity normalized from 45155 → ~0.45155
+        self.assertAlmostEqual(row["quantity"], 0.45155, places=4)
+        # raw value preserved for audit
+        self.assertEqual(row["quantity_raw"], 45155)
+        self.assertIn("fractional", row["quantity_note"])
+        # market_value unchanged
+        self.assertEqual(row["market_value"], 93.62)
+
+    def test_whole_share_position_untouched(self) -> None:
+        from mcp_servers.tiger.server import _position_to_dict
+        row = _position_to_dict(self.whole)
+        self.assertEqual(row["quantity"], 100)
+        # No normalization → no quantity_raw or quantity_note
+        self.assertNotIn("quantity_raw", row)
+        self.assertNotIn("quantity_note", row)
+
+
 class TigerErrorTranslationTests(unittest.TestCase):
     """_wrap_tiger_error turns opaque tigeropen errors into typed exceptions
     whose message text is meaningful to the LLM consuming the tool result."""

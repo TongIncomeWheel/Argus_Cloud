@@ -181,20 +181,53 @@ def _safe_attrs(obj: Any) -> dict:
 
 def _position_to_dict(p) -> dict:
     c = getattr(p, "contract", None)
-    return {
+    qty_raw = _scalar(getattr(p, "quantity", 0))
+    mkt_price = _scalar(getattr(p, "market_price", None))
+    mkt_value = _scalar(getattr(p, "market_value", None))
+    quantity = qty_raw
+    quantity_scaling_note = None
+
+    # Detect Tiger's fractional-share quirk: NVDA-style positions where
+    # `quantity` is returned as an integer scaled by 1e5 (or similar)
+    # rather than the true fractional shares. Symptom: qty * mkt_price
+    # is orders of magnitude larger than mkt_value. When we detect that,
+    # prefer the value/price-derived quantity.
+    try:
+        if (qty_raw is not None and mkt_price not in (None, 0)
+                and mkt_value not in (None, 0)):
+            qty_implied = float(mkt_value) / float(mkt_price)
+            qty_stated = float(qty_raw) * float(mkt_price)
+            if abs(qty_stated) > 0 and abs(qty_implied) > 0:
+                # If the stated qty*price is 1000x or more vs market value,
+                # the SDK is reporting a scaled integer. Substitute.
+                if abs(qty_stated) >= 1000 * abs(float(mkt_value)):
+                    quantity = qty_implied
+                    quantity_scaling_note = (
+                        f"Tiger reported quantity={qty_raw} but market_value "
+                        f"implies {qty_implied:.6f} actual shares — fractional "
+                        f"share scaling normalized."
+                    )
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+
+    out = {
         "symbol": getattr(c, "symbol", "") if c else "",
         "sec_type": getattr(c, "sec_type", "") if c else "",
         "right": getattr(c, "right", None) if c else None,
         "strike": getattr(c, "strike", None) if c else None,
         "expiry": getattr(c, "expiry", None) if c else None,
         "currency": getattr(c, "currency", "USD") if c else "USD",
-        "quantity": _scalar(getattr(p, "quantity", 0)),
+        "quantity": quantity,
         "avg_cost": _scalar(getattr(p, "average_cost", None)),
-        "market_price": _scalar(getattr(p, "market_price", None)),
-        "market_value": _scalar(getattr(p, "market_value", None)),
+        "market_price": mkt_price,
+        "market_value": mkt_value,
         "unrealized_pnl": _scalar(getattr(p, "unrealized_pnl", None)),
         "realized_pnl": _scalar(getattr(p, "realized_pnl", None)),
     }
+    if quantity_scaling_note is not None:
+        out["quantity_raw"] = qty_raw
+        out["quantity_note"] = quantity_scaling_note
+    return out
 
 
 def _order_to_dict(o) -> dict:
