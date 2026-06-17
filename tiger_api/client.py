@@ -689,12 +689,11 @@ class TigerClient:
         symbols = sorted({str(s).strip().upper() for s in symbols if s})
         if not symbols:
             return {}
+        qc = self._quote_client()
         try:
-            qc = self._quote_client()
             df = qc.get_option_expirations(symbols=symbols)
         except Exception as e:
-            logger.warning("get_option_expirations failed: %s", e)
-            return {}
+            raise _wrap_tiger_error("get_option_expirations", e, hint=f"symbols={symbols}")
         return _expirations_to_dict(df)
 
     def get_option_chain(
@@ -705,66 +704,64 @@ class TigerClient:
     ) -> list[dict]:
         """Full option chain for one underlying + expiry.
 
-        Returns a list of dicts, one per contract, with strike / right /
-        bid / ask / volume / open_interest, and Greeks (delta, gamma,
-        theta, vega, rho, implied_vol) when include_greeks=True.
+        Tiger-only. Raises a clear exception if Tiger refuses (e.g. account
+        lacks US market data permission). The MCP layer surfaces the
+        exception text to the LLM so the failure mode is never silently
+        empty.
         """
         sym = symbol.strip().upper()
         tiger_expiry = _tiger_expiry(expiry)
+        qc = self._quote_client()
         try:
-            qc = self._quote_client()
             df = qc.get_option_chain(
                 symbol=sym,
                 expiry=tiger_expiry,
                 return_greek_value=bool(include_greeks),
             )
         except Exception as e:
-            logger.warning("get_option_chain(%s, %s) failed: %s", sym, expiry, e)
-            return []
+            raise _wrap_tiger_error("get_option_chain", e, hint=f"symbol={sym} expiry={expiry}")
         return _option_rows_to_dicts(df)
 
     def get_option_briefs(self, contracts) -> list[dict]:
         """Real-time bid/ask/OI/HV/last for specific option contracts.
 
-        Args:
-          contracts: list[dict] each {symbol, expiry, strike, right} OR
-                     list[str] of pre-formatted Tiger option identifiers.
+        Tiger-only. Raises a clear exception on failure (never returns empty
+        for a real error).
         """
         ids = _build_option_identifiers(contracts)
         if not ids:
-            return []
+            raise ValueError(
+                "get_option_briefs: contracts list is empty or all entries "
+                "failed to convert to Tiger option identifiers."
+            )
+        qc = self._quote_client()
         try:
-            qc = self._quote_client()
             df = qc.get_option_briefs(identifiers=ids)
         except Exception as e:
-            logger.warning("get_option_briefs failed: %s", e)
-            return []
+            raise _wrap_tiger_error("get_option_briefs", e, hint=f"{len(ids)} contracts")
         return _option_rows_to_dicts(df)
 
     def get_option_greeks(self, contracts) -> list[dict]:
-        """Δ / Γ / Θ / ν / ρ + IV per contract.
-
-        Wraps `get_option_briefs` with `return_greek_value=True` per the
-        tigeropen SDK convention.
-        """
+        """Δ / Γ / Θ / ν / ρ + IV per contract. Tiger-only."""
         ids = _build_option_identifiers(contracts)
         if not ids:
-            return []
+            raise ValueError(
+                "get_option_greeks: contracts list is empty or all entries "
+                "failed to convert to Tiger option identifiers."
+            )
+        qc = self._quote_client()
         try:
-            qc = self._quote_client()
             df = qc.get_option_briefs(identifiers=ids, return_greek_value=True)
         except Exception as e:
-            logger.warning("get_option_greeks failed: %s", e)
-            return []
+            raise _wrap_tiger_error("get_option_greeks", e, hint=f"{len(ids)} contracts")
         rows = _option_rows_to_dicts(df)
-        # Slim the response to just identifier + Greek fields so the LLM
-        # response stays focused.
         keep = {
             "symbol", "identifier", "expiry", "strike", "right", "put_call",
             "delta", "gamma", "theta", "vega", "rho", "implied_vol", "iv",
             "underlying", "underlying_symbol",
         }
-        return [{k: v for k, v in r.items() if k in keep or k.startswith("greek")} for r in rows]
+        return [{k: v for k, v in r.items() if k in keep or k.startswith("greek")}
+                for r in rows]
 
     def get_option_bars(
         self,
@@ -772,46 +769,48 @@ class TigerClient:
         period: str = "day",   # "day" | "week" | "month" | "1min" | "5min" | "15min" | "30min" | "60min"
         limit: int = 60,
     ) -> dict:
-        """OHLC bars per option contract. Returns {identifier: [bar_dict, ...]}."""
+        """OHLC bars per option contract. Tiger-only — raises on failure."""
         ids = _build_option_identifiers(contracts)
         if not ids:
-            return {}
+            raise ValueError(
+                "get_option_bars: contracts list is empty or all entries "
+                "failed to convert to Tiger option identifiers."
+            )
+        qc = self._quote_client()
         try:
-            qc = self._quote_client()
             df = qc.get_option_bars(identifiers=ids, period=period, limit=int(limit))
         except Exception as e:
-            logger.warning("get_option_bars failed: %s", e)
-            return {}
+            raise _wrap_tiger_error("get_option_bars", e, hint=f"{len(ids)} contracts period={period}")
         return _bars_to_dict(df)
 
     def get_option_depth(self, contracts) -> list[dict]:
-        """L2 depth per option contract — bid/ask ladder."""
+        """L2 depth per option contract — bid/ask ladder. Tiger-only."""
         ids = _build_option_identifiers(contracts)
         if not ids:
-            return []
+            raise ValueError(
+                "get_option_depth: contracts list is empty or all entries "
+                "failed to convert to Tiger option identifiers."
+            )
+        qc = self._quote_client()
         try:
-            qc = self._quote_client()
             df = qc.get_option_depth(identifiers=ids)
         except Exception as e:
-            logger.warning("get_option_depth failed: %s", e)
-            return []
+            raise _wrap_tiger_error("get_option_depth", e, hint=f"{len(ids)} contracts")
         return _option_rows_to_dicts(df)
 
     def get_option_trade_ticks(self, contracts, limit: int = 50) -> dict:
-        """Recent tick (trade) data per option contract.
-
-        Returns {identifier: [tick_dict, ...]} truncated to `limit` per
-        identifier to keep the payload bounded.
-        """
+        """Recent trade ticks per option contract. Tiger-only."""
         ids = _build_option_identifiers(contracts)
         if not ids:
-            return {}
+            raise ValueError(
+                "get_option_trade_ticks: contracts list is empty or all entries "
+                "failed to convert to Tiger option identifiers."
+            )
+        qc = self._quote_client()
         try:
-            qc = self._quote_client()
             df = qc.get_option_trade_ticks(identifiers=ids, limit=int(limit))
         except Exception as e:
-            logger.warning("get_option_trade_ticks failed: %s", e)
-            return {}
+            raise _wrap_tiger_error("get_option_trade_ticks", e, hint=f"{len(ids)} contracts")
         return _bars_to_dict(df, key_field="identifier")
 
 
@@ -1004,3 +1003,66 @@ def _tiger_expiry(iso_date: str) -> str:
     if len(s) == 8 and s.isdigit():
         return s
     raise ValueError(f"expiry must be YYYY-MM-DD or YYYYMMDD, got {iso_date!r}")
+
+
+# ── Tiger error translation ─────────────────────────────────────────────────
+#
+# Tiger SDK errors come back with code + msg patterns we can detect and
+# rewrap into clear Python exceptions whose message text is meaningful to
+# the LLM consuming the MCP tool result.
+
+
+class TigerPermissionError(PermissionError):
+    """Tiger returned 'permission denied' — typically the account lacks
+    market data permission for the requested asset class."""
+
+
+class TigerSessionError(RuntimeError):
+    """Tiger session is missing or unauthenticated (e.g. config file gone,
+    key invalid, token expired). Distinct from permission errors."""
+
+
+class TigerAPIError(RuntimeError):
+    """Catch-all for other Tiger SDK errors."""
+
+
+def _wrap_tiger_error(method_name: str, exc: Exception, hint: str = "") -> Exception:
+    """Translate a tigeropen SDK exception into a typed one with a clear
+    message the LLM (and the user) can act on.
+
+    Returned exception is meant to be `raise`-d by the caller.
+    """
+    raw = str(exc)
+    low = raw.lower()
+    suffix = f" [{hint}]" if hint else ""
+
+    if "permission denied" in low or "code=4" in low or "no permission" in low:
+        return TigerPermissionError(
+            f"Tiger API permission denied on {method_name}{suffix}. "
+            f"The Tiger account lacks the market data subscription needed "
+            f"for this call. Original Tiger error: {raw}. "
+            f"To fix: log in at tigerbrokers.com → Profile → Market Data "
+            f"and enable US Level 1/2 for OpenAPI, OR contact Tiger support "
+            f"quoting developer ID 20159040. Trade-side calls (positions, "
+            f"orders, NAV) keep working because they're account data, not "
+            f"market data."
+        )
+
+    if any(s in low for s in (
+        "config not found", "private_key", "token", "unauthorized",
+        "401", "session", "auth",
+    )):
+        return TigerSessionError(
+            f"Tiger session/auth failed on {method_name}{suffix}. "
+            f"Original error: {raw}. "
+            f"Likely causes: TIGER_* env vars not loaded into the container "
+            f"(check `gcloud run services describe argus-tiger-mcp` env), "
+            f"or the private key in Secret Manager is corrupted, or the "
+            f"Tiger config bootstrap at /tmp/argus_tiger_config/ failed at "
+            f"startup."
+        )
+
+    return TigerAPIError(
+        f"Tiger API call {method_name} failed{suffix}. "
+        f"Original Tiger error: {raw}."
+    )

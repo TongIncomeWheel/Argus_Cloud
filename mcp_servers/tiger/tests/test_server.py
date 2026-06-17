@@ -254,6 +254,35 @@ class OptionIdentifierTests(unittest.TestCase):
         self.assertEqual(result, ["MSTR  260718P00250000"])
 
 
+class TigerErrorTranslationTests(unittest.TestCase):
+    """_wrap_tiger_error turns opaque tigeropen errors into typed exceptions
+    whose message text is meaningful to the LLM consuming the tool result."""
+
+    def test_permission_denied_becomes_tiger_permission_error(self) -> None:
+        from tiger_api.client import _wrap_tiger_error, TigerPermissionError
+        raw = Exception("code=4 msg=4000:permission denied(Current user and device do not have permissions in the US market)")
+        wrapped = _wrap_tiger_error("get_option_chain", raw, hint="symbol=MSTR")
+        self.assertIsInstance(wrapped, TigerPermissionError)
+        self.assertIn("permission denied", str(wrapped).lower())
+        self.assertIn("get_option_chain", str(wrapped))
+        self.assertIn("symbol=MSTR", str(wrapped))
+        self.assertIn("Market Data", str(wrapped))  # actionable fix in message
+
+    def test_session_failure_becomes_tiger_session_error(self) -> None:
+        from tiger_api.client import _wrap_tiger_error, TigerSessionError
+        raw = Exception("Tiger config not found")
+        wrapped = _wrap_tiger_error("get_account_summary", raw)
+        self.assertIsInstance(wrapped, TigerSessionError)
+        self.assertIn("session/auth", str(wrapped).lower())
+
+    def test_unknown_error_becomes_tiger_api_error(self) -> None:
+        from tiger_api.client import _wrap_tiger_error, TigerAPIError
+        raw = Exception("unexpected SDK bug")
+        wrapped = _wrap_tiger_error("get_option_briefs", raw)
+        self.assertIsInstance(wrapped, TigerAPIError)
+        self.assertIn("get_option_briefs", str(wrapped))
+
+
 class OptionIdentifierDetectionTests(unittest.TestCase):
     """Detect OCC-shaped strings so get_spot_prices can route correctly."""
 
