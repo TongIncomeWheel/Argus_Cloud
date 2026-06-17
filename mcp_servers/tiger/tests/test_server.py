@@ -108,6 +108,14 @@ class ServerToolRegistrationTests(unittest.TestCase):
         "place_option_order",
         "cancel_order",
         "execute_roll",
+        # Phase 2d option-chain / Greeks / quotes
+        "get_option_expirations",
+        "get_option_chain",
+        "get_option_briefs",
+        "get_option_greeks",
+        "get_option_bars",
+        "get_option_depth",
+        "get_option_trade_ticks",
     }
 
     def test_expected_tools_registered(self) -> None:
@@ -192,6 +200,58 @@ class WriteToolPreviewGateTests(unittest.TestCase):
         self.assertTrue(result["preview"])
         self.assertIn("debit", result["summary"])
         self.assertEqual(result["spec"]["net_credit_limit_per_contract_usd"], -0.50)
+
+
+class OptionIdentifierTests(unittest.TestCase):
+    """Format helper is pure logic — testable without the Tiger SDK."""
+
+    def test_basic_put(self) -> None:
+        from tiger_api.client import _format_option_identifier
+        ident = _format_option_identifier("MSTR", "2026-07-18", 250.0, "PUT")
+        # Pad symbol to 6 chars + YYMMDD + P|C + strike*1000 zero-padded
+        self.assertEqual(ident, "MSTR  260718P00250000")
+
+    def test_basic_call(self) -> None:
+        from tiger_api.client import _format_option_identifier
+        ident = _format_option_identifier("AAPL", "2027-01-15", 150.0, "CALL")
+        self.assertEqual(ident, "AAPL  270115C00150000")
+
+    def test_short_form_right(self) -> None:
+        from tiger_api.client import _format_option_identifier
+        ident = _format_option_identifier("AAPL", "2027-01-15", 150.5, "P")
+        # Strike 150.50 → 150500
+        self.assertEqual(ident, "AAPL  270115P00150500")
+
+    def test_lowercase_normalized(self) -> None:
+        from tiger_api.client import _format_option_identifier
+        ident = _format_option_identifier("mstr", "2026-07-18", 250, "put")
+        self.assertEqual(ident, "MSTR  260718P00250000")
+
+    def test_invalid_right_raises(self) -> None:
+        from tiger_api.client import _format_option_identifier
+        with self.assertRaises(ValueError):
+            _format_option_identifier("MSTR", "2026-07-18", 250, "BOTH")
+
+    def test_build_identifiers_accepts_dicts_and_strings(self) -> None:
+        from tiger_api.client import _build_option_identifiers
+        result = _build_option_identifiers([
+            {"symbol": "MSTR", "expiry": "2026-07-18", "strike": 250, "right": "PUT"},
+            "AAPL  270115C00150000",  # already formatted
+            {"symbol": "AAPL", "expiry": "2027-01-15", "strike": 150, "right": "CALL"},
+        ])
+        self.assertEqual(result, [
+            "MSTR  260718P00250000",
+            "AAPL  270115C00150000",
+            "AAPL  270115C00150000",
+        ])
+
+    def test_build_identifiers_skips_incomplete_dicts(self) -> None:
+        from tiger_api.client import _build_option_identifiers
+        result = _build_option_identifiers([
+            {"symbol": "MSTR"},  # missing fields
+            {"symbol": "MSTR", "expiry": "2026-07-18", "strike": 250, "right": "PUT"},
+        ])
+        self.assertEqual(result, ["MSTR  260718P00250000"])
 
 
 class BuildServerTests(unittest.TestCase):
