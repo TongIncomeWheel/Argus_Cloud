@@ -425,16 +425,32 @@ class TigerClient:
         return self._qc
 
     def get_spot_prices(self, symbols) -> dict:
-        """Fetch current spot prices for a list of symbols.
+        """Fetch current spot prices for a list of stock symbols.
 
         Returns {symbol: price}. Tickers without a quote are silently
         omitted from the result (caller falls back to position-based proxy).
+
+        NOTE: this is for STOCK tickers only. Option contract identifiers
+        (e.g. "MSTR  260718P00250000") look like long strings of digits
+        and would be silently dropped by Tiger's stock briefs endpoint.
+        We detect that shape and route the caller to get_option_briefs
+        instead, with a structured error in the response.
         """
         if not symbols:
             return {}
         symbols = sorted({str(s).strip().upper() for s in symbols if s})
         if not symbols:
             return {}
+        # Reject obvious option identifiers — anything that has digits in
+        # the OCC-like position (chars 6-12 looking like YYMMDD) is almost
+        # certainly an option, not a stock ticker.
+        option_shaped = [s for s in symbols if _looks_like_option_identifier(s)]
+        if option_shaped:
+            raise ValueError(
+                f"get_spot_prices is for stock tickers only. Detected "
+                f"option-shaped identifiers: {option_shaped[:3]}. Use "
+                f"get_option_briefs(contracts=[...]) for option quotes."
+            )
         try:
             qc = self._quote_client()
             briefs = qc.get_briefs(symbols=symbols)
@@ -818,6 +834,28 @@ def _format_option_identifier(symbol: str, expiry: str, strike: float, right: st
     strike_int = int(round(float(strike) * 1000))
     # Pad symbol to 6 chars for OCC convention
     return f"{sym:<6}{yymmdd}{pc}{strike_int:08d}"
+
+
+def _looks_like_option_identifier(s: str) -> bool:
+    """Heuristic: does this look like an OCC-style option identifier?
+
+    OCC format is 21 chars: <6-char ticker><6 digits YYMMDD><P|C><8 digits>
+    Anything that long with mostly digits in the tail is almost certainly
+    an option, not a stock ticker (stock tickers are 1-6 chars, letters only).
+    """
+    s = s.strip()
+    if len(s) < 14:
+        return False
+    # Check if last 8 chars are all digits (the strike encoding)
+    if not s[-8:].isdigit():
+        return False
+    # And the char at -9 is P or C (put_call)
+    if s[-9].upper() not in ("P", "C"):
+        return False
+    # And 6 digits before that (YYMMDD)
+    if not s[-15:-9].isdigit():
+        return False
+    return True
 
 
 def _build_option_identifiers(contracts) -> list[str]:

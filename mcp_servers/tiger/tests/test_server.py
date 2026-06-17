@@ -254,6 +254,31 @@ class OptionIdentifierTests(unittest.TestCase):
         self.assertEqual(result, ["MSTR  260718P00250000"])
 
 
+class OptionIdentifierDetectionTests(unittest.TestCase):
+    """Detect OCC-shaped strings so get_spot_prices can route correctly."""
+
+    def test_real_option_id_detected(self) -> None:
+        from tiger_api.client import _looks_like_option_identifier
+        self.assertTrue(_looks_like_option_identifier("MSTR  260718P00250000"))
+        self.assertTrue(_looks_like_option_identifier("AAPL  270115C00150000"))
+        self.assertTrue(_looks_like_option_identifier("SPY   260620P00500000"))
+
+    def test_stock_tickers_not_option(self) -> None:
+        from tiger_api.client import _looks_like_option_identifier
+        for ticker in ("MSTR", "AAPL", "BRK.B", "GOOGL", "T", "SPY"):
+            self.assertFalse(_looks_like_option_identifier(ticker),
+                             f"{ticker!r} should not look like an option id")
+
+    def test_garbage_not_option(self) -> None:
+        from tiger_api.client import _looks_like_option_identifier
+        # Wrong put_call char
+        self.assertFalse(_looks_like_option_identifier("MSTR  260718X00250000"))
+        # Strike not all digits
+        self.assertFalse(_looks_like_option_identifier("MSTR  260718P00ABC000"))
+        # Too short
+        self.assertFalse(_looks_like_option_identifier("MSTR2607"))
+
+
 class BuildServerTests(unittest.TestCase):
     """_build_server() switches auth wiring based on env vars."""
 
