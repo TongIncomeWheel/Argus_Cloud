@@ -416,7 +416,14 @@ class TigerClient:
             logger.warning("get_segment_fund_history failed: %s", e)
             return []
 
-    # ── Quotes (spot prices) ─────────────────────────────────────
+    # ── Quotes (spot prices + option chain / Greeks / briefs / bars) ──
+    def _quote_client(self):
+        """Lazy QuoteClient — only instantiated when first needed."""
+        if not hasattr(self, "_qc") or self._qc is None:
+            from tigeropen.quote.quote_client import QuoteClient
+            self._qc = QuoteClient(self._client_config)
+        return self._qc
+
     def get_spot_prices(self, symbols) -> dict:
         """Fetch current spot prices for a list of symbols.
 
@@ -429,8 +436,7 @@ class TigerClient:
         if not symbols:
             return {}
         try:
-            from tigeropen.quote.quote_client import QuoteClient
-            qc = QuoteClient(self._client_config)
+            qc = self._quote_client()
             briefs = qc.get_briefs(symbols=symbols)
         except Exception as e:
             logger.warning("get_spot_prices failed: %s", e)
@@ -647,6 +653,289 @@ class TigerClient:
             "placed": bool(placed),
             "net_limit_per_contract": net_credit_limit,
         }
+
+
+    # ── Option chain / Greeks / quote depth (Phase 2d) ────────────
+    #
+    # All call into tigeropen.quote.QuoteClient. Returns are coerced to
+    # plain list[dict] / dict so the MCP layer can JSON-serialize without
+    # additional adapters.
+
+    def get_option_expirations(self, symbols) -> dict:
+        """Available expiry dates per underlying.
+
+        Args:
+          symbols: ticker or list of tickers (e.g. "MSTR" or ["MSTR","AAPL"])
+        Returns: {symbol: [YYYY-MM-DD, ...]}
+        """
+        if isinstance(symbols, str):
+            symbols = [symbols]
+        symbols = sorted({str(s).strip().upper() for s in symbols if s})
+        if not symbols:
+            return {}
+        try:
+            qc = self._quote_client()
+            df = qc.get_option_expirations(symbols=symbols)
+        except Exception as e:
+            logger.warning("get_option_expirations failed: %s", e)
+            return {}
+        return _expirations_to_dict(df)
+
+    def get_option_chain(
+        self,
+        symbol: str,
+        expiry: str,                  # YYYY-MM-DD
+        include_greeks: bool = True,
+    ) -> list[dict]:
+        """Full option chain for one underlying + expiry.
+
+        Returns a list of dicts, one per contract, with strike / right /
+        bid / ask / volume / open_interest, and Greeks (delta, gamma,
+        theta, vega, rho, implied_vol) when include_greeks=True.
+        """
+        sym = symbol.strip().upper()
+        tiger_expiry = _tiger_expiry(expiry)
+        try:
+            qc = self._quote_client()
+            df = qc.get_option_chain(
+                symbol=sym,
+                expiry=tiger_expiry,
+                return_greek_value=bool(include_greeks),
+            )
+        except Exception as e:
+            logger.warning("get_option_chain(%s, %s) failed: %s", sym, expiry, e)
+            return []
+        return _option_rows_to_dicts(df)
+
+    def get_option_briefs(self, contracts) -> list[dict]:
+        """Real-time bid/ask/OI/HV/last for specific option contracts.
+
+        Args:
+          contracts: list[dict] each {symbol, expiry, strike, right} OR
+                     list[str] of pre-formatted Tiger option identifiers.
+        """
+        ids = _build_option_identifiers(contracts)
+        if not ids:
+            return []
+        try:
+            qc = self._quote_client()
+            df = qc.get_option_briefs(identifiers=ids)
+        except Exception as e:
+            logger.warning("get_option_briefs failed: %s", e)
+            return []
+        return _option_rows_to_dicts(df)
+
+    def get_option_greeks(self, contracts) -> list[dict]:
+        """Δ / Γ / Θ / ν / ρ + IV per contract.
+
+        Wraps `get_option_briefs` with `return_greek_value=True` per the
+        tigeropen SDK convention.
+        """
+        ids = _build_option_identifiers(contracts)
+        if not ids:
+            return []
+        try:
+            qc = self._quote_client()
+            df = qc.get_option_briefs(identifiers=ids, return_greek_value=True)
+        except Exception as e:
+            logger.warning("get_option_greeks failed: %s", e)
+            return []
+        rows = _option_rows_to_dicts(df)
+        # Slim the response to just identifier + Greek fields so the LLM
+        # response stays focused.
+        keep = {
+            "symbol", "identifier", "expiry", "strike", "right", "put_call",
+            "delta", "gamma", "theta", "vega", "rho", "implied_vol", "iv",
+            "underlying", "underlying_symbol",
+        }
+        return [{k: v for k, v in r.items() if k in keep or k.startswith("greek")} for r in rows]
+
+    def get_option_bars(
+        self,
+        contracts,
+        period: str = "day",   # "day" | "week" | "month" | "1min" | "5min" | "15min" | "30min" | "60min"
+        limit: int = 60,
+    ) -> dict:
+        """OHLC bars per option contract. Returns {identifier: [bar_dict, ...]}."""
+        ids = _build_option_identifiers(contracts)
+        if not ids:
+            return {}
+        try:
+            qc = self._quote_client()
+            df = qc.get_option_bars(identifiers=ids, period=period, limit=int(limit))
+        except Exception as e:
+            logger.warning("get_option_bars failed: %s", e)
+            return {}
+        return _bars_to_dict(df)
+
+    def get_option_depth(self, contracts) -> list[dict]:
+        """L2 depth per option contract — bid/ask ladder."""
+        ids = _build_option_identifiers(contracts)
+        if not ids:
+            return []
+        try:
+            qc = self._quote_client()
+            df = qc.get_option_depth(identifiers=ids)
+        except Exception as e:
+            logger.warning("get_option_depth failed: %s", e)
+            return []
+        return _option_rows_to_dicts(df)
+
+    def get_option_trade_ticks(self, contracts, limit: int = 50) -> dict:
+        """Recent tick (trade) data per option contract.
+
+        Returns {identifier: [tick_dict, ...]} truncated to `limit` per
+        identifier to keep the payload bounded.
+        """
+        ids = _build_option_identifiers(contracts)
+        if not ids:
+            return {}
+        try:
+            qc = self._quote_client()
+            df = qc.get_option_trade_ticks(identifiers=ids, limit=int(limit))
+        except Exception as e:
+            logger.warning("get_option_trade_ticks failed: %s", e)
+            return {}
+        return _bars_to_dict(df, key_field="identifier")
+
+
+# ── Helpers for option identifiers + row normalization ─────────────────────
+
+
+def _format_option_identifier(symbol: str, expiry: str, strike: float, right: str) -> str:
+    """Build a Tiger / OCC option identifier from components.
+
+    Format: SYMBOL YYMMDD <C|P> STRIKE*1000 (8-digit zero-padded)
+    Example: MSTR 250718 P 00250000 → "MSTR  250718P00250000"
+    """
+    sym = symbol.strip().upper()
+    iso = _tiger_expiry(expiry)        # YYYYMMDD
+    yymmdd = iso[2:]                   # YYMMDD
+    right_n = right.strip().upper()
+    if right_n not in ("PUT", "CALL", "P", "C"):
+        raise ValueError(f"right must be PUT or CALL, got {right!r}")
+    pc = "P" if right_n.startswith("P") else "C"
+    strike_int = int(round(float(strike) * 1000))
+    # Pad symbol to 6 chars for OCC convention
+    return f"{sym:<6}{yymmdd}{pc}{strike_int:08d}"
+
+
+def _build_option_identifiers(contracts) -> list[str]:
+    """Normalize list[dict] OR list[str] into list[str] Tiger identifiers."""
+    if not contracts:
+        return []
+    out = []
+    for c in contracts:
+        if isinstance(c, str):
+            out.append(c.strip())
+            continue
+        if isinstance(c, dict):
+            sym = c.get("symbol") or c.get("ticker") or ""
+            exp = c.get("expiry") or c.get("expiration") or ""
+            strike = c.get("strike")
+            right = c.get("right") or c.get("put_call") or c.get("type") or ""
+            if not (sym and exp and strike is not None and right):
+                continue
+            out.append(_format_option_identifier(sym, exp, float(strike), right))
+            continue
+        # Tuple / list: (symbol, expiry, strike, right)
+        try:
+            sym, exp, strike, right = c
+            out.append(_format_option_identifier(sym, exp, float(strike), right))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _option_rows_to_dicts(df) -> list[dict]:
+    """Coerce a tigeropen DataFrame (or list) of option rows to list[dict].
+
+    Many Tiger SDK responses come back as pandas DataFrames; some older
+    versions return lists of objects. Handle both.
+    """
+    if df is None:
+        return []
+    if hasattr(df, "to_dict"):
+        try:
+            records = df.to_dict(orient="records")
+            return [_jsonify_dict(r) for r in records]
+        except Exception:
+            pass
+    if isinstance(df, list):
+        out = []
+        for item in df:
+            if isinstance(item, dict):
+                out.append(_jsonify_dict(item))
+            else:
+                # SDK domain object — pull readable attrs
+                attrs = {}
+                for k in dir(item):
+                    if k.startswith("_"):
+                        continue
+                    try:
+                        v = getattr(item, k)
+                    except Exception:
+                        continue
+                    if callable(v):
+                        continue
+                    attrs[k] = v
+                out.append(_jsonify_dict(attrs))
+        return out
+    return []
+
+
+def _bars_to_dict(df, key_field: str = "identifier") -> dict:
+    """Group bar/tick rows by identifier into {identifier: [row, ...]}."""
+    rows = _option_rows_to_dicts(df)
+    grouped: dict[str, list[dict]] = {}
+    for r in rows:
+        k = str(r.get(key_field) or r.get("symbol") or r.get("ticker") or "")
+        grouped.setdefault(k, []).append(r)
+    return grouped
+
+
+def _expirations_to_dict(df) -> dict:
+    """Group expiry rows by symbol into {symbol: [YYYY-MM-DD, ...]}."""
+    rows = _option_rows_to_dicts(df)
+    grouped: dict[str, list[str]] = {}
+    for r in rows:
+        sym = str(r.get("symbol") or r.get("underlying_symbol") or "").upper()
+        exp = r.get("date") or r.get("expiry") or r.get("expiration")
+        if not (sym and exp):
+            continue
+        s = str(exp)
+        # Convert YYYYMMDD → YYYY-MM-DD when we got the compact form
+        if len(s) == 8 and s.isdigit():
+            s = f"{s[:4]}-{s[4:6]}-{s[6:]}"
+        grouped.setdefault(sym, []).append(s)
+    for k in grouped:
+        grouped[k] = sorted(set(grouped[k]))
+    return grouped
+
+
+def _jsonify_dict(d: dict) -> dict:
+    """Convert datetimes / Decimal / NaN-floats to JSON-safe types."""
+    import math
+    out = {}
+    for k, v in d.items():
+        if v is None:
+            out[str(k)] = None
+        elif isinstance(v, (bool, int, str)):
+            out[str(k)] = v
+        elif isinstance(v, float):
+            out[str(k)] = None if math.isnan(v) or math.isinf(v) else v
+        elif hasattr(v, "isoformat"):
+            try:
+                out[str(k)] = v.isoformat()
+            except Exception:
+                out[str(k)] = str(v)
+        elif isinstance(v, (list, tuple)):
+            out[str(k)] = [_jsonify_dict({"_": x}).get("_") for x in v]
+        elif isinstance(v, dict):
+            out[str(k)] = _jsonify_dict(v)
+        else:
+            out[str(k)] = str(v)
+    return out
 
 
 _SIDE_MAP = {

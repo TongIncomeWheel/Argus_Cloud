@@ -320,6 +320,99 @@ def get_nav_history(days: int = 30) -> dict:
     return _get_client().get_nav_history(days=days)
 
 
+# ── Option chain / Greeks / quotes (Phase 2d) ────────────────────────────────
+
+
+@mcp.tool()
+def get_option_expirations(symbols: list[str]) -> dict:
+    """Available option expiry dates per underlying.
+
+    Args:
+      symbols: list of tickers, e.g. ["MSTR", "AAPL"]
+    Returns: {symbol: [YYYY-MM-DD, ...]}
+    """
+    return _get_client().get_option_expirations(symbols)
+
+
+@mcp.tool()
+def get_option_chain(symbol: str, expiry: str, include_greeks: bool = True) -> list[dict]:
+    """Full option chain for one underlying + expiry.
+
+    Each row is a contract with strike, right (PUT/CALL), bid, ask, volume,
+    open interest, and (if include_greeks=True) delta, gamma, theta, vega,
+    rho, implied_vol. Use this to screen roll candidates across strikes.
+
+    Args:
+      symbol: ticker, e.g. "MSTR"
+      expiry: option expiry, ISO date "YYYY-MM-DD"
+      include_greeks: True (default) to include per-contract Greeks + IV
+    """
+    return _get_client().get_option_chain(symbol=symbol, expiry=expiry, include_greeks=include_greeks)
+
+
+@mcp.tool()
+def get_option_briefs(contracts: list[dict]) -> list[dict]:
+    """Real-time bid / ask / open-interest / HV / last per option contract.
+
+    Use this for accurate mark-to-market and roll execution pricing on
+    specific contracts you already know.
+
+    Args:
+      contracts: list of {symbol, expiry, strike, right} dicts.
+                 expiry is ISO YYYY-MM-DD, right is "PUT" or "CALL".
+    """
+    return _get_client().get_option_briefs(contracts)
+
+
+@mcp.tool()
+def get_option_greeks(contracts: list[dict]) -> list[dict]:
+    """Δ / Γ / Θ / ν / ρ + implied vol per option contract.
+
+    Highest-priority quote tool — feeds roll timing and position-level
+    risk. Returns only the Greek fields + identifier so payloads stay tight.
+
+    Args:
+      contracts: list of {symbol, expiry, strike, right} dicts.
+                 expiry is ISO YYYY-MM-DD, right is "PUT" or "CALL".
+    """
+    return _get_client().get_option_greeks(contracts)
+
+
+@mcp.tool()
+def get_option_bars(contracts: list[dict], period: str = "day", limit: int = 60) -> dict:
+    """OHLC bars per option contract.
+
+    Args:
+      contracts: list of {symbol, expiry, strike, right} dicts
+      period: "day" (default), "week", "month", or intraday "1min" ... "60min"
+      limit: max bars per contract (default 60)
+    Returns: {identifier: [bar_dict, ...]}
+    """
+    return _get_client().get_option_bars(contracts, period=period, limit=limit)
+
+
+@mcp.tool()
+def get_option_depth(contracts: list[dict]) -> list[dict]:
+    """L2 bid/ask depth per option contract — full ladder, not just NBBO.
+
+    Args:
+      contracts: list of {symbol, expiry, strike, right} dicts
+    """
+    return _get_client().get_option_depth(contracts)
+
+
+@mcp.tool()
+def get_option_trade_ticks(contracts: list[dict], limit: int = 50) -> dict:
+    """Recent trade-tick history per option contract.
+
+    Args:
+      contracts: list of {symbol, expiry, strike, right} dicts
+      limit: max ticks per contract (default 50; ticks are voluminous)
+    Returns: {identifier: [tick_dict, ...]}
+    """
+    return _get_client().get_option_trade_ticks(contracts, limit=limit)
+
+
 # ── Write tools (Phase 2c) — preview by default, confirm explicitly ──────────
 
 
