@@ -65,9 +65,12 @@ def _build_server() -> FastMCP:
     """
     name = "tiger"
     instructions = (
-        "Read-only access to the user's Tiger Brokers account via the official "
-        "tigeropen SDK. Use these tools to inspect positions, orders, funding, "
-        "and NAV history. No order placement, modification, or cancellation."
+        "Access to the user's Tiger Brokers account via the official tigeropen "
+        "SDK. Read-only tools cover positions, orders, funding, and NAV history. "
+        "Write tools (place_option_order, cancel_order, execute_roll) preview by "
+        "default — they ONLY submit to Tiger when called again with confirm=True. "
+        "Always show the user the preview spec and get explicit approval before "
+        "passing confirm=True."
     )
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     # MCP_PORT first (explicit), then PORT (Cloud Run / Heroku convention),
@@ -315,6 +318,171 @@ def get_spot_prices(symbols: list[str]) -> dict:
 def get_nav_history(days: int = 30) -> dict:
     """Daily NAV / P&L / cash time series for the last N days."""
     return _get_client().get_nav_history(days=days)
+
+
+# ── Write tools (Phase 2c) — preview by default, confirm explicitly ──────────
+
+
+def _preview_envelope(action_summary: str, spec: dict) -> dict:
+    """Wrap a preview spec with consistent headers so the LLM and the user
+    both see clearly that NO order was placed."""
+    return {
+        "preview": True,
+        "placed": False,
+        "summary": action_summary,
+        "spec": spec,
+        "next_step": "Call this tool again with confirm=True to actually submit.",
+    }
+
+
+@mcp.tool()
+def place_option_order(
+    symbol: str,
+    expiry: str,
+    strike: float,
+    right: str,
+    side: str,
+    quantity: int,
+    limit_price: float,
+    time_in_force: str = "DAY",
+    confirm: bool = False,
+) -> dict:
+    """Place a single-leg option order with a limit price.
+
+    PREVIEW BY DEFAULT — pass confirm=True to actually submit. Always preview
+    first so the user can verify symbol, strike, expiry, side, quantity, and
+    price before any order goes to Tiger.
+
+    Args:
+      symbol: ticker, e.g. "MSTR"
+      expiry: option expiry, ISO date "YYYY-MM-DD"
+      strike: numeric strike price
+      right: "PUT" or "CALL"
+      side: one of SELL_TO_OPEN (CSP/CC entry), BUY_TO_CLOSE (close short),
+            BUY_TO_OPEN (long entry), SELL_TO_CLOSE (close long)
+      quantity: number of contracts (must be > 0)
+      limit_price: limit price per share — Tiger multiplies by 100 internally
+      time_in_force: "DAY" (default) or "GTC"
+      confirm: False = preview only (default); True = submit
+    """
+    symbol_n = symbol.strip().upper()
+    right_n = right.strip().upper()
+    side_n = side.strip().upper().replace(" ", "_").replace("-", "_")
+
+    spec = {
+        "symbol": symbol_n,
+        "expiry": expiry,
+        "strike": float(strike),
+        "right": right_n,
+        "side": side_n,
+        "quantity": int(quantity),
+        "limit_price": float(limit_price),
+        "time_in_force": time_in_force.upper(),
+        "premium_per_contract_usd": round(float(limit_price) * 100, 2),
+        "total_premium_usd": round(float(limit_price) * 100 * int(quantity), 2),
+    }
+    summary = (
+        f"{side_n} {quantity}x {symbol_n} {strike:g}{right_n[0]} "
+        f"exp {expiry} @ ${limit_price:.2f} ({time_in_force.upper()})"
+    )
+
+    if not confirm:
+        return _preview_envelope(summary, spec)
+
+    result = _get_client().place_option_order(
+        symbol=symbol_n,
+        expiry=expiry,
+        strike=float(strike),
+        right=right_n,
+        side=side_n,
+        quantity=int(quantity),
+        limit_price=float(limit_price),
+        time_in_force=time_in_force,
+    )
+    return {"preview": False, "placed": True, "summary": summary, **result}
+
+
+@mcp.tool()
+def cancel_order(order_id: str, confirm: bool = False) -> dict:
+    """Cancel a working order by id.
+
+    PREVIEW BY DEFAULT — pass confirm=True to actually cancel.
+    """
+    spec = {"order_id": str(order_id)}
+    summary = f"Cancel order id={order_id}"
+    if not confirm:
+        return _preview_envelope(summary, spec)
+    result = _get_client().cancel_order(order_id)
+    return {"preview": False, "placed": True, "summary": summary, **result}
+
+
+@mcp.tool()
+def execute_roll(
+    symbol: str,
+    close_expiry: str,
+    close_strike: float,
+    close_right: str,
+    new_expiry: str,
+    new_strike: float,
+    quantity: int,
+    net_credit_limit: float,
+    time_in_force: str = "DAY",
+    confirm: bool = False,
+) -> dict:
+    """Roll a short option: atomic BUY_TO_CLOSE existing leg + SELL_TO_OPEN new
+    leg as one combo (MLEG) order with a single net-credit limit.
+
+    PREVIEW BY DEFAULT — pass confirm=True to actually submit. Always preview
+    first so the user can verify both legs and the net credit.
+
+    Args:
+      symbol: ticker, same on both legs
+      close_expiry / close_strike / close_right: identify the existing short
+        leg you want to close (right is "PUT" or "CALL"; both legs must share)
+      new_expiry / new_strike: the replacement short leg (same right)
+      quantity: number of contracts (must be > 0)
+      net_credit_limit: per-contract net credit required (positive = collect
+        at least this much net premium; negative = accept a net debit of that
+        magnitude)
+      time_in_force: "DAY" (default) or "GTC"
+      confirm: False = preview only (default); True = submit
+    """
+    symbol_n = symbol.strip().upper()
+    right_n = close_right.strip().upper()
+
+    spec = {
+        "symbol": symbol_n,
+        "right": right_n,
+        "close_leg": {"expiry": close_expiry, "strike": float(close_strike), "side": "BUY_TO_CLOSE"},
+        "open_leg": {"expiry": new_expiry, "strike": float(new_strike), "side": "SELL_TO_OPEN"},
+        "quantity": int(quantity),
+        "net_credit_limit_per_contract_usd": float(net_credit_limit),
+        "net_credit_limit_total_usd": round(float(net_credit_limit) * 100 * int(quantity), 2),
+        "time_in_force": time_in_force.upper(),
+    }
+    summary = (
+        f"Roll {quantity}x {symbol_n} {right_n}: "
+        f"close {close_strike:g} exp {close_expiry} + "
+        f"open {new_strike:g} exp {new_expiry} "
+        f"@ net {'credit' if net_credit_limit >= 0 else 'debit'} "
+        f"${abs(net_credit_limit):.2f}/contract"
+    )
+
+    if not confirm:
+        return _preview_envelope(summary, spec)
+
+    result = _get_client().execute_combo_roll(
+        symbol=symbol_n,
+        close_expiry=close_expiry,
+        close_strike=float(close_strike),
+        close_right=right_n,
+        new_expiry=new_expiry,
+        new_strike=float(new_strike),
+        quantity=int(quantity),
+        net_credit_limit=float(net_credit_limit),
+        time_in_force=time_in_force,
+    )
+    return {"preview": False, "placed": True, "summary": summary, **result}
 
 
 def main() -> None:
