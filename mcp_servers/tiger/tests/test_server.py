@@ -106,6 +106,7 @@ class ServerToolRegistrationTests(unittest.TestCase):
         "get_nav_history",
         # Phase 2c write tools
         "place_option_order",
+        "place_stock_order",
         "cancel_order",
         "execute_roll",
         # Phase 2d option-chain / Greeks / quotes
@@ -188,6 +189,40 @@ class WriteToolPreviewGateTests(unittest.TestCase):
         self.assertEqual(result["spec"]["open_leg"]["side"], "SELL_TO_OPEN")
         self.assertEqual(result["spec"]["net_credit_limit_total_usd"], 125.0)
         self.assertIn("credit", result["summary"])
+
+    def test_place_stock_order_preview_returns_spec_no_client_call(self) -> None:
+        from mcp_servers.tiger.server import place_stock_order
+        result = place_stock_order(
+            symbol="AAPL", side="BUY", quantity=100, order_type="LMT",
+            limit_price=150.00, time_in_force="DAY",
+        )
+        self.assertTrue(result["preview"])
+        self.assertFalse(result["placed"])
+        self.assertEqual(result["spec"]["symbol"], "AAPL")
+        self.assertEqual(result["spec"]["side"], "BUY")
+        self.assertEqual(result["spec"]["quantity"], 100.0)
+        self.assertEqual(result["spec"]["order_type"], "LMT")
+        self.assertEqual(result["spec"]["limit_price"], 150.0)
+        self.assertIn("BUY 100 AAPL", result["summary"])
+
+    def test_place_stock_order_market_no_limit_required(self) -> None:
+        from mcp_servers.tiger.server import place_stock_order
+        result = place_stock_order(
+            symbol="SPY", side="SELL", quantity=50, order_type="MKT",
+        )
+        self.assertTrue(result["preview"])
+        self.assertEqual(result["spec"]["order_type"], "MKT")
+        self.assertIsNone(result["spec"]["limit_price"])
+        self.assertIn("market", result["summary"])
+
+    def test_place_stock_order_outside_rth_flag_in_summary(self) -> None:
+        from mcp_servers.tiger.server import place_stock_order
+        result = place_stock_order(
+            symbol="AAPL", side="BUY", quantity=10, order_type="LMT",
+            limit_price=150.00, outside_rth=True,
+        )
+        self.assertTrue(result["spec"]["outside_rth"])
+        self.assertIn("outside RTH", result["summary"])
 
     def test_execute_roll_preview_negative_credit_is_debit(self) -> None:
         from mcp_servers.tiger.server import execute_roll

@@ -49,8 +49,12 @@ _CONSENT_HTML = """<!DOCTYPE html>
   <div class="box">
     <p><span class="client">{client_name}</span> is requesting access to your
     Tiger Brokers account through the Tiger MCP server.</p>
-    <div class="scope">Scope: <strong>read-only</strong> — positions, orders,
-    funding, NAV history. No order placement, modification, or cancellation.</div>
+    <div class="scope">
+      <strong>Read</strong> — positions, orders, funding, NAV history, option Greeks/chain<br>
+      <strong>Trade</strong> — place / modify / cancel stock and option orders, execute combo rolls<br>
+      <em>Every write tool defaults to preview mode; orders only submit when the
+      caller explicitly passes confirm=True.</em>
+    </div>
     {error}
     <form method="post">
       <input type="hidden" name="request_id" value="{request_id}">

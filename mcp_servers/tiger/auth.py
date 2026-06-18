@@ -98,7 +98,7 @@ class BearerTokenVerifier:
         return AccessToken(
             token=token,
             client_id="argus-tiger-mcp",
-            scopes=["tiger:read"],
+            scopes=["tiger:read", "tiger:trade"],
             subject="owner",
         )
 
