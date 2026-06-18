@@ -72,6 +72,32 @@ jobs:
           gcloud --version | head -2
           gcloud config get-value project
 
+      # Idempotent one-time setup for persistent OAuth state. Enables
+      # the Firestore API, creates a Native-mode database in the same
+      # region as Cloud Run, and grants the runtime compute SA read+write.
+      # All commands swallow "already exists" / "already enabled" so
+      # re-runs are no-ops.
+      - name: Ensure Firestore is provisioned
+        env:
+          PROJECT_NUMBER: "686093261470"
+        run: |
+          set +e
+          echo "→ enable firestore API"
+          gcloud services enable firestore.googleapis.com --project "$GCP_PROJECT"
+          echo "→ create (default) Firestore database in $GCP_REGION (no-op if exists)"
+          gcloud firestore databases create \
+            --location="$GCP_REGION" \
+            --type=firestore-native \
+            --project "$GCP_PROJECT" 2>&1 | grep -v 'ALREADY_EXISTS\|already exists' || true
+          echo "→ grant runtime SA Datastore User"
+          RUN_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+          gcloud projects add-iam-policy-binding "$GCP_PROJECT" \
+            --member="serviceAccount:${RUN_SA}" \
+            --role="roles/datastore.user" \
+            --condition=None \
+            --quiet > /dev/null
+          echo "✓ Firestore ready"
+
       # gcloud run deploy --source . wants the Dockerfile at the source
       # root, not nested under mcp_servers/tiger/deploy/. Mirror it for
       # the duration of this job — the copy is local to the runner and
@@ -95,7 +121,7 @@ jobs:
             --concurrency 50 \
             --timeout 3600 \
             --no-cpu-throttling \
-            --set-env-vars MCP_TRANSPORT=sse,MCP_HOST=0.0.0.0,TIGER_LICENSE=TBSG,TIGER_ENV=PROD,MCP_BASE_URL=${SERVICE_URL} \
+            --set-env-vars MCP_TRANSPORT=sse,MCP_HOST=0.0.0.0,TIGER_LICENSE=TBSG,TIGER_ENV=PROD,MCP_BASE_URL=${SERVICE_URL},MCP_OAUTH_STORAGE=firestore,GCP_PROJECT=${GCP_PROJECT} \
             --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest \
             --quiet
 
