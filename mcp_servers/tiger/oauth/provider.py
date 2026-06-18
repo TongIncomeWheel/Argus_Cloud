@@ -4,6 +4,11 @@ Implements the MCP SDK's protocol so FastMCP can advertise the
 required OAuth metadata, accept Dynamic Client Registration from the
 Claude consumer app, and gate every tool call by a bearer access token
 issued through the consent flow.
+
+Storage backend is injected (see oauth/storage.py): InMemoryStorage for
+tests/stdio, FirestoreStorage for HTTPS deploys. The provider only
+touches storage through the OAuthStorage protocol methods, so swapping
+backends never requires changing this file.
 """
 from __future__ import annotations
 
@@ -20,7 +25,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
-from mcp_servers.tiger.oauth.storage import InMemoryStorage, PendingAuthRequest
+from mcp_servers.tiger.oauth.storage import OAuthStorage, PendingAuthRequest
 
 
 _ACCESS_TTL = 3600  # 1 hour
@@ -32,19 +37,17 @@ _PENDING_TTL = 600  # 10 minutes for the consent step
 class TigerOAuthProvider(OAuthAuthorizationServerProvider):
     """OAuth 2.1 + PKCE + DCR for the single-owner Tiger MCP server."""
 
-    def __init__(self, storage: InMemoryStorage, base_url: str) -> None:
+    def __init__(self, storage: OAuthStorage, base_url: str) -> None:
         self._storage = storage
         self._base_url = base_url.rstrip("/")
 
     # ── Client registration ──────────────────────────────────────────────
 
     async def get_client(self, client_id: str) -> Optional[OAuthClientInformationFull]:
-        async with self._storage.lock:
-            return self._storage.clients.get(client_id)
+        return await self._storage.get_client(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        async with self._storage.lock:
-            self._storage.clients[client_info.client_id] = client_info
+        await self._storage.store_client(client_info)
 
     # ── Authorize → consent → callback ───────────────────────────────────
 
@@ -65,26 +68,23 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
             resource=params.resource,
             expires_at=time.time() + _PENDING_TTL,
         )
-        async with self._storage.lock:
-            self._storage.pending[request_id] = pending
+        await self._storage.store_pending(request_id, pending)
         return f"{self._base_url}/consent?request_id={request_id}"
 
     async def get_pending_request(self, request_id: str) -> Optional[PendingAuthRequest]:
-        async with self._storage.lock:
-            pending = self._storage.pending.get(request_id)
-            if pending is None:
-                return None
-            if pending.expires_at < time.time():
-                self._storage.pending.pop(request_id, None)
-                return None
-            return pending
+        pending = await self._storage.get_pending(request_id)
+        if pending is None:
+            return None
+        if pending.expires_at < time.time():
+            await self._storage.pop_pending(request_id)
+            return None
+        return pending
 
     async def finalize_authorization(self, request_id: str) -> tuple[str, Optional[str], str]:
         """After the user passes the consent step, mint an auth code and
         return (code, state, redirect_uri) so the route handler can build
         the redirect back to the OAuth client."""
-        async with self._storage.lock:
-            pending = self._storage.pending.pop(request_id, None)
+        pending = await self._storage.pop_pending(request_id)
         if pending is None or pending.expires_at < time.time():
             raise ValueError("Authorization request is invalid or expired")
 
@@ -100,8 +100,7 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
             resource=pending.resource,
             subject="owner",
         )
-        async with self._storage.lock:
-            self._storage.auth_codes[code_str] = code
+        await self._storage.store_code(code)
         return code_str, pending.state, pending.redirect_uri
 
     # ── Token endpoint ───────────────────────────────────────────────────
@@ -111,16 +110,15 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
         client: OAuthClientInformationFull,
         authorization_code: str,
     ) -> Optional[AuthorizationCode]:
-        async with self._storage.lock:
-            code = self._storage.auth_codes.get(authorization_code)
-            if code is None:
-                return None
-            if code.client_id != client.client_id:
-                return None
-            if code.expires_at < time.time():
-                self._storage.auth_codes.pop(authorization_code, None)
-                return None
-            return code
+        code = await self._storage.get_code(authorization_code)
+        if code is None:
+            return None
+        if code.client_id != client.client_id:
+            return None
+        if code.expires_at < time.time():
+            await self._storage.pop_code(authorization_code)
+            return None
+        return code
 
     async def exchange_authorization_code(
         self,
@@ -145,11 +143,10 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
             expires_at=now + _REFRESH_TTL,
             subject=authorization_code.subject,
         )
-        async with self._storage.lock:
-            self._storage.access_tokens[access] = access_tok
-            self._storage.refresh_tokens[refresh] = refresh_tok
-            # One-time use: invalidate the auth code.
-            self._storage.auth_codes.pop(authorization_code.code, None)
+        await self._storage.store_access(access_tok)
+        await self._storage.store_refresh(refresh_tok)
+        # One-time use: invalidate the auth code.
+        await self._storage.pop_code(authorization_code.code)
         return OAuthToken(
             access_token=access,
             token_type="Bearer",
@@ -163,14 +160,13 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
         client: OAuthClientInformationFull,
         refresh_token: str,
     ) -> Optional[RefreshToken]:
-        async with self._storage.lock:
-            rt = self._storage.refresh_tokens.get(refresh_token)
-            if rt is None or rt.client_id != client.client_id:
-                return None
-            if rt.expires_at is not None and rt.expires_at < time.time():
-                self._storage.refresh_tokens.pop(refresh_token, None)
-                return None
-            return rt
+        rt = await self._storage.get_refresh(refresh_token)
+        if rt is None or rt.client_id != client.client_id:
+            return None
+        if rt.expires_at is not None and rt.expires_at < time.time():
+            await self._storage.pop_refresh(refresh_token)
+            return None
+        return rt
 
     async def exchange_refresh_token(
         self,
@@ -201,11 +197,10 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
             expires_at=now + _REFRESH_TTL,
             subject=refresh_token.subject,
         )
-        async with self._storage.lock:
-            self._storage.access_tokens[access] = access_tok
-            self._storage.refresh_tokens[new_refresh] = new_refresh_tok
-            # Rotation: revoke the consumed refresh token.
-            self._storage.refresh_tokens.pop(refresh_token.token, None)
+        await self._storage.store_access(access_tok)
+        await self._storage.store_refresh(new_refresh_tok)
+        # Rotation: revoke the consumed refresh token.
+        await self._storage.pop_refresh(refresh_token.token)
         return OAuthToken(
             access_token=access,
             token_type="Bearer",
@@ -217,16 +212,14 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
     # ── Resource server side ─────────────────────────────────────────────
 
     async def load_access_token(self, token: str) -> Optional[AccessToken]:
-        async with self._storage.lock:
-            at = self._storage.access_tokens.get(token)
-            if at is None:
-                return None
-            if at.expires_at is not None and at.expires_at < time.time():
-                self._storage.access_tokens.pop(token, None)
-                return None
-            return at
+        at = await self._storage.get_access(token)
+        if at is None:
+            return None
+        if at.expires_at is not None and at.expires_at < time.time():
+            await self._storage.pop_access(token)
+            return None
+        return at
 
     async def revoke_token(self, token: Union[AccessToken, RefreshToken]) -> None:
-        async with self._storage.lock:
-            self._storage.access_tokens.pop(token.token, None)
-            self._storage.refresh_tokens.pop(token.token, None)
+        await self._storage.pop_access(token.token)
+        await self._storage.pop_refresh(token.token)

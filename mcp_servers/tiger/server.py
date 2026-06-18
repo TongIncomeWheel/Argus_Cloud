@@ -41,12 +41,39 @@ from mcp.server.fastmcp import FastMCP
 from mcp_servers.tiger.auth import BearerTokenVerifier, bootstrap_from_env
 from mcp_servers.tiger.oauth.consent import make_consent_routes
 from mcp_servers.tiger.oauth.provider import TigerOAuthProvider
-from mcp_servers.tiger.oauth.storage import InMemoryStorage
+from mcp_servers.tiger.oauth.storage import InMemoryStorage, OAuthStorage
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("tiger-mcp")
 
 bootstrap_from_env()
+
+
+def _build_storage() -> OAuthStorage:
+    """Pick the OAuth storage backend.
+
+    MCP_OAUTH_STORAGE=firestore  →  Firestore (persists across cold starts;
+                                    required for the hosted deploy so claude.ai
+                                    OAuth tokens survive container restarts)
+    anything else (or unset)     →  InMemoryStorage (tests, stdio dev)
+    """
+    backend = os.environ.get("MCP_OAUTH_STORAGE", "memory").strip().lower()
+    if backend == "firestore":
+        try:
+            from mcp_servers.tiger.oauth.firestore_storage import FirestoreStorage
+        except ImportError as e:
+            logger.error(
+                "MCP_OAUTH_STORAGE=firestore but google-cloud-firestore is not "
+                "installed; falling back to in-memory: %s", e
+            )
+            return InMemoryStorage()
+        project = os.environ.get("GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        database = os.environ.get("FIRESTORE_DATABASE", "(default)")
+        logger.info("OAuth storage = Firestore (project=%s, db=%s)",
+                    project or "<ADC>", database)
+        return FirestoreStorage(project=project, database=database)
+    logger.info("OAuth storage = in-memory (state lost on restart)")
+    return InMemoryStorage()
 
 
 def _build_server() -> FastMCP:
@@ -80,7 +107,7 @@ def _build_server() -> FastMCP:
 
     if os.environ.get("MCP_OAUTH_OWNER_PASSWORD", "").strip():
         logger.info("Building FastMCP with OAuth 2.1 + PKCE + DCR")
-        storage = InMemoryStorage()
+        storage = _build_storage()
         provider = TigerOAuthProvider(storage, base_url)
         # Split scopes so the consent screen makes clear we ask for BOTH
         # read access (positions/orders/NAV) AND trade access (place,
