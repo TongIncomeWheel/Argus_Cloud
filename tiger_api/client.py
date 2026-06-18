@@ -578,6 +578,84 @@ class TigerClient:
             "placed": bool(placed),
         }
 
+    def place_stock_order(
+        self,
+        symbol: str,
+        side: str,                    # "BUY" | "SELL"
+        quantity: float,
+        order_type: str = "LMT",      # "LMT" | "MKT" | "STP" | "STP_LMT"
+        limit_price: float | None = None,
+        stop_price: float | None = None,
+        time_in_force: str = "DAY",   # "DAY" | "GTC"
+        outside_rth: bool = False,    # pre/post hours (US only)
+        currency: str = "USD",
+    ) -> dict:
+        """Submit a single-leg stock / ETF order.
+
+        Returns {order_id, status, placed}.
+        """
+        from tigeropen.common.util.contract_utils import stock_contract
+        from tigeropen.common.util.order_utils import (
+            limit_order, market_order, stop_order, stop_limit_order,
+        )
+
+        sym = symbol.strip().upper()
+        action = side.strip().upper()
+        if action not in ("BUY", "SELL"):
+            raise ValueError(f"side must be BUY or SELL, got {side!r}")
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+        otype = order_type.strip().upper().replace("-", "_")
+        if otype not in ("LMT", "MKT", "STP", "STP_LMT"):
+            raise ValueError(f"order_type must be LMT/MKT/STP/STP_LMT, got {order_type!r}")
+        tif = time_in_force.strip().upper()
+        if tif not in ("DAY", "GTC"):
+            raise ValueError(f"time_in_force must be DAY or GTC, got {time_in_force!r}")
+        if otype in ("LMT", "STP_LMT") and (limit_price is None or float(limit_price) <= 0):
+            raise ValueError(f"limit_price required and > 0 for {otype}")
+        if otype in ("STP", "STP_LMT") and (stop_price is None or float(stop_price) <= 0):
+            raise ValueError(f"stop_price required and > 0 for {otype}")
+
+        contract = stock_contract(symbol=sym, currency=currency.strip().upper())
+
+        if otype == "LMT":
+            order = limit_order(
+                account=self._account, contract=contract,
+                action=action, quantity=quantity, limit_price=float(limit_price),
+            )
+        elif otype == "MKT":
+            order = market_order(
+                account=self._account, contract=contract,
+                action=action, quantity=quantity,
+            )
+        elif otype == "STP":
+            order = stop_order(
+                account=self._account, contract=contract,
+                action=action, quantity=quantity, aux_price=float(stop_price),
+            )
+        else:  # STP_LMT
+            order = stop_limit_order(
+                account=self._account, contract=contract,
+                action=action, quantity=quantity,
+                limit_price=float(limit_price), aux_price=float(stop_price),
+            )
+
+        order.time_in_force = tif
+        if outside_rth and currency.strip().upper() == "USD":
+            order.outside_rth = True
+
+        logger.info(
+            "place_stock_order: %s %s %s %s qty=%s lmt=%s stop=%s tif=%s outside_rth=%s",
+            self._account, action, sym, otype, quantity, limit_price, stop_price, tif, outside_rth,
+        )
+        placed = self._trade_client.place_order(order)
+        logger.info("place_stock_order placed: id=%s", getattr(order, "id", None))
+        return {
+            "order_id": getattr(order, "id", None),
+            "status": getattr(order, "status", None),
+            "placed": bool(placed),
+        }
+
     def cancel_order(self, order_id) -> dict:
         """Cancel a working order by id. Returns {ok, status}."""
         logger.info("cancel_order: %s", order_id)

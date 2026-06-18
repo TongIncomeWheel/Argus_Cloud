@@ -82,6 +82,11 @@ def _build_server() -> FastMCP:
         logger.info("Building FastMCP with OAuth 2.1 + PKCE + DCR")
         storage = InMemoryStorage()
         provider = TigerOAuthProvider(storage, base_url)
+        # Split scopes so the consent screen makes clear we ask for BOTH
+        # read access (positions/orders/NAV) AND trade access (place,
+        # cancel, roll). A single "tiger:read" was misleading users into
+        # thinking trades were blocked.
+        scopes = ["tiger:read", "tiger:trade"]
         mcp_instance = FastMCP(
             name,
             instructions=instructions,
@@ -91,11 +96,11 @@ def _build_server() -> FastMCP:
             auth=AuthSettings(
                 issuer_url=base_url,
                 resource_server_url=base_url,
-                required_scopes=["tiger:read"],
+                required_scopes=scopes,
                 client_registration_options=ClientRegistrationOptions(
                     enabled=True,
-                    valid_scopes=["tiger:read"],
-                    default_scopes=["tiger:read"],
+                    valid_scopes=scopes,
+                    default_scopes=scopes,
                 ),
                 revocation_options=RevocationOptions(enabled=True),
             ),
@@ -120,7 +125,7 @@ def _build_server() -> FastMCP:
         auth=AuthSettings(
             issuer_url=base_url,
             resource_server_url=base_url,
-            required_scopes=["tiger:read"],
+            required_scopes=["tiger:read", "tiger:trade"],
         ),
     )
 
@@ -459,6 +464,76 @@ def _preview_envelope(action_summary: str, spec: dict) -> dict:
         "spec": spec,
         "next_step": "Call this tool again with confirm=True to actually submit.",
     }
+
+
+@mcp.tool()
+def place_stock_order(
+    symbol: str,
+    side: str,
+    quantity: float,
+    order_type: str = "LMT",
+    limit_price: float | None = None,
+    stop_price: float | None = None,
+    time_in_force: str = "DAY",
+    outside_rth: bool = False,
+    currency: str = "USD",
+    confirm: bool = False,
+) -> dict:
+    """Place a stock / ETF order.
+
+    PREVIEW BY DEFAULT — pass confirm=True to actually submit.
+
+    Args:
+      symbol: ticker, e.g. "AAPL", "00700" (HK), "SPY"
+      side: "BUY" or "SELL"
+      quantity: number of shares (must be > 0)
+      order_type: "LMT" (default), "MKT", "STP", or "STP_LMT"
+      limit_price: required when order_type in (LMT, STP_LMT)
+      stop_price: required when order_type in (STP, STP_LMT) — Tiger calls
+                  this `aux_price` internally
+      time_in_force: "DAY" (default) or "GTC"
+      outside_rth: True to allow pre-market and after-hours fills (US only)
+      currency: "USD" (default), "HKD", or "SGD" — must match the symbol's
+                listing market
+      confirm: False = preview only (default); True = submit
+    """
+    sym_n = symbol.strip().upper()
+    side_n = side.strip().upper()
+    otype = order_type.strip().upper().replace("-", "_")
+
+    spec = {
+        "symbol": sym_n,
+        "side": side_n,
+        "quantity": float(quantity),
+        "order_type": otype,
+        "limit_price": float(limit_price) if limit_price is not None else None,
+        "stop_price": float(stop_price) if stop_price is not None else None,
+        "time_in_force": time_in_force.upper(),
+        "outside_rth": bool(outside_rth),
+        "currency": currency.upper(),
+    }
+    summary_price = (
+        f"@ ${limit_price:.2f} limit" if otype == "LMT" and limit_price is not None
+        else f"@ market" if otype == "MKT"
+        else f"@ stop ${stop_price:.2f}" if otype == "STP" and stop_price is not None
+        else f"@ stop ${stop_price:.2f} → ${limit_price:.2f} limit"
+            if otype == "STP_LMT" and stop_price is not None and limit_price is not None
+        else ""
+    )
+    summary = (
+        f"{side_n} {quantity:g} {sym_n} {summary_price} "
+        f"({time_in_force.upper()}{', outside RTH' if outside_rth else ''})"
+    )
+
+    if not confirm:
+        return _preview_envelope(summary, spec)
+
+    result = _get_client().place_stock_order(
+        symbol=sym_n, side=side_n, quantity=quantity, order_type=otype,
+        limit_price=limit_price, stop_price=stop_price,
+        time_in_force=time_in_force, outside_rth=outside_rth, currency=currency,
+    )
+    return {"preview": False, "placed": True, "summary": summary, **result}
 
 
 @mcp.tool()
