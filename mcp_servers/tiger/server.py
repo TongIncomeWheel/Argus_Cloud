@@ -24,7 +24,7 @@ import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # Make the repo root importable when launched as `python -m mcp_servers.tiger.server`
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -267,55 +267,102 @@ def _position_to_dict(p) -> dict:
     return out
 
 
+def _normalize_enum_str(v) -> str:
+    """Strip the SDK enum class prefix from a stringified value.
+
+    Tiger's SDK serializes enums as their fully-qualified repr — e.g.
+    `OrderStatus.FILLED`, `SecurityType.OPT`, `ActionType.SELL`. The
+    classifier needs the bare token. Returns uppercase for case-safe
+    comparisons; returns "" for None / unparseable.
+    """
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if not s:
+        return ""
+    # Take the last dotted segment so "OrderStatus.FILLED" → "FILLED",
+    # "FILLED" → "FILLED", and "package.Module.OrderStatus.FILLED" still works.
+    if "." in s:
+        s = s.rsplit(".", 1)[-1]
+    return s.upper()
+
+
+def _to_float_or_none(v) -> Optional[float]:
+    """Coerce to float for the zero-comparison path; None on failure."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def _order_to_dict(o) -> dict:
     c = getattr(o, "contract", None)
-    sec_type = getattr(c, "sec_type", "") if c else ""
-    status = _scalar(getattr(o, "status", None))
-    avg_fill = _scalar(getattr(o, "avg_fill_price", None))
-    limit_p = _scalar(getattr(o, "limit_price", None))
-    commission = _scalar(getattr(o, "commission", None))
-    quantity = _scalar(getattr(o, "quantity", None))
+    raw_status = getattr(o, "status", None)
+    raw_sec_type = getattr(c, "sec_type", "") if c else ""
+    raw_action = getattr(o, "action", None)
+    raw_order_type = getattr(o, "order_type", None)
+
+    # Normalised forms: enum prefix stripped, uppercase. Used for both
+    # the user-facing output (cleaner) AND the classifier (correct).
+    status_n = _normalize_enum_str(raw_status)
+    sec_type_n = _normalize_enum_str(raw_sec_type)
+    action_n = _normalize_enum_str(raw_action) or None
+    order_type_n = _normalize_enum_str(raw_order_type) or None
+
+    avg_fill_raw = _scalar(getattr(o, "avg_fill_price", None))
+    limit_raw = _scalar(getattr(o, "limit_price", None))
+    commission_raw = _scalar(getattr(o, "commission", None))
+    quantity_raw = _scalar(getattr(o, "quantity", None))
+
+    avg_fill_f = _to_float_or_none(avg_fill_raw)
+    limit_f = _to_float_or_none(limit_raw)
+    commission_f = _to_float_or_none(commission_raw)
+    quantity_f = _to_float_or_none(quantity_raw)
 
     # Classify the order's fill_type. Tiger reports expiry-day events
     # (worthless expiration, auto-exercise of OTM contracts) as "filled"
     # orders with avg_fill_price=0, limit_price=0, commission=0. Without
-    # tagging, downstream code can't distinguish these from real trades
+    # tagging, downstream code can't distinguish them from real trades
     # and ends up averaging "0" fill prices into P&L calculations.
-    fill_type = "normal"
-    if sec_type == "OPT":
-        try:
-            zero_price = (
-                (avg_fill in (None, 0, 0.0))
-                and (limit_p in (None, 0, 0.0))
-                and (commission in (None, 0, 0.0))
-            )
-            has_size = quantity not in (None, 0, 0.0)
-            looks_filled = (
-                isinstance(status, str)
-                and status.lower() in ("filled", "expired", "auto-exercised", "exercised")
-            )
-            if zero_price and has_size and looks_filled:
-                fill_type = "expiration"
-        except (TypeError, ValueError):
-            pass
+    #
+    # Use the normalised status / sec_type — Tiger serialises enums as
+    # "OrderStatus.FILLED" / "SecurityType.OPT", which would never match
+    # bare "FILLED" / "OPT" without prefix stripping.
+    is_zero_priced = (
+        (avg_fill_f is None or avg_fill_f == 0.0)
+        and (limit_f is None or limit_f == 0.0)
+        and (commission_f is None or commission_f == 0.0)
+    )
+    has_size = quantity_f is not None and quantity_f != 0.0
+    is_completed_status = status_n in (
+        "FILLED", "EXPIRED", "EXERCISED", "AUTO_EXERCISED", "AUTO-EXERCISED",
+    )
+    fill_type = (
+        "expiration"
+        if (sec_type_n == "OPT" and is_zero_priced and has_size and is_completed_status)
+        else "normal"
+    )
 
     return {
         "id": _scalar(getattr(o, "id", None)),
-        "status": status,
+        "status": status_n or None,           # cleaned (no "OrderStatus." prefix)
+        "status_raw": str(raw_status) if raw_status is not None else None,
         "fill_type": fill_type,
-        "action": _scalar(getattr(o, "action", None)),
-        "order_type": _scalar(getattr(o, "order_type", None)),
-        "sec_type": sec_type,
+        "action": action_n,
+        "order_type": order_type_n,
+        "sec_type": sec_type_n or None,       # cleaned
         "symbol": getattr(c, "symbol", "") if c else "",
         "right": getattr(c, "right", None) if c else None,
         "strike": getattr(c, "strike", None) if c else None,
         "expiry": getattr(c, "expiry", None) if c else None,
-        "quantity": quantity,
+        "quantity": quantity_raw,
         "filled": _scalar(getattr(o, "filled", None)),
-        "avg_fill_price": avg_fill,
-        "limit_price": limit_p,
+        "avg_fill_price": avg_fill_raw,
+        "limit_price": limit_raw,
         "stop_price": _scalar(getattr(o, "stop_price", None)),
-        "commission": commission,
+        "commission": commission_raw,
         "gst": _scalar(getattr(o, "gst", None)),
         "realized_pnl": _scalar(getattr(o, "realized_pnl", None)),
         "trade_time": _scalar(getattr(o, "trade_time", None)),

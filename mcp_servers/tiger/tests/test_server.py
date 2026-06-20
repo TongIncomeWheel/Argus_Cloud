@@ -305,15 +305,21 @@ class OptionIdentifierTests(unittest.TestCase):
 
 class OrderFillTypeClassificationTests(unittest.TestCase):
     """Tiger marks worthless expirations / OTM auto-exercises as 'filled'
-    orders with avg_fill_price=0, limit_price=0, commission=0. Without
-    a fill_type tag, downstream code averages those zeros into P&L
+    orders with avg_fill_price=0, limit_price=0, commission=0. Without a
+    fill_type tag, downstream code averages those zeros into P&L
     calculations and misreports performance. _order_to_dict adds
     fill_type so callers can distinguish them from real trades.
+
+    Tiger's actual wire format puts enum class prefixes on status and
+    sec_type — "OrderStatus.FILLED", "SecurityType.OPT" — so the
+    classifier MUST strip those prefixes before comparing. Several of
+    these tests deliberately use the prefixed form to guard the regression
+    that BUG 004's first fix attempt missed.
     """
 
     class _FakeContract:
-        def __init__(self, sec_type="OPT", symbol="SPY",
-                     right="CALL", strike=735.0, expiry="20260710"):
+        def __init__(self, sec_type="SecurityType.OPT", symbol="MARA",
+                     right="CALL", strike=15.0, expiry="20260618"):
             self.sec_type = sec_type
             self.symbol = symbol
             self.right = right
@@ -324,9 +330,10 @@ class OrderFillTypeClassificationTests(unittest.TestCase):
         def __init__(self, **kw):
             self.contract = kw.get("contract")
             self.id = kw.get("id", "ord-1")
-            self.status = kw.get("status", "Filled")
-            self.action = kw.get("action", "SELL")
-            self.order_type = kw.get("order_type", "LMT")
+            # Default matches what Tiger actually returns over the wire.
+            self.status = kw.get("status", "OrderStatus.FILLED")
+            self.action = kw.get("action", "ActionType.SELL")
+            self.order_type = kw.get("order_type", "OrderType.LMT")
             self.quantity = kw.get("quantity", 1)
             self.filled = kw.get("filled", 1)
             self.avg_fill_price = kw.get("avg_fill_price", 0.0)
@@ -338,55 +345,84 @@ class OrderFillTypeClassificationTests(unittest.TestCase):
             self.trade_time = kw.get("trade_time", None)
             self.order_time = kw.get("order_time", None)
 
-    def test_zero_price_filled_option_tagged_expiration(self) -> None:
+    def test_tiger_wire_format_zero_price_option_tagged_expiration(self) -> None:
+        """The exact six-row regression case from the live testpack."""
         from mcp_servers.tiger.server import _order_to_dict
         o = self._FakeOrder(contract=self._FakeContract(),
+                            status="OrderStatus.FILLED",
+                            avg_fill_price=0.0, limit_price=0.0, commission=0.0,
+                            quantity=1, filled=1)
+        row = _order_to_dict(o)
+        self.assertEqual(row["fill_type"], "expiration")
+        # Original wire values preserved for audit
+        self.assertEqual(row["avg_fill_price"], 0.0)
+        self.assertEqual(row["status_raw"], "OrderStatus.FILLED")
+        # Normalised display
+        self.assertEqual(row["status"], "FILLED")
+        self.assertEqual(row["sec_type"], "OPT")
+
+    def test_bare_filled_status_still_works(self) -> None:
+        """Backward compat — accept stripped status too."""
+        from mcp_servers.tiger.server import _order_to_dict
+        o = self._FakeOrder(contract=self._FakeContract(sec_type="OPT"),
                             status="Filled",
                             avg_fill_price=0.0, limit_price=0.0, commission=0.0,
                             quantity=1, filled=1)
         row = _order_to_dict(o)
         self.assertEqual(row["fill_type"], "expiration")
-        self.assertEqual(row["avg_fill_price"], 0.0)  # raw value preserved
 
-    def test_zero_price_explicit_expired_status_tagged_expiration(self) -> None:
+    def test_explicit_expired_status_tagged_expiration(self) -> None:
         from mcp_servers.tiger.server import _order_to_dict
         o = self._FakeOrder(contract=self._FakeContract(),
-                            status="Expired",
+                            status="OrderStatus.EXPIRED",
                             avg_fill_price=0.0, limit_price=0.0, commission=0.0,
                             quantity=1, filled=0)
         row = _order_to_dict(o)
         self.assertEqual(row["fill_type"], "expiration")
+        self.assertEqual(row["status"], "EXPIRED")
 
     def test_real_filled_option_tagged_normal(self) -> None:
         from mcp_servers.tiger.server import _order_to_dict
         o = self._FakeOrder(contract=self._FakeContract(),
-                            status="Filled",
+                            status="OrderStatus.FILLED",
                             avg_fill_price=5.50, limit_price=5.50, commission=1.30,
                             quantity=1, filled=1)
         row = _order_to_dict(o)
         self.assertEqual(row["fill_type"], "normal")
 
-    def test_zero_price_stock_order_not_tagged(self) -> None:
-        """Only option-sec_type orders get the expiration classification;
-        stock orders with zero prices indicate a different bug, not expiry."""
+    def test_zero_price_stock_order_not_tagged_expiration(self) -> None:
+        """Only option sec_type gets the expiration classification."""
         from mcp_servers.tiger.server import _order_to_dict
-        stock_ctr = self._FakeContract(sec_type="STK", symbol="SPY",
+        stock_ctr = self._FakeContract(sec_type="SecurityType.STK", symbol="SPY",
                                         right=None, strike=None, expiry=None)
         o = self._FakeOrder(contract=stock_ctr,
-                            status="Filled",
+                            status="OrderStatus.FILLED",
                             avg_fill_price=0.0, limit_price=0.0, commission=0.0)
         row = _order_to_dict(o)
         self.assertEqual(row["fill_type"], "normal")
+        self.assertEqual(row["sec_type"], "STK")
 
     def test_zero_price_cancelled_option_not_expiration(self) -> None:
         """Cancelled orders also have zero prices but are not expirations."""
         from mcp_servers.tiger.server import _order_to_dict
         o = self._FakeOrder(contract=self._FakeContract(),
-                            status="Cancelled",
+                            status="OrderStatus.CANCELLED",
                             avg_fill_price=0.0, limit_price=0.0, commission=0.0,
                             quantity=1, filled=0)
         row = _order_to_dict(o)
         self.assertEqual(row["fill_type"], "normal")
+        self.assertEqual(row["status"], "CANCELLED")
+
+    def test_normalize_enum_str_helper(self) -> None:
+        """Direct unit test of the prefix stripper used by the classifier."""
+        from mcp_servers.tiger.server import _normalize_enum_str
+        self.assertEqual(_normalize_enum_str("OrderStatus.FILLED"), "FILLED")
+        self.assertEqual(_normalize_enum_str("SecurityType.OPT"), "OPT")
+        self.assertEqual(_normalize_enum_str("FILLED"), "FILLED")
+        self.assertEqual(_normalize_enum_str("filled"), "FILLED")
+        self.assertEqual(_normalize_enum_str("pkg.mod.OrderStatus.FILLED"), "FILLED")
+        self.assertEqual(_normalize_enum_str(None), "")
+        self.assertEqual(_normalize_enum_str(""), "")
 
 
 class OptionIdentifierParseTests(unittest.TestCase):
