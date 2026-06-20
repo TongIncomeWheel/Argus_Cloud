@@ -102,7 +102,8 @@ class ServerToolRegistrationTests(unittest.TestCase):
         "get_order_transactions",
         "get_prime_assets",
         "get_funding_history",
-        "get_spot_prices",
+        # get_spot_prices intentionally absent — equity quotes routed to
+        # the IBKR connector's get_price_snapshot.
         "get_nav_history",
         # Phase 2c write tools
         "place_option_order",
@@ -118,6 +119,19 @@ class ServerToolRegistrationTests(unittest.TestCase):
         "get_option_depth",
         "get_option_trade_ticks",
     }
+
+    def test_get_spot_prices_intentionally_not_registered(self) -> None:
+        from mcp_servers.tiger import server
+
+        async def gather_names() -> set[str]:
+            tools = await server.mcp.list_tools()
+            return {t.name for t in tools}
+
+        names = asyncio.run(gather_names())
+        self.assertNotIn(
+            "get_spot_prices", names,
+            "get_spot_prices must NOT be exposed — equity quotes go via IBKR.",
+        )
 
     def test_expected_tools_registered(self) -> None:
         from mcp_servers.tiger import server

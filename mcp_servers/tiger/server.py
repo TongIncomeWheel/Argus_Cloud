@@ -93,11 +93,16 @@ def _build_server() -> FastMCP:
     name = "tiger"
     instructions = (
         "Access to the user's Tiger Brokers account via the official tigeropen "
-        "SDK. Read-only tools cover positions, orders, funding, and NAV history. "
-        "Write tools (place_option_order, cancel_order, execute_roll) preview by "
-        "default — they ONLY submit to Tiger when called again with confirm=True. "
-        "Always show the user the preview spec and get explicit approval before "
-        "passing confirm=True."
+        "SDK. Read-only tools cover positions, orders, funding, NAV history. "
+        "Option market data (chain, Greeks, briefs, bars, depth, ticks) is "
+        "served from Tiger's US Option L1 subscription. "
+        "For EQUITY (stock/ETF) spot prices use the IBKR connector's "
+        "get_price_snapshot — Tiger MCP intentionally does not expose a "
+        "spot-prices tool. "
+        "Write tools (place_stock_order, place_option_order, cancel_order, "
+        "execute_roll) preview by default — they ONLY submit to Tiger when "
+        "called again with confirm=True. Always show the user the preview "
+        "spec and get explicit approval before passing confirm=True."
     )
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     # MCP_PORT first (explicit), then PORT (Cloud Run / Heroku convention),
@@ -372,11 +377,15 @@ def get_funding_history() -> list[dict]:
     return df.to_dict(orient="records")
 
 
-@mcp.tool()
-def get_spot_prices(symbols: list[str]) -> dict:
-    """Latest spot prices for a list of tickers. Tickers without a Tiger quote
-    are silently omitted from the result."""
-    return _get_client().get_spot_prices(symbols)
+# get_spot_prices intentionally NOT exposed as an MCP tool.
+# Equity spot quotes are served by the IBKR MCP connector
+# (`get_price_snapshot`). Tiger's spot-prices endpoint requires a US
+# Equity L1 subscription separate from the US Option L1 subscription;
+# routing equity quotes to IBKR keeps Tiger MCP focused on its specialty
+# (option market data + your Tiger trade account). The underlying
+# TigerClient.get_spot_prices() method stays in place so Argus's
+# Streamlit `tiger_data.load_spot_prices` keeps working with its own
+# yfinance/Alpaca fallback chain.
 
 
 @mcp.tool()
