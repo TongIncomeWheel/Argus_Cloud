@@ -195,7 +195,44 @@ class TigerClient:
 
     # ── Account & cash ───────────────────────────────────────────
     def get_assets(self) -> TigerAssets:
-        """Snapshot of NAV / cash / position value. One round-trip."""
+        """Snapshot of NAV / cash / position value / today's P&L.
+
+        Pulled from `get_prime_assets` segment 'S' (Securities) because
+        the legacy `get_assets()` summary fields are unreliable on
+        TBSG prime accounts: unrealized_pl / realized_pl return 0 even
+        when the segment-level fields hold the correct numbers, and
+        gross_position_value sometimes returns `Infinity`. Tiger has a
+        known bug here; segment-level reads are the canonical source.
+
+        Falls back to the legacy summary path only if prime_assets is
+        unavailable or the Securities segment is missing — needed for
+        sandbox or non-prime account types.
+        """
+        prime = None
+        try:
+            prime = self._trade_client.get_prime_assets(account=self._account)
+        except Exception as e:
+            logger.warning("get_prime_assets failed; falling back to get_assets summary: %s", e)
+
+        if prime is not None:
+            seg = None
+            segments = getattr(prime, "segments", None) or {}
+            for key in ("S", "G", "C", "F"):
+                if key in segments:
+                    seg = segments[key]
+                    break
+            if seg is not None:
+                return TigerAssets(
+                    currency=getattr(seg, "currency", "USD"),
+                    nav=float(_safe_num(getattr(seg, "net_liquidation", 0))),
+                    cash=float(_safe_num(getattr(seg, "cash_balance", 0))),
+                    stock_value=float(_safe_num(getattr(seg, "gross_position_value", 0))),
+                    realized_pnl_today=float(_safe_num(getattr(seg, "realized_pl", 0))),
+                    unrealized_pnl=float(_safe_num(getattr(seg, "unrealized_pl", 0))),
+                    raw=prime,
+                )
+
+        # Legacy fallback (sandbox / non-prime accounts).
         result = self._trade_client.get_assets(account=self._account)
         if not result:
             raise RuntimeError("get_assets() returned empty")
@@ -203,11 +240,11 @@ class TigerClient:
         s = a.summary
         return TigerAssets(
             currency=getattr(s, "currency", "USD"),
-            nav=float(getattr(s, "net_liquidation", 0) or 0),
-            cash=float(getattr(s, "cash", 0) or 0),
-            stock_value=float(getattr(s, "gross_position_value", 0) or 0),
-            realized_pnl_today=float(getattr(s, "realized_pl", 0) or 0),
-            unrealized_pnl=float(getattr(s, "unrealized_pl", 0) or 0),
+            nav=float(_safe_num(getattr(s, "net_liquidation", 0))),
+            cash=float(_safe_num(getattr(s, "cash", 0))),
+            stock_value=float(_safe_num(getattr(s, "gross_position_value", 0))),
+            realized_pnl_today=float(_safe_num(getattr(s, "realized_pl", 0))),
+            unrealized_pnl=float(_safe_num(getattr(s, "unrealized_pl", 0))),
             raw=a,
         )
 
@@ -820,26 +857,85 @@ class TigerClient:
         return _option_rows_to_dicts(df)
 
     def get_option_greeks(self, contracts) -> list[dict]:
-        """Δ / Γ / Θ / ν / ρ + IV per contract. Tiger-only."""
-        ids = _build_option_identifiers(contracts)
-        if not ids:
+        """Δ / Γ / Θ / ν / ρ + IV per contract.
+
+        Tiger's `QuoteClient.get_option_briefs` does NOT accept a
+        `return_greek_value` kwarg — only `get_option_chain` does. So
+        for each unique (symbol, expiry) in the request we fetch the
+        chain once with `return_greek_value=True`, then filter rows
+        down to the requested (strike, right) combos. One chain call
+        covers many strikes, so this is also cheaper than per-leg calls.
+        """
+        if not contracts:
             raise ValueError(
-                "get_option_greeks: contracts list is empty or all entries "
-                "failed to convert to Tiger option identifiers."
+                "get_option_greeks: contracts list is empty."
             )
+
+        # Group requested legs by (symbol, expiry)
+        wanted: dict[tuple[str, str], list[dict]] = {}
+        for c in contracts:
+            if isinstance(c, str):
+                # Pre-formatted Tiger identifier — best-effort parse:
+                # "MSTR  260718P00250000" → symbol "MSTR", expiry "2026-07-18",
+                # strike 250.0, right "PUT"
+                parsed = _parse_option_identifier(c)
+                if parsed is None:
+                    continue
+                sym, exp, strike, right = parsed
+            elif isinstance(c, dict):
+                sym = (c.get("symbol") or c.get("ticker") or "").strip().upper()
+                exp = str(c.get("expiry") or c.get("expiration") or "")
+                strike_v = c.get("strike")
+                right_v = (c.get("right") or c.get("put_call") or c.get("type") or "").strip().upper()
+                if not (sym and exp and strike_v is not None and right_v):
+                    continue
+                strike = float(strike_v)
+                right = "PUT" if right_v.startswith("P") else "CALL"
+            else:
+                continue
+            wanted.setdefault((sym, exp), []).append({
+                "strike": float(strike),
+                "right": right,
+            })
+
+        if not wanted:
+            raise ValueError(
+                "get_option_greeks: could not parse any (symbol, expiry, strike, right) "
+                "from the supplied contracts."
+            )
+
         qc = self._quote_client()
-        try:
-            df = qc.get_option_briefs(identifiers=ids, return_greek_value=True)
-        except Exception as e:
-            raise _wrap_tiger_error("get_option_greeks", e, hint=f"{len(ids)} contracts")
-        rows = _option_rows_to_dicts(df)
-        keep = {
-            "symbol", "identifier", "expiry", "strike", "right", "put_call",
-            "delta", "gamma", "theta", "vega", "rho", "implied_vol", "iv",
-            "underlying", "underlying_symbol",
-        }
-        return [{k: v for k, v in r.items() if k in keep or k.startswith("greek")}
-                for r in rows]
+        out: list[dict] = []
+        for (sym, exp), legs in wanted.items():
+            tiger_expiry = _tiger_expiry(exp)
+            try:
+                df = qc.get_option_chain(
+                    symbol=sym, expiry=tiger_expiry, return_greek_value=True,
+                )
+            except Exception as e:
+                raise _wrap_tiger_error(
+                    "get_option_greeks", e, hint=f"symbol={sym} expiry={exp}"
+                )
+            rows = _option_rows_to_dicts(df)
+            # Filter to requested strikes + rights.
+            requested = {(float(l["strike"]), l["right"]) for l in legs}
+            keep = {
+                "symbol", "identifier", "expiry", "strike", "right", "put_call",
+                "delta", "gamma", "theta", "vega", "rho", "implied_vol", "iv",
+                "underlying", "underlying_symbol",
+            }
+            for r in rows:
+                try:
+                    r_strike = float(r.get("strike"))
+                    r_right = (r.get("put_call") or r.get("right") or "").strip().upper()
+                except (TypeError, ValueError):
+                    continue
+                if (r_strike, r_right) in requested:
+                    out.append({
+                        k: v for k, v in r.items()
+                        if k in keep or k.startswith("greek")
+                    })
+        return out
 
     def get_option_bars(
         self,
@@ -877,7 +973,13 @@ class TigerClient:
         return _option_rows_to_dicts(df)
 
     def get_option_trade_ticks(self, contracts, limit: int = 50) -> dict:
-        """Recent trade ticks per option contract. Tiger-only."""
+        """Recent trade ticks per option contract. Tiger-only.
+
+        Note: the Tiger SDK's get_option_trade_ticks does NOT accept a
+        `limit` parameter (it does for stock get_trade_ticks but not for
+        the option variant). We accept the parameter for API consistency
+        and apply it in Python after the response comes back.
+        """
         ids = _build_option_identifiers(contracts)
         if not ids:
             raise ValueError(
@@ -886,13 +988,59 @@ class TigerClient:
             )
         qc = self._quote_client()
         try:
-            df = qc.get_option_trade_ticks(identifiers=ids, limit=int(limit))
+            df = qc.get_option_trade_ticks(identifiers=ids)
         except Exception as e:
             raise _wrap_tiger_error("get_option_trade_ticks", e, hint=f"{len(ids)} contracts")
-        return _bars_to_dict(df, key_field="identifier")
+        grouped = _bars_to_dict(df, key_field="identifier")
+        # Client-side truncate to the requested limit per identifier.
+        try:
+            cap = max(int(limit), 1)
+        except (TypeError, ValueError):
+            cap = 50
+        return {k: rows[:cap] for k, rows in grouped.items()}
 
 
 # ── Helpers for option identifiers + row normalization ─────────────────────
+
+
+def _safe_num(v) -> float:
+    """Coerce Tiger SDK numbers to float. Tiger occasionally returns
+    `inf`, `nan`, or strings on certain summary fields (e.g. gross_position
+    _value=Infinity on get_assets). Return 0.0 instead so downstream
+    aggregation doesn't break.
+    """
+    import math
+    try:
+        f = float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+    if math.isnan(f) or math.isinf(f):
+        return 0.0
+    return f
+
+
+def _parse_option_identifier(s: str) -> Optional[tuple[str, str, float, str]]:
+    """Inverse of `_format_option_identifier`. Parse "MSTR  260718P00250000"
+    into (symbol, "YYYY-MM-DD", strike, "PUT"/"CALL"). Returns None on
+    anything that doesn't look like an OCC option string.
+    """
+    s = s.strip()
+    if not _looks_like_option_identifier(s):
+        return None
+    try:
+        strike_int = int(s[-8:])
+        right = "PUT" if s[-9].upper() == "P" else "CALL"
+        yymmdd = s[-15:-9]
+        year = int(yymmdd[:2])
+        # OCC YY → 20YY for years 1970+ (covers all retail trading)
+        full_year = 2000 + year if year < 70 else 1900 + year
+        month = int(yymmdd[2:4])
+        day = int(yymmdd[4:6])
+        iso_exp = f"{full_year:04d}-{month:02d}-{day:02d}"
+        symbol = s[:-15].strip().upper()
+        return symbol, iso_exp, strike_int / 1000.0, right
+    except (ValueError, IndexError):
+        return None
 
 
 def _format_option_identifier(symbol: str, expiry: str, strike: float, right: str) -> str:
