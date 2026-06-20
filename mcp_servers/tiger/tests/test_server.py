@@ -389,6 +389,63 @@ class OrderFillTypeClassificationTests(unittest.TestCase):
         self.assertEqual(row["fill_type"], "normal")
 
 
+class OptionIdentifierParseTests(unittest.TestCase):
+    """Round-trip option identifier formatter ↔ parser. Greeks pathway
+    relies on the parser to read back identifiers."""
+
+    def test_parse_real_put_round_trip(self) -> None:
+        from tiger_api.client import _parse_option_identifier, _format_option_identifier
+        ident = _format_option_identifier("MSTR", "2026-07-18", 250.0, "PUT")
+        parsed = _parse_option_identifier(ident)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        sym, exp, strike, right = parsed
+        self.assertEqual(sym, "MSTR")
+        self.assertEqual(exp, "2026-07-18")
+        self.assertEqual(strike, 250.0)
+        self.assertEqual(right, "PUT")
+
+    def test_parse_call_with_fractional_strike(self) -> None:
+        from tiger_api.client import _parse_option_identifier, _format_option_identifier
+        ident = _format_option_identifier("AAPL", "2027-01-15", 150.5, "CALL")
+        parsed = _parse_option_identifier(ident)
+        assert parsed is not None
+        self.assertEqual(parsed[2], 150.5)
+        self.assertEqual(parsed[3], "CALL")
+
+    def test_parse_non_option_returns_none(self) -> None:
+        from tiger_api.client import _parse_option_identifier
+        self.assertIsNone(_parse_option_identifier("AAPL"))
+        self.assertIsNone(_parse_option_identifier("hello world"))
+
+
+class SafeNumTests(unittest.TestCase):
+    """get_account_summary must not return Infinity / NaN."""
+
+    def test_finite_passthrough(self) -> None:
+        from tiger_api.client import _safe_num
+        self.assertEqual(_safe_num(1.5), 1.5)
+        self.assertEqual(_safe_num(0), 0.0)
+        self.assertEqual(_safe_num(-100), -100.0)
+
+    def test_none_becomes_zero(self) -> None:
+        from tiger_api.client import _safe_num
+        self.assertEqual(_safe_num(None), 0.0)
+
+    def test_infinity_becomes_zero(self) -> None:
+        from tiger_api.client import _safe_num
+        self.assertEqual(_safe_num(float("inf")), 0.0)
+        self.assertEqual(_safe_num(float("-inf")), 0.0)
+
+    def test_nan_becomes_zero(self) -> None:
+        from tiger_api.client import _safe_num
+        self.assertEqual(_safe_num(float("nan")), 0.0)
+
+    def test_garbage_string_becomes_zero(self) -> None:
+        from tiger_api.client import _safe_num
+        self.assertEqual(_safe_num("not a number"), 0.0)
+
+
 class FractionalSharePositionTests(unittest.TestCase):
     """Tiger reports some fractional-share positions with quantity scaled by 1e5.
     The position dict normalizer detects the mismatch with market_value and
