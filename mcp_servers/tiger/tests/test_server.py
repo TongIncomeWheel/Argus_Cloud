@@ -303,6 +303,92 @@ class OptionIdentifierTests(unittest.TestCase):
         self.assertEqual(result, ["MSTR  260718P00250000"])
 
 
+class OrderFillTypeClassificationTests(unittest.TestCase):
+    """Tiger marks worthless expirations / OTM auto-exercises as 'filled'
+    orders with avg_fill_price=0, limit_price=0, commission=0. Without
+    a fill_type tag, downstream code averages those zeros into P&L
+    calculations and misreports performance. _order_to_dict adds
+    fill_type so callers can distinguish them from real trades.
+    """
+
+    class _FakeContract:
+        def __init__(self, sec_type="OPT", symbol="SPY",
+                     right="CALL", strike=735.0, expiry="20260710"):
+            self.sec_type = sec_type
+            self.symbol = symbol
+            self.right = right
+            self.strike = strike
+            self.expiry = expiry
+
+    class _FakeOrder:
+        def __init__(self, **kw):
+            self.contract = kw.get("contract")
+            self.id = kw.get("id", "ord-1")
+            self.status = kw.get("status", "Filled")
+            self.action = kw.get("action", "SELL")
+            self.order_type = kw.get("order_type", "LMT")
+            self.quantity = kw.get("quantity", 1)
+            self.filled = kw.get("filled", 1)
+            self.avg_fill_price = kw.get("avg_fill_price", 0.0)
+            self.limit_price = kw.get("limit_price", 0.0)
+            self.stop_price = kw.get("stop_price", None)
+            self.commission = kw.get("commission", 0.0)
+            self.gst = kw.get("gst", 0.0)
+            self.realized_pnl = kw.get("realized_pnl", 0.0)
+            self.trade_time = kw.get("trade_time", None)
+            self.order_time = kw.get("order_time", None)
+
+    def test_zero_price_filled_option_tagged_expiration(self) -> None:
+        from mcp_servers.tiger.server import _order_to_dict
+        o = self._FakeOrder(contract=self._FakeContract(),
+                            status="Filled",
+                            avg_fill_price=0.0, limit_price=0.0, commission=0.0,
+                            quantity=1, filled=1)
+        row = _order_to_dict(o)
+        self.assertEqual(row["fill_type"], "expiration")
+        self.assertEqual(row["avg_fill_price"], 0.0)  # raw value preserved
+
+    def test_zero_price_explicit_expired_status_tagged_expiration(self) -> None:
+        from mcp_servers.tiger.server import _order_to_dict
+        o = self._FakeOrder(contract=self._FakeContract(),
+                            status="Expired",
+                            avg_fill_price=0.0, limit_price=0.0, commission=0.0,
+                            quantity=1, filled=0)
+        row = _order_to_dict(o)
+        self.assertEqual(row["fill_type"], "expiration")
+
+    def test_real_filled_option_tagged_normal(self) -> None:
+        from mcp_servers.tiger.server import _order_to_dict
+        o = self._FakeOrder(contract=self._FakeContract(),
+                            status="Filled",
+                            avg_fill_price=5.50, limit_price=5.50, commission=1.30,
+                            quantity=1, filled=1)
+        row = _order_to_dict(o)
+        self.assertEqual(row["fill_type"], "normal")
+
+    def test_zero_price_stock_order_not_tagged(self) -> None:
+        """Only option-sec_type orders get the expiration classification;
+        stock orders with zero prices indicate a different bug, not expiry."""
+        from mcp_servers.tiger.server import _order_to_dict
+        stock_ctr = self._FakeContract(sec_type="STK", symbol="SPY",
+                                        right=None, strike=None, expiry=None)
+        o = self._FakeOrder(contract=stock_ctr,
+                            status="Filled",
+                            avg_fill_price=0.0, limit_price=0.0, commission=0.0)
+        row = _order_to_dict(o)
+        self.assertEqual(row["fill_type"], "normal")
+
+    def test_zero_price_cancelled_option_not_expiration(self) -> None:
+        """Cancelled orders also have zero prices but are not expirations."""
+        from mcp_servers.tiger.server import _order_to_dict
+        o = self._FakeOrder(contract=self._FakeContract(),
+                            status="Cancelled",
+                            avg_fill_price=0.0, limit_price=0.0, commission=0.0,
+                            quantity=1, filled=0)
+        row = _order_to_dict(o)
+        self.assertEqual(row["fill_type"], "normal")
+
+
 class FractionalSharePositionTests(unittest.TestCase):
     """Tiger reports some fractional-share positions with quantity scaled by 1e5.
     The position dict normalizer detects the mismatch with market_value and

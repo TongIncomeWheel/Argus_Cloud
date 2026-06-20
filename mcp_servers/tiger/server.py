@@ -269,22 +269,53 @@ def _position_to_dict(p) -> dict:
 
 def _order_to_dict(o) -> dict:
     c = getattr(o, "contract", None)
+    sec_type = getattr(c, "sec_type", "") if c else ""
+    status = _scalar(getattr(o, "status", None))
+    avg_fill = _scalar(getattr(o, "avg_fill_price", None))
+    limit_p = _scalar(getattr(o, "limit_price", None))
+    commission = _scalar(getattr(o, "commission", None))
+    quantity = _scalar(getattr(o, "quantity", None))
+
+    # Classify the order's fill_type. Tiger reports expiry-day events
+    # (worthless expiration, auto-exercise of OTM contracts) as "filled"
+    # orders with avg_fill_price=0, limit_price=0, commission=0. Without
+    # tagging, downstream code can't distinguish these from real trades
+    # and ends up averaging "0" fill prices into P&L calculations.
+    fill_type = "normal"
+    if sec_type == "OPT":
+        try:
+            zero_price = (
+                (avg_fill in (None, 0, 0.0))
+                and (limit_p in (None, 0, 0.0))
+                and (commission in (None, 0, 0.0))
+            )
+            has_size = quantity not in (None, 0, 0.0)
+            looks_filled = (
+                isinstance(status, str)
+                and status.lower() in ("filled", "expired", "auto-exercised", "exercised")
+            )
+            if zero_price and has_size and looks_filled:
+                fill_type = "expiration"
+        except (TypeError, ValueError):
+            pass
+
     return {
         "id": _scalar(getattr(o, "id", None)),
-        "status": _scalar(getattr(o, "status", None)),
+        "status": status,
+        "fill_type": fill_type,
         "action": _scalar(getattr(o, "action", None)),
         "order_type": _scalar(getattr(o, "order_type", None)),
-        "sec_type": getattr(c, "sec_type", "") if c else "",
+        "sec_type": sec_type,
         "symbol": getattr(c, "symbol", "") if c else "",
         "right": getattr(c, "right", None) if c else None,
         "strike": getattr(c, "strike", None) if c else None,
         "expiry": getattr(c, "expiry", None) if c else None,
-        "quantity": _scalar(getattr(o, "quantity", None)),
+        "quantity": quantity,
         "filled": _scalar(getattr(o, "filled", None)),
-        "avg_fill_price": _scalar(getattr(o, "avg_fill_price", None)),
-        "limit_price": _scalar(getattr(o, "limit_price", None)),
+        "avg_fill_price": avg_fill,
+        "limit_price": limit_p,
         "stop_price": _scalar(getattr(o, "stop_price", None)),
-        "commission": _scalar(getattr(o, "commission", None)),
+        "commission": commission,
         "gst": _scalar(getattr(o, "gst", None)),
         "realized_pnl": _scalar(getattr(o, "realized_pnl", None)),
         "trade_time": _scalar(getattr(o, "trade_time", None)),
