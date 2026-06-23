@@ -28,9 +28,19 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mcp_servers.tiger.oauth.storage import OAuthStorage, PendingAuthRequest
 
 
-_ACCESS_TTL = 24 * 3600  # 24 hours — keep claude.ai's refresh cadence low
-_REFRESH_TTL = 30 * 24 * 3600  # 30 days
-_CODE_TTL = 600  # 10 minutes
+# OAuth tokens for THIS server are effectively eternal. The OAuth spec's
+# TTL exists for multi-tenant defense-in-depth — if a token leaks, the
+# damage window is bounded. We have a single user (the owner), a single
+# OAuth client (claude.ai), owner-password-gated consent, and a Tiger
+# API key as the real revocation lever. Forcing daily refresh cycles
+# adds zero security here and 100% of the disconnect pain.
+#
+# Tokens still expire on these TTLs — set to ~10 years so they never
+# trigger in practice. The /revoke endpoint and `pop_*` storage methods
+# remain functional for explicit revocation if the user signs out.
+_ACCESS_TTL = 10 * 365 * 24 * 3600   # 10 years
+_REFRESH_TTL = 10 * 365 * 24 * 3600  # 10 years
+_CODE_TTL = 600  # 10 minutes — short by design (single-use, security-sensitive)
 _PENDING_TTL = 600  # 10 minutes for the consent step
 
 
