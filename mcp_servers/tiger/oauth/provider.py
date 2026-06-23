@@ -28,7 +28,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mcp_servers.tiger.oauth.storage import OAuthStorage, PendingAuthRequest
 
 
-_ACCESS_TTL = 3600  # 1 hour
+_ACCESS_TTL = 24 * 3600  # 24 hours — keep claude.ai's refresh cadence low
 _REFRESH_TTL = 30 * 24 * 3600  # 30 days
 _CODE_TTL = 600  # 10 minutes
 _PENDING_TTL = 600  # 10 minutes for the consent step
@@ -174,6 +174,20 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
+        """Mint a new access token (and a new refresh token) from a valid
+        refresh token.
+
+        Intentionally does NOT delete the consumed refresh token. The
+        OAuth 2.1 spec recommends rotation, but in practice claude.ai's
+        consumer connector occasionally retries refresh requests (network
+        jitter, race conditions, sleep/wake transitions). If we delete the
+        old token the moment a new one is issued, the retry comes in with
+        a token we just invalidated and the connector silently disconnects.
+
+        Refresh tokens still expire on their own (30-day TTL), so the
+        "tokens accumulate forever" risk is bounded. revoke_token() can
+        also remove them explicitly when the user signs out.
+        """
         access = secrets.token_urlsafe(32)
         new_refresh = secrets.token_urlsafe(32)
         now = int(time.time())
@@ -199,8 +213,7 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
         )
         await self._storage.store_access(access_tok)
         await self._storage.store_refresh(new_refresh_tok)
-        # Rotation: revoke the consumed refresh token.
-        await self._storage.pop_refresh(refresh_token.token)
+        # NOTE: NOT deleting refresh_token.token here. See docstring.
         return OAuthToken(
             access_token=access,
             token_type="Bearer",

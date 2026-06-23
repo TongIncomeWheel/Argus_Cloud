@@ -56,23 +56,47 @@ def _build_storage() -> OAuthStorage:
                                     required for the hosted deploy so claude.ai
                                     OAuth tokens survive container restarts)
     anything else (or unset)     →  InMemoryStorage (tests, stdio dev)
+
+    If Firestore is requested but unavailable (import error, client init
+    error), we log loudly and crash rather than silently fall back to
+    in-memory — silent fallback was the original source of overnight
+    disconnects because the operator couldn't tell from outside whether
+    Firestore was actually live.
     """
     backend = os.environ.get("MCP_OAUTH_STORAGE", "memory").strip().lower()
+    logger.info("======================================================")
+    logger.info("MCP_OAUTH_STORAGE = %s", backend)
+    logger.info("======================================================")
     if backend == "firestore":
         try:
             from mcp_servers.tiger.oauth.firestore_storage import FirestoreStorage
         except ImportError as e:
             logger.error(
                 "MCP_OAUTH_STORAGE=firestore but google-cloud-firestore is not "
-                "installed; falling back to in-memory: %s", e
+                "installed. Refusing to silently fall back to in-memory because "
+                "that's the original disconnect bug. Install the package or "
+                "set MCP_OAUTH_STORAGE to something else.", exc_info=e,
             )
-            return InMemoryStorage()
+            raise
         project = os.environ.get("GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
         database = os.environ.get("FIRESTORE_DATABASE", "(default)")
-        logger.info("OAuth storage = Firestore (project=%s, db=%s)",
+        try:
+            storage = FirestoreStorage(project=project, database=database)
+        except Exception as e:
+            logger.error(
+                "FirestoreStorage init failed (project=%s db=%s). Refusing to "
+                "silently fall back to in-memory.", project, database, exc_info=e,
+            )
+            raise
+        logger.info("OAuth storage = Firestore (project=%s, db=%s) — PERSISTENT",
                     project or "<ADC>", database)
-        return FirestoreStorage(project=project, database=database)
-    logger.info("OAuth storage = in-memory (state lost on restart)")
+        return storage
+    logger.warning(
+        "OAuth storage = in-memory (state lost on restart). "
+        "This is only safe for stdio/local dev. Hosted deploys MUST set "
+        "MCP_OAUTH_STORAGE=firestore — otherwise claude.ai connector "
+        "will silently disconnect after every Cloud Run cold start."
+    )
     return InMemoryStorage()
 
 

@@ -116,27 +116,60 @@ class FirestoreStorage:
     # ── Access tokens ────────────────────────────────────────────────────
 
     async def get_access(self, token: str) -> Optional[AccessToken]:
-        snap = await self._doc(_COL_ACCESS, token).get()
+        try:
+            snap = await self._doc(_COL_ACCESS, token).get()
+        except Exception as e:
+            logger.error("FirestoreStorage.get_access failed: %s", e)
+            raise
         if not snap.exists:
             return None
-        return _validate(AccessToken, snap.to_dict())
+        try:
+            return _validate(AccessToken, snap.to_dict())
+        except Exception as e:
+            logger.error("get_access: failed to deserialize doc: %s", e)
+            raise
 
     async def store_access(self, token: AccessToken) -> None:
-        await self._doc(_COL_ACCESS, token.token).set(_dump(token))
+        try:
+            await self._doc(_COL_ACCESS, token.token).set(_dump(token))
+        except Exception as e:
+            logger.error("store_access failed: %s", e)
+            raise
 
     async def pop_access(self, token_str: str) -> None:
-        await self._doc(_COL_ACCESS, token_str).delete()
+        try:
+            await self._doc(_COL_ACCESS, token_str).delete()
+        except Exception as e:
+            logger.warning("pop_access: %s", e)
 
     # ── Refresh tokens ───────────────────────────────────────────────────
 
     async def get_refresh(self, token: str) -> Optional[RefreshToken]:
-        snap = await self._doc(_COL_REFRESH, token).get()
+        try:
+            snap = await self._doc(_COL_REFRESH, token).get()
+        except Exception as e:
+            logger.error("FirestoreStorage.get_refresh failed: %s", e)
+            raise
         if not snap.exists:
+            logger.info("get_refresh: token not found in Firestore (prefix=%s)",
+                        token[:8] if token else "")
             return None
-        return _validate(RefreshToken, snap.to_dict())
+        try:
+            return _validate(RefreshToken, snap.to_dict())
+        except Exception as e:
+            logger.error("get_refresh: failed to deserialize doc: %s", e)
+            raise
 
     async def store_refresh(self, token: RefreshToken) -> None:
-        await self._doc(_COL_REFRESH, token.token).set(_dump(token))
+        try:
+            await self._doc(_COL_REFRESH, token.token).set(_dump(token))
+        except Exception as e:
+            logger.error("store_refresh failed (prefix=%s): %s",
+                         token.token[:8], e)
+            raise
 
     async def pop_refresh(self, token_str: str) -> None:
-        await self._doc(_COL_REFRESH, token_str).delete()
+        try:
+            await self._doc(_COL_REFRESH, token_str).delete()
+        except Exception as e:
+            logger.warning("pop_refresh: %s", e)
