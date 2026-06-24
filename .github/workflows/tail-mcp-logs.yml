@@ -1,0 +1,66 @@
+name: Tail Tiger MCP Cloud Run logs
+
+# On-demand diagnostic. Pulls recent Cloud Run logs for the Tiger MCP
+# service and prints them to the workflow log so they can be read via
+# the GitHub MCP without needing gcloud locally. Used when claude.ai
+# reports a disconnect we can't explain from outside the box.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lines:
+        description: 'Number of recent log lines to fetch'
+        required: false
+        default: '300'
+      filter:
+        description: 'Substring filter (case-insensitive). Leave blank for all.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT: tiger-mcp-499603
+  GCP_REGION: asia-southeast1
+  SERVICE: argus-tiger-mcp
+
+jobs:
+  tail:
+    name: Tail logs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+
+      - name: Pull recent Cloud Run logs
+        run: |
+          LINES="${{ inputs.lines }}"
+          FILTER="${{ inputs.filter }}"
+          echo "=========================================="
+          echo "Service: $SERVICE  Region: $GCP_REGION  Project: $GCP_PROJECT"
+          echo "Fetching last $LINES log lines..."
+          echo "=========================================="
+          if [ -n "$FILTER" ]; then
+            gcloud run services logs read "$SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT" \
+              --limit="$LINES" 2>&1 | grep -i "$FILTER" || echo "(no lines matched filter: $FILTER)"
+          else
+            gcloud run services logs read "$SERVICE" \
+              --region="$GCP_REGION" \
+              --project="$GCP_PROJECT" \
+              --limit="$LINES" 2>&1
+          fi
+          echo "=========================================="
+          echo "End of log tail."
