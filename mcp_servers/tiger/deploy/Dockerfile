@@ -25,13 +25,15 @@ RUN pip install -r /tmp/req.txt
 COPY tiger_api ./tiger_api
 COPY mcp_servers ./mcp_servers
 
-ENV MCP_TRANSPORT=sse \
+ENV MCP_TRANSPORT=streamable-http \
     MCP_HOST=0.0.0.0 \
     PORT=8080
 
 EXPOSE 8080
 
-# Cloud Run probes "/" by default; FastMCP's SSE transport responds on
-# /sse. No custom healthcheck needed — Cloud Run treats any 2xx-or-3xx
-# on /sse as healthy when --no-cpu-throttling is on.
-CMD ["python", "-m", "mcp_servers.tiger.server", "--transport", "sse"]
+# Cloud Run probes the service URL by default. Streamable-HTTP transport
+# responds on /mcp. Each tool call is its own short-lived HTTP request,
+# so there's no persistent SSE stream to be killed by Cloud Run's
+# 60-minute request timeout. Earlier deploys used --transport sse and
+# saw connections die after the 1h SSE max.
+CMD ["python", "-m", "mcp_servers.tiger.server", "--transport", "streamable-http"]

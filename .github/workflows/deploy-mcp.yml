@@ -151,7 +151,7 @@ jobs:
             --concurrency 50 \
             --timeout 3600 \
             --no-cpu-throttling \
-            --set-env-vars MCP_TRANSPORT=sse,MCP_HOST=0.0.0.0,TIGER_LICENSE=TBSG,TIGER_ENV=PROD,MCP_BASE_URL=${SERVICE_URL},MCP_OAUTH_STORAGE=firestore,GCP_PROJECT=${GCP_PROJECT},MCP_OAUTH_CLIENT_ID=argus-tiger-mcp-claude \
+            --set-env-vars MCP_TRANSPORT=streamable-http,MCP_HOST=0.0.0.0,TIGER_LICENSE=TBSG,TIGER_ENV=PROD,MCP_BASE_URL=${SERVICE_URL},MCP_OAUTH_STORAGE=firestore,GCP_PROJECT=${GCP_PROJECT},MCP_OAUTH_CLIENT_ID=argus-tiger-mcp-claude \
             --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest,MCP_OAUTH_CLIENT_SECRET=mcp-oauth-client-secret:latest \
             --quiet
 
@@ -162,11 +162,11 @@ jobs:
           curl -fsS "$SERVICE_URL/.well-known/oauth-authorization-server" \
             | python3 -c "import json,sys; d=json.load(sys.stdin); print(' ', d['issuer']); print(' ', 'endpoints:', sorted(k for k in d if k.endswith('_endpoint')))"
           echo
-          echo "→ /sse without bearer expects HTTP 401"
-          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$SERVICE_URL/sse")
+          echo "→ /mcp without bearer expects HTTP 401"
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$SERVICE_URL/mcp")
           echo "  got HTTP $code"
           if [ "$code" != "401" ]; then
-            echo "::warning::Expected 401 on unauth /sse, got $code"
+            echo "::warning::Expected 401 on unauth /mcp, got $code"
           fi
           echo
           echo "✅ deployed: $SERVICE_URL"
@@ -184,7 +184,8 @@ jobs:
           echo "Use these in claude.ai/settings/connectors → Add custom connector"
           echo "=========================================="
           echo
-          echo "  URL:              $SERVICE_URL/sse"
+          echo "  URL:              $SERVICE_URL/mcp"
+          echo "  (streamable-http transport; replaces the older /sse endpoint)"
           echo "  OAuth Client ID:  argus-tiger-mcp-claude"
           printf "  OAuth Client Secret: "
           gcloud secrets versions access latest \
