@@ -98,6 +98,36 @@ jobs:
             --quiet > /dev/null
           echo "✓ Firestore ready"
 
+      # Ensure the static OAuth client_secret exists in Secret Manager.
+      # If missing, generate a random 48-char URL-safe token and store
+      # it. Grant the runtime compute SA accessor on it. Subsequent runs
+      # are no-ops. The client_id itself is a fixed string in env vars
+      # (not secret — just a public identifier for claude.ai's form).
+      - name: Ensure static OAuth client secret exists
+        env:
+          PROJECT_NUMBER: "686093261470"
+        run: |
+          set +e
+          SECRET_NAME="mcp-oauth-client-secret"
+          RUN_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+          if gcloud secrets describe "$SECRET_NAME" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+            echo "→ secret $SECRET_NAME already exists"
+          else
+            echo "→ creating $SECRET_NAME with random 48-char value"
+            python3 -c "import secrets; print(secrets.token_urlsafe(48), end='')" \
+              | gcloud secrets create "$SECRET_NAME" \
+                  --data-file=- \
+                  --replication-policy=automatic \
+                  --project "$GCP_PROJECT" --quiet
+          fi
+          echo "→ grant runtime SA Secret Accessor on $SECRET_NAME"
+          gcloud secrets add-iam-policy-binding "$SECRET_NAME" \
+            --member="serviceAccount:${RUN_SA}" \
+            --role="roles/secretmanager.secretAccessor" \
+            --project="$GCP_PROJECT" \
+            --quiet > /dev/null
+          echo "✓ Static OAuth client secret ready"
+
       # gcloud run deploy --source . wants the Dockerfile at the source
       # root, not nested under mcp_servers/tiger/deploy/. Mirror it for
       # the duration of this job — the copy is local to the runner and
@@ -121,8 +151,8 @@ jobs:
             --concurrency 50 \
             --timeout 3600 \
             --no-cpu-throttling \
-            --set-env-vars MCP_TRANSPORT=sse,MCP_HOST=0.0.0.0,TIGER_LICENSE=TBSG,TIGER_ENV=PROD,MCP_BASE_URL=${SERVICE_URL},MCP_OAUTH_STORAGE=firestore,GCP_PROJECT=${GCP_PROJECT} \
-            --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest \
+            --set-env-vars MCP_TRANSPORT=sse,MCP_HOST=0.0.0.0,TIGER_LICENSE=TBSG,TIGER_ENV=PROD,MCP_BASE_URL=${SERVICE_URL},MCP_OAUTH_STORAGE=firestore,GCP_PROJECT=${GCP_PROJECT},MCP_OAUTH_CLIENT_ID=argus-tiger-mcp-claude \
+            --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest,MCP_OAUTH_CLIENT_SECRET=mcp-oauth-client-secret:latest \
             --quiet
 
       - name: Post-deploy sanity checks
@@ -140,3 +170,31 @@ jobs:
           fi
           echo
           echo "✅ deployed: $SERVICE_URL"
+
+      # Print the connector configuration values so the user has them
+      # available for claude.ai's "Add custom connector" form. Repo logs
+      # are only visible to collaborators (single user), so this is an
+      # acceptable trade-off vs forcing the user to navigate Secret
+      # Manager UI on every connector re-add.
+      - name: Print claude.ai connector setup values
+        run: |
+          set -e
+          echo "=========================================="
+          echo "CLAUDE.AI CUSTOM CONNECTOR SETUP VALUES"
+          echo "Use these in claude.ai/settings/connectors → Add custom connector"
+          echo "=========================================="
+          echo
+          echo "  URL:              $SERVICE_URL/sse"
+          echo "  OAuth Client ID:  argus-tiger-mcp-claude"
+          printf "  OAuth Client Secret: "
+          gcloud secrets versions access latest \
+            --secret=mcp-oauth-client-secret \
+            --project="$GCP_PROJECT"
+          echo
+          echo
+          echo "  Owner Password (consent page): "
+          gcloud secrets versions access latest \
+            --secret=mcp-oauth-owner-password \
+            --project="$GCP_PROJECT"
+          echo
+          echo "=========================================="

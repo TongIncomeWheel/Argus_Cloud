@@ -49,6 +49,49 @@ logger = logging.getLogger("tiger-mcp")
 bootstrap_from_env()
 
 
+async def _ensure_static_oauth_client(provider: TigerOAuthProvider) -> None:
+    """If MCP_OAUTH_CLIENT_ID / _SECRET are set, pre-register that client
+    in storage so claude.ai can use the connector form's "OAuth Client ID"
+    + "OAuth Client Secret" fields instead of relying on Dynamic Client
+    Registration.
+
+    DCR puts the client_id in claude.ai's local state, which can be
+    evicted (cache cleanup, internal lifecycle, etc.) — leaving the
+    connector unable to refresh and silently disconnecting. Static
+    credentials live in claude.ai's connector config itself, so they
+    can never be lost short of the user deleting the connector.
+    """
+    client_id = os.environ.get("MCP_OAUTH_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("MCP_OAUTH_CLIENT_SECRET", "").strip()
+    if not client_id:
+        logger.info("MCP_OAUTH_CLIENT_ID not set — static client not registered. "
+                    "claude.ai will use DCR (less reliable for our case).")
+        return
+    existing = await provider.get_client(client_id)
+    if existing is not None:
+        logger.info("Static OAuth client already in storage: %s...",
+                    client_id[:16])
+        return
+    # First boot with this client_id — register it.
+    from mcp.shared.auth import OAuthClientInformationFull
+    client_info = OAuthClientInformationFull(
+        client_id=client_id,
+        client_secret=client_secret or None,
+        client_name="Tiger MCP static client",
+        redirect_uris=[
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://claude.com/api/mcp/auth_callback",
+        ],
+        scope="tiger:read tiger:trade",
+        token_endpoint_auth_method=("client_secret_post" if client_secret else "none"),
+        grant_types=["authorization_code", "refresh_token"],
+        response_types=["code"],
+    )
+    await provider.register_client(client_info)
+    logger.info("Static OAuth client registered: %s... (with secret: %s)",
+                client_id[:16], "yes" if client_secret else "no")
+
+
 def _build_storage() -> OAuthStorage:
     """Pick the OAuth storage backend.
 
@@ -143,6 +186,19 @@ def _build_server() -> FastMCP:
         # cancel, roll). A single "tiger:read" was misleading users into
         # thinking trades were blocked.
         scopes = ["tiger:read", "tiger:trade"]
+        # If static client credentials are configured, register that
+        # client on the FastMCP startup hook so claude.ai's connector
+        # form can pre-populate "OAuth Client ID" + "OAuth Client
+        # Secret" instead of relying on Dynamic Client Registration.
+        # DCR-issued credentials live in claude.ai's volatile cache and
+        # appear to be the recurring root cause of overnight disconnects.
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _lifespan(_mcp):
+            await _ensure_static_oauth_client(provider)
+            yield
+
         mcp_instance = FastMCP(
             name,
             instructions=instructions,
@@ -160,6 +216,7 @@ def _build_server() -> FastMCP:
                 ),
                 revocation_options=RevocationOptions(enabled=True),
             ),
+            lifespan=_lifespan,
         )
         render, handle = make_consent_routes(provider)
         mcp_instance.custom_route("/consent", methods=["GET"])(render)
