@@ -157,6 +157,12 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
         await self._storage.store_refresh(refresh_tok)
         # One-time use: invalidate the auth code.
         await self._storage.pop_code(authorization_code.code)
+        import logging
+        logging.getLogger("tiger-mcp.oauth").info(
+            "exchange_authorization_code: minted access (prefix=%s, "
+            "expires_at=%d) + refresh (prefix=%s) for client=%s",
+            access[:10], now + _ACCESS_TTL, refresh[:10], client.client_id,
+        )
         return OAuthToken(
             access_token=access,
             token_type="Bearer",
@@ -171,9 +177,29 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
         refresh_token: str,
     ) -> Optional[RefreshToken]:
         rt = await self._storage.get_refresh(refresh_token)
-        if rt is None or rt.client_id != client.client_id:
+        if rt is None:
+            import logging
+            logging.getLogger("tiger-mcp.oauth").warning(
+                "load_refresh_token: NOT FOUND in storage. prefix=%s len=%d. "
+                "claude.ai requested refresh but server has no record.",
+                refresh_token[:10] if refresh_token else "<empty>",
+                len(refresh_token) if refresh_token else 0,
+            )
+            return None
+        if rt.client_id != client.client_id:
+            import logging
+            logging.getLogger("tiger-mcp.oauth").warning(
+                "load_refresh_token: CLIENT_ID MISMATCH. token's client=%s "
+                "requesting client=%s",
+                rt.client_id, client.client_id,
+            )
             return None
         if rt.expires_at is not None and rt.expires_at < time.time():
+            import logging
+            logging.getLogger("tiger-mcp.oauth").warning(
+                "load_refresh_token: EXPIRED. prefix=%s. With 10y TTL "
+                "this should never fire.", refresh_token[:10],
+            )
             await self._storage.pop_refresh(refresh_token)
             return None
         return rt
@@ -237,8 +263,24 @@ class TigerOAuthProvider(OAuthAuthorizationServerProvider):
     async def load_access_token(self, token: str) -> Optional[AccessToken]:
         at = await self._storage.get_access(token)
         if at is None:
+            # CRITICAL: this is the silent-401 path. Log loudly so when
+            # claude.ai's bearer mysteriously stops working, we can see
+            # exactly which token isn't in storage.
+            import logging
+            logging.getLogger("tiger-mcp.oauth").warning(
+                "load_access_token: bearer NOT FOUND in storage. "
+                "prefix=%s len=%d. claude.ai will get 401 and likely "
+                "show 'disconnected'.",
+                token[:10] if token else "<empty>", len(token) if token else 0,
+            )
             return None
         if at.expires_at is not None and at.expires_at < time.time():
+            import logging
+            logging.getLogger("tiger-mcp.oauth").warning(
+                "load_access_token: bearer EXPIRED. prefix=%s expired_at=%s "
+                "now=%s. With our 10-year TTL this should never fire.",
+                token[:10], at.expires_at, int(time.time()),
+            )
             await self._storage.pop_access(token)
             return None
         return at
