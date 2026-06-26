@@ -23,6 +23,52 @@ runs Python on Cloud Run; tokens are free there.
 
 ---
 
+## Data freshness protocol (READ BEFORE EVERY COMPUTE STEP)
+
+Tiger MCP tools have **three different freshness profiles**. Mixing them
+silently produces wrong answers. Before any analytical step, decide which
+freshness tier you actually need and call the matching tool.
+
+| Tier | Source | Latency | Tools |
+|---|---|---|---|
+| **Live quote** | Tiger L1 push | sub-second | `get_option_briefs`, `get_option_chain`, `get_option_depth`, `get_option_trade_ticks` |
+| **Position snapshot** | Tiger account cache | seconds–minutes (depends on Tiger's internal refresh) | `get_option_positions`, `get_stock_positions`, `get_account_summary`, `get_prime_assets` |
+| **Underlying spot (equity)** | yfinance (server-side, inside compute_portfolio_greeks) | ~15 min delayed | embedded in `compute_portfolio_greeks` |
+
+Rules:
+
+1. **Position state (qty, avg_cost, symbol/expiry/strike) is reliable**
+   from `get_option_positions`. Treat it as ground truth.
+2. **`market_price` on a position is NOT reliable for execution.** It's a
+   Tiger-cached mark, age unknown. Whenever the user is about to act on
+   it — sizing a roll, deciding to BTC, computing real-time P&L — re-quote
+   via `get_option_briefs` first. Burn the extra round-trip; it's cheap.
+3. **For book-wide Greeks** call `compute_portfolio_greeks` directly. It
+   fetches yfinance spot per call (no cache), but uses position.market_price
+   as the option price. If you need contract-level *freshness* for the
+   Greeks (not just spot), tell the user the IV solve is based on a
+   possibly-stale position mark and ask whether they want a `briefs`
+   re-quote first.
+4. **For "what does my book actually look like RIGHT NOW"** the canonical
+   sequence is:
+   ```
+   get_option_positions          → identifiers + quantities
+   get_option_briefs(those ids)  → fresh bid/ask/mid per contract
+   ```
+   Mark-to-market = qty × 100 × briefs.mid. Do not trust
+   positions.market_value for live decisions.
+5. **Never claim a number is "current" or "live" without naming the
+   source and its latency.** "Net theta ≈ $X/day (yfinance spot ~15 min
+   delayed; IV solved from Tiger position marks of unknown age)" is the
+   correct level of disclosure.
+
+If the user runs a project-layer command (e.g., `/md-pacing`, `/md-yield`)
+that needs freshness, the FIRST action of that command MUST be a refresh
+sweep matching the tier above. If the command spec doesn't say so,
+treat that as a charter bug and flag it before running.
+
+---
+
 ## Decision tree (read first)
 
 | User asks about… | Tool to call FIRST |
@@ -77,10 +123,29 @@ user actually mentioned will do.
 
 - **`get_open_orders()`** → currently working orders.
 - **`get_filled_orders(days=7)`** → fills in the last N days. Auto-chunks
-  into 30-day windows under Tiger's 90-day cap. Each order has a
-  `fill_type` field: `"normal"` for real fills, `"expiration"` for
-  worthless-expiry / auto-exercise events (use this to filter out
-  zero-priced expiry events when computing realized P&L).
+  into 30-day windows under Tiger's 90-day cap.
+
+  **MANDATORY: filter by `fill_type` before any P&L / yield / premium
+  averaging.** Each order has a `fill_type` field:
+    - `"normal"` — real economic fills. Use these for premium collected,
+      avg price, fill count for performance attribution.
+    - `"expiration"` — worthless-expiry / auto-exercise events. These
+      have `avg_fill_price=0`, `limit_price=0`, `commission=0` but a
+      nonzero quantity, because Tiger records expiry as a "filled" order.
+
+  Pseudocode any command MUST use when computing premium / yield:
+  ```
+  fills = get_filled_orders(days=N)
+  real  = [f for f in fills if f["fill_type"] == "normal"]
+  expiries = [f for f in fills if f["fill_type"] == "expiration"]
+  # Premium / yield math goes over `real`.
+  # Expiry events count toward win-rate / cycle completion separately.
+  ```
+
+  If a command counts expiry events into "avg premium per fill" or "fill
+  count for yield", numbers will be silently wrong — premiums get divided
+  by an inflated denominator. This is a known footgun; treat as a
+  charter bug if you see a command spec missing the filter.
 - **`get_cancelled_orders(days=7)`** → cancelled orders.
 - **`get_transactions(symbol, days=30, limit=100)`** → per-fill executions
   for one ticker. Tiger requires a symbol filter — for portfolio-wide
@@ -98,9 +163,18 @@ user actually mentioned will do.
   contract. Use for mark-to-market and execution pricing on contracts
   whose identifiers you already know.
 - **`get_option_greeks([contracts])`** → Δ/Γ/Θ/ν/ρ + IV per contract.
-  ⚠️ Tiger denies this for retail TBSG accounts — falls through to
-  permission errors. Prefer `compute_portfolio_greeks` for whole-book
-  Greeks, or compute per-contract from `get_option_chain`'s Greeks fields.
+  ⚠️ **Tiger denies this for retail TBSG accounts (this account is TBSG).
+  EXPECT a 403 / permission error.** Do not list this tool as a primary
+  source in any project-layer command — it WILL fail silently and produce
+  degraded output with no error surfaced upward. Route every Greeks
+  request to one of:
+    1. `compute_portfolio_greeks` — whole-book Δ + Θ, local BS solve.
+    2. `get_option_chain(..., include_greeks=True)` — per-contract Greeks
+       served from the chain endpoint (separate Tiger code path, works on
+       TBSG when the L1 entitlement is active).
+  If a charter still calls `get_option_greeks` directly, that is a
+  charter bug — flag it and substitute one of the routes above before
+  proceeding.
 - **`get_option_bars([contracts], period, limit)`** → OHLC bars.
 - **`get_option_depth([contracts])`** → L2 ladder.
 - **`get_option_trade_ticks([contracts], limit)`** → recent prints.
@@ -187,6 +261,33 @@ When the user asks one of these:
 
 ---
 
+## Command-author checklist (run this against every /md-* or /aegis-* spec)
+
+Before executing ANY project-layer command, mentally walk this list. If
+the command spec violates any item, FIRST flag it to the user, THEN
+substitute the correct path. Do not run a broken command silently.
+
+1. **Freshness sweep declared?** First action should be a refresh matching
+   the data tier (live quote vs. position snapshot vs. spot). See "Data
+   freshness protocol" above.
+2. **No `get_option_greeks` as a primary source.** Tiger 403s for TBSG.
+   Use `compute_portfolio_greeks` or chain-Greeks.
+3. **Spot source correct for the project?** Tiger-only project →
+   yfinance-via-`compute_portfolio_greeks` or Alpaca (when E2 lands).
+   IBKR-attached project → `get_price_snapshot`. Never invent a price.
+4. **`fill_type == "normal"` filter applied to any premium/yield/avg
+   math?** Expiry events are filled-with-zero-price and will dilute
+   averages otherwise.
+5. **All numbers attributed to a source + latency?** "Net Δ ≈ X (yfinance
+   spot ~15 min delayed; IV from Tiger position mark, unknown age)".
+6. **Write tools: preview before confirm, always.** No exceptions for
+   urgency.
+
+If the command passes all six, run it. If it fails any, fix it in
+conversation with the user before pushing through.
+
+---
+
 ## What Claude should NEVER do
 
 1. **Never re-derive Greeks in context.** If asked, call
@@ -202,9 +303,18 @@ When the user asks one of these:
    Greeks.** Tiger returns 403 for retail TBSG. Use
    `compute_portfolio_greeks` directly.
 5. **Never fetch equity spot from a Tiger tool.** The server intentionally
-   doesn't expose one. Use the IBKR connector's `get_price_snapshot`, OR
-   accept that `compute_portfolio_greeks` already pulls spot via yfinance
-   internally (no extra fetch needed for Greeks workflow).
+   doesn't expose one (Tiger US Equity L1 is a separate subscription we
+   don't carry). Correct spot routes, by context:
+   - **Inside the Greeks workflow** → already handled. `compute_portfolio_greeks`
+     fetches yfinance spot per call server-side. Don't do a separate spot pull.
+   - **Tiger-only project (e.g. Project MD)** → for charts, watchlists,
+     scenario inputs, use `compute_portfolio_greeks` if the symbol is
+     already in the option book (read its `spot` field from the response),
+     otherwise note "spot not available from Tiger MCP — would need
+     Alpaca (Phase E2)". Do **not** invent prices.
+   - **Project with IBKR connector also attached (e.g. Aegis)** → use
+     IBKR's `get_price_snapshot` for clean real-time spot. This is the
+     ONLY context where `get_price_snapshot` applies.
 
 ---
 
