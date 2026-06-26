@@ -646,6 +646,260 @@ def get_option_trade_ticks(contracts: list[dict], limit: int = 50) -> dict:
     return _get_client().get_option_trade_ticks(contracts, limit=limit)
 
 
+# ── Analytics tools (Phase E1) — local compute, no Tiger Greeks dependency ───
+
+
+def _yfinance_spot_batch(symbols: list[str]) -> dict[str, float]:
+    """Batch fetch underlying spot prices via yfinance.
+
+    Free, no auth, ~15-minute delayed. Used because Tiger's spot-prices
+    endpoint requires a separate US Equity L1 subscription. Returns
+    {SYMBOL_UPPER: float}. Tickers with no quote are dropped silently;
+    callers should diff requested-vs-returned to log misses.
+    """
+    if not symbols:
+        return {}
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.warning(
+            "yfinance not installed — compute_portfolio_greeks cannot fetch "
+            "underlying spots. Add yfinance to requirements-mcp.txt."
+        )
+        return {}
+    out: dict[str, float] = {}
+    uniq = sorted({s.upper() for s in symbols})
+    try:
+        tickers = yf.Tickers(" ".join(uniq))
+        for sym in uniq:
+            try:
+                t = tickers.tickers.get(sym)
+                if not t:
+                    continue
+                fast = getattr(t, "fast_info", None)
+                price = None
+                if fast is not None:
+                    price = (
+                        fast.get("last_price")
+                        or fast.get("lastPrice")
+                        or fast.get("regular_market_price")
+                    )
+                if not price:
+                    info = t.info or {}
+                    price = info.get("regularMarketPrice") or info.get("currentPrice")
+                if price:
+                    out[sym] = float(price)
+            except Exception as e:
+                logger.warning("yfinance spot fetch failed for %s: %s", sym, e)
+                continue
+    except Exception as e:
+        logger.warning("yfinance batch fetch failed: %s", e)
+    return out
+
+
+def _parse_tiger_expiry(value: Any) -> Optional[date]:
+    """Tiger position.contract.expiry comes back in inconsistent formats —
+    sometimes ISO 'YYYY-MM-DD', sometimes compact 'YYYYMMDD', sometimes a
+    datetime/date object. Coerce to a `date` or None."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    s = str(value).strip()
+    if not s:
+        return None
+    if "-" in s:
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    if "/" in s:
+        try:
+            return datetime.strptime(s[:10], "%Y/%m/%d").date()
+        except ValueError:
+            pass
+    try:
+        return datetime.strptime(s[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+
+
+def _round(v: Any, n: int = 4) -> Optional[float]:
+    """None-safe rounding so payloads stay tight without crashing on None."""
+    if v is None:
+        return None
+    try:
+        return round(float(v), n)
+    except (TypeError, ValueError):
+        return None
+
+
+@mcp.tool()
+def compute_portfolio_greeks(
+    risk_free_rate: float = 0.045,
+    dividend_yield: float = 0.0,
+) -> dict:
+    """Compute Δ + Θ for every option position and aggregate net + gross exposure.
+
+    Tiger denies Greeks for retail TBSG accounts, so this tool computes them
+    locally via Black-Scholes:
+      • Spot price: yfinance (free, ~15-min delayed)
+      • IV: Newton-Raphson solved from each position's market_price
+      • Delta + Theta: BS closed form, sign-flipped for short positions
+
+    Sign convention (handled by compute_greeks — verify against your view):
+      • Long calls / short puts → delta > 0
+      • Short calls / long puts → delta < 0
+      • Long options  → theta < 0  (decay hurts you)
+      • Short options → theta > 0  (decay pays you)
+
+    Position-level scaling:
+      delta_shares      = delta * 100 * |quantity|
+      theta_per_day_usd = theta_per_day * 100 * |quantity|
+
+    Args:
+      risk_free_rate: annualized risk-free rate (default 4.5%)
+      dividend_yield: continuous dividend yield (default 0.0)
+
+    Returns:
+      positions:   per-position rows with computed Greeks and dollar exposure
+      aggregates:  net + gross deltas and theta plus priced/total counts
+      skipped:     positions we couldn't price, with the reason
+      notes:       human-readable caveats (delayed spot, missing tickers, etc.)
+    """
+    from tiger_api.greeks import compute_greeks
+
+    asof = date.today()
+    raw_positions = _get_client().get_option_positions()
+    positions = [_position_to_dict(p) for p in raw_positions]
+
+    symbols = sorted({p["symbol"] for p in positions if p.get("symbol")})
+    spots = _yfinance_spot_batch(symbols)
+    missing_spots = [s for s in symbols if s not in spots]
+
+    out_positions: list[dict] = []
+    skipped: list[dict] = []
+    net_delta_shares = 0.0
+    net_theta_usd = 0.0
+    gross_delta_shares = 0.0
+    gross_theta_usd = 0.0
+    priced = 0
+
+    for p in positions:
+        symbol = (p.get("symbol") or "").upper()
+        strike = p.get("strike")
+        right = (p.get("right") or "").upper()
+        qty = p.get("quantity")
+        market_price = p.get("market_price")
+        expiry_raw = p.get("expiry")
+        expiry_date = _parse_tiger_expiry(expiry_raw)
+
+        def _skip(reason: str) -> None:
+            skipped.append({
+                "symbol": symbol,
+                "expiry": expiry_raw,
+                "strike": strike,
+                "right": right,
+                "reason": reason,
+            })
+
+        if right not in ("PUT", "CALL"):
+            _skip(f"non-option right={right!r}")
+            continue
+        spot = spots.get(symbol)
+        if spot is None:
+            _skip(f"no spot price for {symbol} (yfinance miss)")
+            continue
+        if expiry_date is None:
+            _skip(f"unparseable expiry {expiry_raw!r}")
+            continue
+        try:
+            qty_f = float(qty)
+            strike_f = float(strike)
+            mkt_f = float(market_price)
+        except (TypeError, ValueError):
+            _skip(f"non-numeric qty/strike/market_price ({qty!r}/{strike!r}/{market_price!r})")
+            continue
+        if qty_f == 0 or strike_f <= 0 or mkt_f <= 0:
+            _skip(f"zero/invalid qty={qty_f} strike={strike_f} mkt={mkt_f}")
+            continue
+
+        dte_days = (expiry_date - asof).days
+        if dte_days < 0:
+            _skip(f"already expired ({expiry_date.isoformat()})")
+            continue
+        if dte_days == 0:
+            dte_days = 0.5
+
+        is_call = (right == "CALL")
+        is_long = (qty_f > 0)
+        g = compute_greeks(
+            spot=spot, strike=strike_f, dte_days=dte_days,
+            market_price=mkt_f, is_call=is_call, is_long=is_long,
+            r=risk_free_rate, q=dividend_yield,
+        )
+        if g["delta"] is None or g["theta_per_day"] is None:
+            _skip("IV solve failed (price below intrinsic or non-convergent)")
+            continue
+
+        abs_qty = abs(qty_f)
+        delta_shares = g["delta"] * 100.0 * abs_qty
+        theta_usd = g["theta_per_day"] * 100.0 * abs_qty
+
+        out_positions.append({
+            "symbol": symbol,
+            "expiry": expiry_date.isoformat(),
+            "strike": strike_f,
+            "right": right,
+            "quantity": qty_f,
+            "spot": _round(spot, 4),
+            "market_price": _round(mkt_f, 4),
+            "dte_days": dte_days,
+            "delta": _round(g["delta"], 4),
+            "theta_per_day": _round(g["theta_per_day"], 4),
+            "iv": _round(g["iv"], 4),
+            "delta_shares": _round(delta_shares, 2),
+            "theta_per_day_usd": _round(theta_usd, 2),
+        })
+        net_delta_shares += delta_shares
+        net_theta_usd += theta_usd
+        gross_delta_shares += abs(delta_shares)
+        gross_theta_usd += abs(theta_usd)
+        priced += 1
+
+    notes: list[str] = []
+    if missing_spots:
+        notes.append(
+            f"No spot for: {', '.join(missing_spots)} — those positions skipped. "
+            "yfinance may rate-limit, or the ticker isn't on Yahoo."
+        )
+    notes.append(
+        "Spot ≈ 15-min delayed (yfinance). IV solved per-position from market_price; "
+        "stale/wide bid-ask can produce noisy IV. For real-time Greeks, wire Alpaca "
+        "(Phase E2 — see BACKLOG.md)."
+    )
+
+    return {
+        "positions": out_positions,
+        "aggregates": {
+            "net_delta_shares": _round(net_delta_shares, 2),
+            "net_theta_per_day_usd": _round(net_theta_usd, 2),
+            "gross_delta_shares": _round(gross_delta_shares, 2),
+            "gross_theta_per_day_usd": _round(gross_theta_usd, 2),
+            "priced_positions": priced,
+            "total_positions": len(positions),
+        },
+        "skipped": skipped,
+        "asof_date": asof.isoformat(),
+        "spot_source": "yfinance",
+        "risk_free_rate": risk_free_rate,
+        "dividend_yield": dividend_yield,
+        "notes": notes,
+    }
+
+
 # ── Write tools (Phase 2c) — preview by default, confirm explicitly ──────────
 
 

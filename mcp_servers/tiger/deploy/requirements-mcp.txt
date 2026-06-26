@@ -1,7 +1,12 @@
 # Minimal deps for the hosted MCP server. Keeps the deploy image small —
-# excludes streamlit, plotly, gspread, alpaca-py, yfinance, etc. that only the
-# Argus UI needs.
+# excludes streamlit, plotly, gspread, alpaca-py that only the Argus UI needs.
+#
+# yfinance is in here for compute_portfolio_greeks (and any future analytics
+# tool that needs underlying spot). Tiger's spot-prices endpoint requires a
+# separate US Equity L1 subscription we don't carry; yfinance is free and
+# ~15-min delayed, which is good enough for risk-aggregation purposes.
 tigeropen>=3.5.0
 mcp>=1.0.0
 pandas>=2.0.0
 google-cloud-firestore>=2.16.0
+yfinance>=0.2.0
