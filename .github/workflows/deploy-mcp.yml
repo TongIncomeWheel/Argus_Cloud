@@ -144,14 +144,29 @@ jobs:
           SECRET_NAME="mcp-income-wheel-sheet-id"
           RUN_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
           if gcloud secrets describe "$SECRET_NAME" --project "$GCP_PROJECT" >/dev/null 2>&1; then
-            echo "→ secret $SECRET_NAME already exists"
+            # Make sure the secret has at least one version. A bare
+            # `gcloud secrets create` from an empty payload (earlier
+            # buggy attempt) created the container but no version, and
+            # Cloud Run's --set-secrets resolution then 404s on :latest.
+            # If no versions exist, seed one with the NOT_SET sentinel.
+            if ! gcloud secrets versions list "$SECRET_NAME" --project "$GCP_PROJECT" --limit 1 --format='value(name)' | grep -q .; then
+              echo "→ secret $SECRET_NAME exists but has no versions — seeding NOT_SET sentinel"
+              printf "NOT_SET" | gcloud secrets versions add "$SECRET_NAME" \
+                --data-file=- --project "$GCP_PROJECT" --quiet
+            else
+              echo "→ secret $SECRET_NAME already exists with at least one version"
+            fi
           else
-            echo "→ creating $SECRET_NAME with empty placeholder"
-            printf "" | gcloud secrets create "$SECRET_NAME" \
+            echo "→ creating $SECRET_NAME seeded with NOT_SET sentinel"
+            # Non-empty payload is REQUIRED — Secret Manager silently
+            # skips creating a version on empty stdin. data_table.py
+            # treats "NOT_SET" as unconfigured so get_position_roc falls
+            # through to the Tiger 90-day fallback automatically.
+            printf "NOT_SET" | gcloud secrets create "$SECRET_NAME" \
               --data-file=- \
               --replication-policy=automatic \
               --project "$GCP_PROJECT" --quiet
-            echo "::warning::mcp-income-wheel-sheet-id created EMPTY. "\
+            echo "::warning::mcp-income-wheel-sheet-id created with NOT_SET sentinel. "\
               "get_position_roc will use Tiger 90-day fallback until you set the value. "\
               "To set: echo -n '<sheet-id>' | gcloud secrets versions add mcp-income-wheel-sheet-id --data-file=- --project=$GCP_PROJECT"
           fi
