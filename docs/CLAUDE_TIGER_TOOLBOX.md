@@ -93,7 +93,9 @@ treat that as a charter bug and flag it before running.
 | **Net Δ / Net Θ across the whole option book** | **`compute_portfolio_greeks`** |
 | **Per-position RoC, harvested %, juiced flag** | **`get_position_roc(juiced_only, pot)`** |
 | **PMCC §12 scorecard for one candidate** | **`score_pmcc_candidate(symbol, strike, expiry, side, premium, spot, hv30, ...)`** ← new |
-| **HV30 / HV-N realised vol for an underlying** | **`compute_hv(symbol, lookback_days=30)`** ← new |
+| **HV30 / HV-N realised vol for an underlying** | **`compute_hv(symbol, lookback_days=30)`** |
+| **Per-ticker wheel state (CSP_OPEN / ASSIGNED / CC_OPEN / LEAP_ONLY)** | **`get_wheel_state(symbols=None, pot="all")`** ← new |
+| **PMCC §5.1 Earning Power Test — ROLL vs HOLD** | **`earning_power_test(current_theta_per_day, current_delta, new_theta_per_day, new_delta, roll_debit, new_dte_days, ...)`** ← new |
 | What expiries are available for XYZ? | `get_option_expirations([symbols])` |
 | Full chain for one expiry | `get_option_chain(symbol, expiry)` |
 | Quote on specific contracts I already know | `get_option_briefs([contracts])` |
@@ -282,6 +284,52 @@ Contract dict shape used by `briefs`/`greeks`/`bars`/`depth`/`ticks`:
   already have a hot value from FMP or elsewhere. ~250ms latency; safe
   to call inline at the top of a review.
 
+- **`get_wheel_state(symbols=None, pot="all")`** →
+  per-ticker wheel cycle state classifier. Returns the canonical
+  CSP_OPEN / ASSIGNED / CC_OPEN / LEAP_ONLY / MIXED / IDLE state plus
+  the positions backing it and a `cycle_start_date` anchor (earliest
+  Date_open among currently-held legs for the ticker).
+
+  Args:
+    - `symbols`: optional list of tickers to filter; default = every
+      ticker in the book that isn't on `EXCLUDE_TICKERS`
+    - `pot`: `"all"` | `"core"` | `"active"` | `"sidecar"`
+
+  Returns `{tickers[], summary{total_tickers, by_state, by_pot},
+  asof_date, entry_source, notes[]}`. Each `tickers[]` row exposes
+  `state`, `pot`, `has_stock`, `stock_quantity`, `short_puts[]`,
+  `short_calls[]`, `long_options[]`, `current_positions_count`,
+  `cycle_start_date`, `cycle_start_source`, `days_in_cycle`.
+
+  **Use when:** the user asks "what state are we in on MARA", or any
+  command needs per-ticker wheel context (`/md-pacing`, position
+  triage). Source for cycle_start_date is Sheets primary, Tiger 90-day
+  fallback — same pattern as `get_position_roc`.
+
+- **`earning_power_test(current_theta_per_day, current_delta,
+    new_theta_per_day, new_delta, roll_debit, new_dte_days,
+    expected_daily_drift=0.0, payback_threshold_frac=0.5)`** →
+  PMCC Master Doctrine §5.1 Portfolio Earning Power Test. Pure-math,
+  no live data. Returns the daily improvement, payback days, ROLL/HOLD
+  verdict, and a one-line justification.
+
+  Greeks are **per-day, per-position dollar values** (not annualised).
+  Delta is dollar-delta of the leg (Δ × 100 × contracts). `roll_debit`
+  is positive for debit / negative for credit.
+
+  Three branches the verdict can take:
+    1. `daily_improvement ≤ 0` → HOLD ("new leg doesn't earn more").
+    2. `roll_debit ≤ 0` AND `daily_improvement > 0` → ROLL
+       (net-credit roll that also improves earning; passes on both axes).
+    3. Otherwise `payback_days = roll_debit / daily_improvement`;
+       ROLL if `< new_dte_days × 0.5`, else HOLD.
+
+  **Use when:** the user proposes a roll (BTC X + STO Y) and asks
+  whether to execute. Pull current leg's θ/δ from
+  `compute_portfolio_greeks` or the chain, the new leg's from
+  `score_pmcc_candidate` or chain, then feed both with the proposed
+  net debit/credit.
+
 - **`score_pmcc_candidate(symbol, strike, expiry, side, premium, spot,
     hv30, risk_free_rate=0.045, n_paths=5000, seed=None)`** →
   the **PMCC Master Doctrine v3 §12 Trade Evaluation Scorecard**.
@@ -367,8 +415,11 @@ it via a "Phase E1 follow-up". Do not try to recompute them in chat.
 | CSP candidate scanner (theta_scanner) | `theta_scanner/scan.py` | Python only |
 | PMCC engine (regime, doctrine, scorecard) | `pmcc_engine/` | Python only |
 | Forecast income (theta carry over horizon) | (designed, not built) | Not implemented |
-| §5.1 Earning Power Test (PMCC roll decision math) | (doctrine only) | Not wired — compute in chat from current vs. new leg θ + roll debit |
 | §12 BTC / ROLL scorecard variants | (doctrine only) | `score_pmcc_candidate` is STO-only in v1 |
+| Roll candidate finder (forward-looking) | `tiger_api/rolls.py` | Currently only analyses HISTORIC rolls; forward-looking candidate finder tracked as Priority 2 |
+| Stress test (B / D / B+D scenarios) | `tiger_api/stress.py` | Priority 3 — not yet wired |
+| Win rate by setup bucket | `tiger_api/win_rate.py` | Priority 6 — not yet wired |
+| IV rank / percentile scanner | `tiger_api/iv_scanner.py` | Priority 7 — not yet wired |
 
 When the user asks one of these:
 - "Could compute that, but it's not wired to MCP yet. Want me to add a
@@ -376,9 +427,9 @@ When the user asks one of these:
   to load positions into context and run BS by hand — slow and lossy."
 - The roadmap order is in `BACKLOG.md` (Phase E1). Shipped so far:
   `compute_portfolio_greeks` (2026-06-25), `get_position_roc` (2026-06-27),
-  `score_pmcc_candidate` + `compute_hv` (2026-06-27). Next priorities:
-  `get_wheel_state`, `get_roll_candidates`, BTC/ROLL scorecard variants,
-  §5.1 Earning Power Test as an MCP tool.
+  `score_pmcc_candidate` + `compute_hv` + `get_wheel_state` +
+  `earning_power_test` (2026-06-27). Next priorities: `get_roll_candidates`,
+  stress test, BTC/ROLL scorecard variants, win rate, IV rank.
 
 ---
 

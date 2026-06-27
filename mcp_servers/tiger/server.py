@@ -1430,6 +1430,371 @@ def score_pmcc_candidate(
     }
 
 
+# ── Wheel-state classifier (Phase E1, Priority 1) ────────────────────────────
+
+
+_WHEEL_STATES = {
+    "CSP_OPEN",     # cash, short put(s) open
+    "ASSIGNED",     # holding stock, no short call yet
+    "CC_OPEN",      # holding stock + short call(s)
+    "LEAP_ONLY",    # long option(s) only (PMCC chassis no short cover)
+    "MIXED",        # combinations that don't fit a clean wheel state
+    "IDLE",         # no live position
+}
+
+
+def _earliest_position_entry(
+    sheet_rows: list[dict],
+    fallback_fills: list[dict],
+    ticker: str,
+    opt_positions: list[dict],
+) -> tuple[Optional[date], str]:
+    """Return the earliest Date_open among the ticker's currently-held option
+    positions and the source tag ('google_sheets' / 'tiger_mcp_fallback' /
+    'none'). Used to anchor cycle_start_date — when this current state began."""
+    from mcp_servers.tiger import data_table
+
+    candidates: list[date] = []
+    matched_via_sheets = False
+    matched_via_tiger = False
+
+    for opt in opt_positions:
+        right = (opt.get("right") or "").upper()
+        if right not in ("PUT", "CALL"):
+            continue
+        try:
+            strike_f = float(opt.get("strike"))
+        except (TypeError, ValueError):
+            continue
+        expiry_d = data_table._parse_iso_date(opt.get("expiry"))
+        if expiry_d is None:
+            continue
+
+        if sheet_rows:
+            row = data_table._match_open_row(sheet_rows, ticker, strike_f, expiry_d, right)
+            if row:
+                d = data_table._parse_iso_date(row.get("Date_open"))
+                if d is not None:
+                    candidates.append(d)
+                    matched_via_sheets = True
+                    continue
+
+        if fallback_fills:
+            fill = data_table._match_fill_for_position(
+                fallback_fills, ticker, strike_f, expiry_d, right,
+            )
+            if fill:
+                d = (
+                    data_table._parse_iso_date(fill.get("trade_time"))
+                    or data_table._parse_iso_date(fill.get("order_time"))
+                )
+                if d is not None:
+                    candidates.append(d)
+                    matched_via_tiger = True
+
+    if not candidates:
+        return None, "none"
+    if matched_via_sheets and not matched_via_tiger:
+        src = "google_sheets"
+    elif matched_via_tiger and not matched_via_sheets:
+        src = "tiger_mcp_fallback"
+    else:
+        src = "mixed"
+    return min(candidates), src
+
+
+@mcp.tool()
+def get_wheel_state(
+    symbols: list[str] | None = None,
+    pot: str = "all",
+) -> dict:
+    """Per-ticker wheel cycle state classification.
+
+    Returns the current wheel-cycle phase for each ticker in the book:
+
+      CSP_OPEN   — cash secured, short put(s) open (selling premium)
+      ASSIGNED   — holding stock, no short call yet (uncovered share lot)
+      CC_OPEN    — holding stock + short call(s) (covered call active)
+      LEAP_ONLY  — long option(s) only (PMCC chassis without short cover)
+      MIXED      — combinations not cleanly modeled as a wheel state
+                   (e.g. long puts, stock + short puts on same ticker)
+      IDLE       — no live position (only relevant if user explicitly
+                   requested a ticker not in the book)
+
+    Pot routing follows the locked CORE / ACTIVE / SIDECAR map. Tickers
+    in EXCLUDE_TICKERS (KO, MCD, NVDA, SPY) are dropped entirely.
+
+    Cycle anchor: `cycle_start_date` is the earliest Date_open among the
+    currently-held option positions for the ticker — i.e. when the current
+    state's first leg was opened. Sourced from Google Sheets primary,
+    Tiger 90-day fallback (same pattern as get_position_roc). `null` if
+    no source could date the position.
+
+    Args:
+      symbols: optional list of tickers to filter to (case-insensitive)
+      pot:     "all" | "core" | "active" | "sidecar"
+
+    Returns:
+      tickers[]:  per-ticker rows with state + positions + cycle anchor
+      summary:    {total_tickers, by_state, by_pot}
+      asof_date:  today's ISO date
+      notes[]:    caveats (data-source warnings, etc.)
+    """
+    from mcp_servers.tiger import data_table
+
+    asof = date.today()
+    client = _get_client()
+
+    stock_positions = [_position_to_dict(p) for p in client.get_stock_positions()]
+    option_positions = [_position_to_dict(p) for p in client.get_option_positions()]
+
+    # Tickers present in the book
+    tickers_in_book = {
+        (p.get("symbol") or "").upper() for p in stock_positions + option_positions
+        if p.get("symbol")
+    }
+    tickers_in_book -= data_table.EXCLUDE_TICKERS
+
+    # Resolve target set
+    if symbols:
+        requested = {s.strip().upper() for s in symbols if s and s.strip()}
+        requested -= data_table.EXCLUDE_TICKERS
+        target = sorted(requested)
+    else:
+        target = sorted(tickers_in_book)
+
+    # Pot filter (after include/exclude)
+    if pot != "all":
+        target = [t for t in target if data_table.get_pot(t) == pot]
+
+    # Sheets primary, Tiger 90-day fallback (mirrors get_position_roc)
+    sheet_rows = data_table.read_data_table()
+    fallback_fills: list[dict] = []
+    notes: list[str] = []
+    if not sheet_rows:
+        try:
+            fallback_fills = [
+                _order_to_dict(o) for o in client.get_filled_orders(days=90)
+            ]
+            notes.append(
+                "Sheets unavailable — cycle_start_date anchored to Tiger "
+                "90-day fill window; older positions may report null."
+            )
+        except Exception as e:
+            notes.append(f"Sheets and Tiger fallback both failed: {e}")
+
+    results: list[dict] = []
+    by_state: dict[str, int] = {s: 0 for s in _WHEEL_STATES}
+    by_pot: dict[str, int] = {"core": 0, "active": 0, "sidecar": 0, "unknown": 0}
+
+    for ticker in target:
+        stock_rows = [
+            p for p in stock_positions
+            if (p.get("symbol") or "").upper() == ticker
+        ]
+        opt_rows = [
+            p for p in option_positions
+            if (p.get("symbol") or "").upper() == ticker
+        ]
+
+        # Reduce to "live" booleans / counts
+        stock_qty = 0.0
+        stock_avg_cost: Optional[float] = None
+        for p in stock_rows:
+            try:
+                q = float(p.get("quantity") or 0)
+                stock_qty += q
+                if stock_avg_cost is None:
+                    ac = p.get("avg_cost")
+                    if ac is not None:
+                        try:
+                            stock_avg_cost = float(ac)
+                        except (TypeError, ValueError):
+                            pass
+            except (TypeError, ValueError):
+                continue
+
+        short_puts: list[dict] = []
+        short_calls: list[dict] = []
+        long_opts: list[dict] = []
+        for p in opt_rows:
+            try:
+                q = float(p.get("quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+            right = (p.get("right") or "").upper()
+            if q < 0 and right == "PUT":
+                short_puts.append(p)
+            elif q < 0 and right == "CALL":
+                short_calls.append(p)
+            elif q > 0:
+                long_opts.append(p)
+
+        has_stock = stock_qty > 0
+
+        # Classify. The wheel doctrine cleanly admits the four named states;
+        # anything that doesn't fit is "MIXED" so the operator can see it.
+        if has_stock and short_calls and not short_puts and not long_opts:
+            state = "CC_OPEN"
+        elif has_stock and not short_calls and not short_puts and not long_opts:
+            state = "ASSIGNED"
+        elif not has_stock and short_puts and not short_calls and not long_opts:
+            state = "CSP_OPEN"
+        elif not has_stock and not short_puts and not short_calls and long_opts:
+            state = "LEAP_ONLY"
+        elif not has_stock and not short_puts and not short_calls and not long_opts:
+            state = "IDLE"
+        else:
+            state = "MIXED"
+
+        cycle_start_d, cycle_start_src = _earliest_position_entry(
+            sheet_rows, fallback_fills, ticker, opt_rows,
+        )
+        days_in_cycle = (asof - cycle_start_d).days if cycle_start_d else None
+
+        pot_name = data_table.get_pot(ticker)
+        by_state[state] = by_state.get(state, 0) + 1
+        by_pot[pot_name] = by_pot.get(pot_name, 0) + 1
+
+        results.append({
+            "ticker": ticker,
+            "state": state,
+            "pot": pot_name,
+            "has_stock": has_stock,
+            "stock_quantity": stock_qty if has_stock else 0,
+            "stock_avg_cost": stock_avg_cost,
+            "short_puts": short_puts,
+            "short_calls": short_calls,
+            "long_options": long_opts,
+            "current_positions_count": len(opt_rows) + len(stock_rows),
+            "cycle_start_date": cycle_start_d.isoformat() if cycle_start_d else None,
+            "cycle_start_source": cycle_start_src,
+            "days_in_cycle": days_in_cycle,
+        })
+
+    return {
+        "tickers": results,
+        "summary": {
+            "total_tickers": len(results),
+            "by_state": by_state,
+            "by_pot": by_pot,
+        },
+        "asof_date": asof.isoformat(),
+        "entry_source": "google_sheets" if sheet_rows else "tiger_mcp_fallback",
+        "notes": notes,
+    }
+
+
+# ── §5.1 Earning Power Test (Phase E1, Priority 4) ───────────────────────────
+
+
+@mcp.tool()
+def earning_power_test(
+    current_theta_per_day: float,
+    current_delta: float,
+    new_theta_per_day: float,
+    new_delta: float,
+    roll_debit: float,
+    new_dte_days: int,
+    expected_daily_drift: float = 0.0,
+    payback_threshold_frac: float = 0.5,
+) -> dict:
+    """PMCC Master Doctrine §5.1 — Portfolio Earning Power Test.
+
+    The primary roll decision. Never compares remaining extrinsic in the
+    dying leg against the roll debit (that test optimizes for cheapest BTC
+    while ignoring lost earning power). Instead:
+
+        current_earning  = current_theta_per_day + current_delta × drift
+        new_earning      = new_theta_per_day     + new_delta     × drift
+        daily_improvement = new_earning − current_earning
+        payback_days     = roll_debit ÷ daily_improvement
+        ROLL  if payback_days < new_dte_days × threshold_frac (default 0.5)
+        HOLD  otherwise
+
+    Use `drift = 0` for the conservative flat-market assumption. If the
+    market is trending (3+ consecutive directional days), pass actual
+    recent drift per $1 underlying.
+
+    All Greeks are **per-day, per-position** numbers (not annualised).
+    Delta is the dollar-delta of the leg (Δ × 100 × contracts).
+    `roll_debit` is the net cash cost to execute the roll
+    (positive = debit, negative = net credit collected).
+
+    Args:
+      current_theta_per_day: existing leg's θ in $/day (signed — short = positive)
+      current_delta:         existing leg's delta in $/$ underlying
+      new_theta_per_day:     proposed replacement leg's θ in $/day
+      new_delta:             proposed replacement leg's delta
+      roll_debit:            net cash to execute (positive = pay; negative = collect)
+      new_dte_days:          DTE of the new leg
+      expected_daily_drift:  expected daily $ move of underlying (default 0)
+      payback_threshold_frac: ROLL/HOLD cutoff as fraction of new_dte_days
+                              (default 0.5 — doctrine §5.1 Step 5)
+
+    Returns:
+      Same shape as a §5.4 Roll Decomposition Template row — daily
+      improvement, payback days, verdict, justification — ready to paste
+      into the §16 output block.
+    """
+    drift = expected_daily_drift
+    current_earning = current_theta_per_day + current_delta * drift
+    new_earning = new_theta_per_day + new_delta * drift
+    daily_improvement = new_earning - current_earning
+
+    threshold_days = new_dte_days * payback_threshold_frac
+
+    payback_days: Optional[float] = None
+    verdict: str
+    reason: str
+
+    if daily_improvement <= 0:
+        verdict = "HOLD"
+        reason = (
+            f"daily_improvement = ${daily_improvement:.4f}/day ≤ 0 — new leg "
+            "does not earn more than the current leg, so any roll debit never "
+            "amortises. Hold and re-evaluate on next session."
+        )
+    elif roll_debit <= 0:
+        # Net credit roll — improves earning AND collects cash. Always pass.
+        payback_days = 0.0
+        verdict = "ROLL"
+        reason = (
+            f"Net credit roll (${-roll_debit:.2f} collected) AND new leg earns "
+            f"${daily_improvement:.4f}/day more. Pass on both axes."
+        )
+    else:
+        payback_days = roll_debit / daily_improvement
+        if payback_days < threshold_days:
+            verdict = "ROLL"
+            reason = (
+                f"payback {payback_days:.1f} days < {threshold_days:.1f} "
+                f"({payback_threshold_frac:.0%} of new DTE = {new_dte_days}d). "
+                "Roll pays back well within the new leg's life."
+            )
+        else:
+            verdict = "HOLD"
+            reason = (
+                f"payback {payback_days:.1f} days ≥ {threshold_days:.1f} "
+                f"({payback_threshold_frac:.0%} of new DTE = {new_dte_days}d). "
+                "Hold — the new leg won't earn back the debit in time."
+            )
+
+    return {
+        "current_earning_per_day": _round(current_earning, 4),
+        "new_earning_per_day": _round(new_earning, 4),
+        "daily_improvement": _round(daily_improvement, 4),
+        "roll_debit": _round(roll_debit, 2),
+        "new_dte_days": new_dte_days,
+        "payback_days": _round(payback_days, 2) if payback_days is not None else None,
+        "threshold_days": _round(threshold_days, 2),
+        "payback_threshold_frac": payback_threshold_frac,
+        "expected_daily_drift": expected_daily_drift,
+        "verdict": verdict,
+        "reason": reason,
+    }
+
+
 # ── Write tools (Phase 2c) — preview by default, confirm explicitly ──────────
 
 

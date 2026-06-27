@@ -1,189 +1,136 @@
-# Backlog — Tiger MCP
+# ARGUS — E1 BACKLOG
 
-Work queued for weekend execution (no active trading, lowest token contention).
-This file is the source of truth — if a future Claude session asks "what's
-next," point them here.
-
----
-
-## Scoping decisions (locked, can change but call it out if you do)
-
-- **Q1: Surface** — both Streamlit AND claude.ai MCP. MCP first, Streamlit second.
-- **Q2: UX strategy** — layer wheel-cycle awareness + capital-aware sizing on top
-  of the existing `theta_scanner/` module. Do NOT rebuild the existing UI from
-  scratch.
-- **Q3: "Active Pot"** = the Argus Active Portfolio target (the Tiger account
-  portfolio selector that already exists in `app.py`).
-
-## Pre-feature defense PRs (optional, can do any time)
-
-Identified by the 2026-06-23 code review. Tiny, low-token, defensive. Worth
-shipping any time — not gated to weekends. Status: TBD per user.
-
-- **PR-D1:** Fix broken test `test_refresh_token_rotation_invalidates_old`
-  in `mcp_servers/tiger/tests/test_oauth.py` — code intentionally no longer
-  rotates refresh tokens (PR #38), test still asserts old behavior. ~20 min.
-- **PR-D2:** Add boot guard in `mcp_servers/tiger/server.py` `_build_server()`:
-  if `MCP_OAUTH_OWNER_PASSWORD` set AND transport is sse/streamable-http AND
-  `MCP_OAUTH_STORAGE != firestore` → refuse to start. Prevents the entire
-  class of overnight-disconnect bugs from recurring. ~30 min.
-- **PR-D3:** Delete `mcp_servers/tiger/deploy/cloud-run.yaml`. Has drifted hard
-  from the GitHub Actions deploy (memory 256Mi vs 512Mi, missing OAuth env
-  vars). Better gone than wrong. ~5 min.
+**Repo:** TongIncomeWheel/Argus_Cloud
+**Updated:** 27 Jun 2026
+**Status:** Living document — update as items ship
 
 ---
 
-## Phase 1 — Tiger as primary chain source + MCP exposure
+## SHIPPED (wired to MCP — callable now)
 
-**Trigger:** weekend, US markets closed, Tiger US Option L1 entitlement
-confirmed active for OpenAPI (see BUG 005 — Ash to action with Tiger support).
-
-**Scope:**
-
-- `theta_scanner/data.py`
-  - Add Tiger chain loader using `TigerClient.get_option_chain(symbol, expiry,
-    return_greek_value=True)` (already implemented in
-    `tiger_api/client.py:777-...`).
-  - Tiger becomes primary source. Alpaca stays as fallback (`alpaca_configured()`
-    check) for when Tiger entitlement is in a bad state.
-  - Single env var to override: `THETA_SCANNER_CHAIN_SOURCE=tiger|alpaca|auto`,
-    default `auto` (tries Tiger, falls back to Alpaca on permission errors).
-
-- New MCP tools in `mcp_servers/tiger/server.py`:
-  - `scan_csp_candidates(universe, dte_min, dte_max, delta_min, delta_max,
-                          min_iv, min_oi, min_volume, limit=20)`
-    → returns ranked CSP scan results as `list[dict]`. Wraps
-    `theta_scanner.scan.run_scan` with `option_type="put"`.
-  - `scan_csp_with_capital(cash_available, max_per_position_pct,
-                            universe, dte_min, dte_max, delta_min, delta_max,
-                            limit=10)`
-    → sizing-aware: filters out contracts where `strike * 100 * 1` exceeds
-    the per-position cap, sorts by `theta * size_fit` rather than raw theta.
-
-- New MCP resource: `theta-scanner://presets` (read-only) — exposes existing
-  `presets.load_filter_presets()` to the LLM so it can use named scan configs.
-
-**Out of scope for Phase 1:**
-- One-click stage_csp action (that's Phase 2)
-- Wheel-cycle awareness (that's Phase 2)
-- Streamlit UI changes (Phase 2)
-
-**Estimated tokens:** ~2-3 hours of focused work, no UI design churn.
+| Tool | Shipped | Notes |
+|---|---|---|
+| `compute_portfolio_greeks` | 25 Jun 2026 | Full book delta + theta. BS local solve. yfinance spot ~15min delayed. |
+| `get_position_roc` | 27 Jun 2026 | Per-position yield, % harvested, annualised RoC, juiced flag at 65%. Primary: Google Sheets. Fallback: Tiger 90-day. ms-epoch timestamp bug (1781-11-05) fixed same day. |
+| `compute_hv` | 27 Jun 2026 | HV30 from yfinance daily closes. Input to PMCC §2 hurdle and §12 scorecard. |
+| `score_pmcc_candidate` | 27 Jun 2026 | Full §12 scorecard server-side. BS Greeks + 5k-path MC distribution + verdict. STO only (v1). |
+| `quarterly_archive` | 27 Jun 2026 | Google Sheets Data Table snapshot at quarter-end. GitHub Actions cron (Mar/Jun/Sep/Dec 30/31). |
 
 ---
 
-## Phase 2 — Wheel-aware UX + capital sizing
+## OUTSTANDING — PRIORITY ORDER
 
-**Trigger:** weekend, after Phase 1 is shipped and validated by hitting the
-new MCP tools from claude.ai.
-
-**Scope (in priority order):**
-
-1. **Position-cross-reference in scanner output.** For every CSP candidate,
-   annotate whether we already have:
-   - A short put on this ticker (in `tiger_api.client.get_option_positions`)
-   - The stock (assigned scenario)
-   - A short call (CC scenario)
-   Surfaces as `wheel_state` field on each result row: `"empty" / "csp_open" /
-   "assigned" / "cc_open" / "called_away"`.
-
-2. **Capital-aware sizing default.** Wire `get_account_summary` cash into
-   `scan_csp_with_capital` as default `cash_available` if not supplied.
-   `max_per_position_pct` defaults to a config setting (e.g., 15% per CSP).
-
-3. **One-click stage action.**
-   - New MCP tool: `stage_csp(symbol, expiry, strike, quantity, limit_price,
-                              confirm=False)`
-     → returns `place_option_order(symbol, expiry, strike, right="PUT",
-     side="SELL_TO_OPEN", quantity, limit_price, confirm=False)` preview.
-     Just a semantic shim — clearer name for the income-wheel workflow.
-   - Optional: `stage_csps_from_scan(scan_results, top_n)` → returns N
-     previews in one call.
-
-4. **Streamlit UI integration:**
-   - Add a "Scan & Stage" tab in `app.py` that wraps the MCP tools.
-   - Display wheel_state badges next to each candidate.
-   - Stage button → opens `place_option_order` preview in a confirm modal.
-   - Doesn't touch the existing `render_theta_scanner` UI — sits next to it.
-
-**Estimated tokens:** ~3-4 hours.
+### Priority 1 — `get_wheel_state`
+**File:** `tiger_api/wheel_cycles.py`
+**What it does:** Returns per-ticker wheel cycle state — CSP_OPEN / ASSIGNED / CC_OPEN / EXPIRED / IDLE.
+**Why it matters:** Claude currently cannot tell which phase of the wheel each ticker is in without reading raw position data and inferring. This makes `/md-pacing` imprecise.
+**Output schema:**
+```json
+{
+  "ticker": "MARA",
+  "state": "CC_OPEN",
+  "current_positions": [...],
+  "cycle_start_date": "2026-06-05",
+  "days_in_cycle": 22
+}
+```
 
 ---
 
-## Phase 3 — automation (deferred, not in this backlog)
-
-Cron-driven scans, alert thresholds, auto-stage queued previews. Revisit
-when Phase 1+2 are operational and we have real usage data on which alerts
-would actually be useful.
-
----
-
-## Phase E1 — Analytics MCP tools (Claude-as-executive)
-
-**Premise:** Claude becomes the front-end / executive. The Tiger MCP server
-exposes Argus's existing compute engines as tools, so Claude can offload the
-math instead of re-deriving it inside the model context. User decided:
-extend the existing connector (Option A) — no rename, no separate server.
-
-**Shipped (2026-06-25):**
-
-- `compute_portfolio_greeks(risk_free_rate, dividend_yield)` —
-  net + gross Δ and Θ across all option positions. Local BS with yfinance
-  spot + market-price IV solve. Sign convention encoded; per-position rows
-  include delta_shares + theta_per_day_usd for direct $ exposure. Tactical
-  fix for Tiger TBSG Greeks-denied state.
-
-**Queued (in priority order):**
-
-- `get_portfolio_snapshot()` — one-call composite: account summary +
-  positions + open orders + computed Greeks aggregates. Single round-trip
-  for the typical "what's my book look like" prompt.
-- `get_wheel_state(symbols=None)` — per-ticker classification:
-  empty / csp_open / assigned / cc_open / called_away. Reuses
-  `wheel_cycles` engine logic.
-- `get_roll_candidates(symbol, current_strike, current_expiry, ...)` —
-  candidate target strikes/expiries scored by net credit, dte, delta.
-- `analyze_roll_quality(close_leg, open_leg)` — debit/credit, ΔΘ, Δdte,
-  Δrisk for a proposed roll.
-- `get_win_rate_by_setup(setup_filter=None)` — closed-trade win-rate +
-  avg P&L bucketed by entry conditions.
-- `stress_book(spot_shock_pct, vol_shock_pct)` — portfolio P&L under a
-  parallel spot + IV shift.
-- `scan_iv_rank(symbols, lookback_days=252)` — IV rank/percentile across a
-  watchlist (uses theta_scanner.scan or iv_scanner).
-- `scan_csp_candidates(universe, ...)` and `scan_csp_with_capital(...)` —
-  already in Phase 1 above; expose via the same connector.
-- `forecast_income(horizon_days=30)` — projected theta carry over horizon
-  assuming positions held.
-
-**Out of scope for E1:** order-staging beyond what Phase 2 specifies, any
-new Streamlit UI.
-
-## Phase E2 — Alpaca spot + Greeks (free, 15-min delayed)
-
-**Trigger:** ship E1, then upgrade the spot source.
-
-Alpaca's free tier exposes option chains + per-contract Greeks with a
-15-minute delay. Cleaner than yfinance (regulated feed, consistent schema)
-and avoids the IV-solve step entirely. Becomes the primary source in
-`compute_portfolio_greeks`; yfinance stays as fallback.
-
-Requires `ALPACA_API_KEY` + `ALPACA_SECRET_KEY` secrets in the runtime SA
-(env already has them in the Streamlit deploy).
+### Priority 2 — `get_roll_candidates`
+**File:** `tiger_api/rolls.py`
+**What it does:** Surfaces all open short positions that meet roll criteria — dying leg definition, delta band breach, or juiced flag — with net credit/debit estimate for candidate strikes.
+**Why it matters:** Currently Claude identifies roll candidates manually from Greeks output. This moves the logic server-side.
+**Input:** `pot` filter, `urgency` (immediate / this-week / monitor)
+**Output:** Ranked list of roll candidates with BTC cost, STO credit estimate, net debit/credit, payback days.
 
 ---
 
-## How to resume this work in a future session
-
-> "Read `BACKLOG.md`. Status check: have Phase 1 PRs landed? If yes, start
-> Phase 2 with the scoping decisions already locked. If no, start Phase 1
-> from the `scan_csp_candidates` MCP tool — Tiger chain loader first, then
-> MCP wrapper. Pre-feature defense PRs (PR-D1 through PR-D3) can be shipped
-> any time — check with the user before doing them as part of a Phase batch
-> to keep PRs small and reviewable."
+### Priority 3 — Stress Test MCP tool
+**File:** `tiger_api/stress.py`
+**What it does:** Runs the B, D, and B+D combined drawdown scenarios server-side against live positions. Returns NAV impact, excess liquidity after shock, zone classification, and reduction schedule.
+**Why it matters:** Currently Claude computes margin scenarios inline — slow, token-heavy, prone to drift as positions change. Server-side stress test runs against live marks every morning automatically.
+**Output:**
+```json
+{
+  "scenarios": {
+    "A": {"equity_loss": 40023, "buffer_after": 37956, "zone": "watch"},
+    "B": {"equity_loss": 80200, "buffer_after": 0, "zone": "critical"},
+    "D": {"pmcc_loss": 44390, "buffer_after": 33589, "zone": "watch"},
+    "BD": {"total_loss": 153968, "buffer_after": -75989, "zone": "insolvent"}
+  },
+  "current_zone": "watch",
+  "reduction_schedule": [...]
+}
+```
+**Charter integration:** Replaces Claude inline margin math in morning run. `/margin` command calls this directly.
 
 ---
 
-*Last updated: 2026-06-23 by Claude Code session
-01GTnrwWAp9CvXWRWkzqQy2X — scoped from user instruction during code-review
-session. Phase 1+2 explicitly on hold pending weekend execution.*
+### Priority 4 — §5.1 Earning Power Test MCP tool
+**What it does:** Given a dying short leg and a proposed replacement, runs the Portfolio Earning Power Test from PMCC Master Doctrine §5.1 server-side.
+**Formula:**
+```
+daily_improvement = (new_theta + new_delta × drift) − (current_theta + current_delta × drift)
+payback_days = roll_debit ÷ daily_improvement
+verdict = ROLL if payback_days < new_DTE × 0.50 else HOLD
+```
+**Why it matters:** Currently computed inline by Claude from Greeks output. Error-prone and token-heavy on a 6-leg array.
+**Input:** current leg Greeks + proposed leg Greeks + roll debit + new DTE + drift assumption
+**Output:** daily_improvement, payback_days, verdict, justification
+
+---
+
+### Priority 5 — `score_pmcc_candidate` BTC/ROLL variants
+**Current state:** `score_pmcc_candidate` is STO-only (v1).
+**Needed:** BTC scorecard (should I close this position?) + ROLL scorecard (BTC old → STO new as a combined evaluation).
+**Doctrine reference:** PMCC Master Doctrine §12 — "BTC/ROLL scorecard variants tracked in BACKLOG."
+
+---
+
+### Priority 6 — `get_win_rate`
+**File:** `tiger_api/win_rate.py`
+**What it does:** Win rate by setup bucket — by ticker, by delta band at entry, by DTE at entry, by pot.
+**Why it matters:** Needed for honest performance attribution. Tells you whether the 0.30–0.35 delta entries outperform the 0.38–0.40 entries over time.
+**Source:** Google Sheets Data Table (full history) — not Tiger 90-day window.
+
+---
+
+### Priority 7 — `get_iv_rank`
+**File:** `tiger_api/iv_scanner.py`
+**What it does:** IV rank/percentile for a given ticker using realised vol proxy from historical prices.
+**Why it matters:** Active Pot CSP entry timing. High IV rank = rich premium. Currently estimated manually.
+
+---
+
+### Backlog (no priority assigned yet)
+- Income forecast — theta carry over configurable horizon
+- `ap-scan` — Active Pot CSP candidate screener (pull-based, PM-initiated only — never autopushed)
+- Phase E2 — Alpaca spot + Greeks (free, 15-min delayed) replacing yfinance in `compute_portfolio_greeks` and `compute_hv`. Requires `ALPACA_API_KEY` + `ALPACA_SECRET_KEY` GH secrets; deploy workflow syncs to Cloud Run.
+- Theta-scanner Phase 1 (`scan_csp_candidates`, `scan_csp_with_capital`) and Phase 2 (wheel-aware UX, capital sizing) — older scoping doc, still relevant. Pot-aware `wheel_state` annotation now subsumed by Priority 1.
+- PR-D1: fix broken `test_refresh_token_rotation_invalidates_old` (PR #38 stopped rotating refresh tokens; test still asserts old behavior).
+- PR-D2: boot-guard `_build_server()` — refuse to start if `MCP_OAUTH_OWNER_PASSWORD` set AND transport is sse/streamable-http AND `MCP_OAUTH_STORAGE != firestore`. Prevents overnight-disconnect class of bugs from recurring.
+- PR-D3: delete `mcp_servers/tiger/deploy/cloud-run.yaml` — drifted from the GitHub Actions deploy (memory 256Mi vs 512Mi, missing OAuth env vars).
+
+---
+
+## KNOWN ISSUES / TECH DEBT
+
+| Issue | Impact | Fix |
+|---|---|---|
+| `entry_fill_found: false` on some positions older than 90 days | Annualised RoC not computable for those positions. Yield % and harvested % still correct. | Once Sheets primary source is active (PR #51 wired auto-sync from GH secrets), most resolve. Remaining gaps need ETL backfill. |
+| yfinance spot ~15min delayed | Greeks solve uses slightly stale spot | Phase E2: wire Alpaca for real-time spot. Low priority — delay acceptable for daily review. |
+| Streamlit Community Cloud sleep | Argus UI goes cold after ~15 min inactivity | Separate issue — Streamlit hosting choice. MCP server itself is on Cloud Run with `min-instances=1` + `no-cpu-throttling`, always warm. |
+
+---
+
+## DEPLOYMENT NOTES (correct as of 27 Jun 2026)
+
+- **Hosting:** the Tiger MCP server runs on Google Cloud Run (`tiger-mcp-499603` / `asia-southeast1`). Not Railway. `min-instances=1`, `no-cpu-throttling`, 60-min request timeout. Auto-deploys on every push to `main` via `.github/workflows/deploy-mcp.yml`.
+- **Sheets auth:** the deploy workflow syncs `GOOGLE_SHEETS_CREDENTIALS` + `INCOME_WHEEL_SHEET_ID` GitHub repo secrets into Secret Manager on every push; Cloud Run binds both as env vars. Same SA the Streamlit Argus deploy uses. No manual sheet sharing required.
+- **OAuth:** static client credentials (PR #42) in Firestore (PR #43+), 10-year token TTLs (PR #39), streamable-http transport (PR #45). The connector ID in claude.ai's form is `argus-tiger-mcp-claude`; the secret is `mcp-oauth-client-secret`.
+- **Connector name:** `Tiger MCPv7` in claude.ai. URL `https://argus-tiger-mcp-686093261470.asia-southeast1.run.app/mcp`.
+
+---
+
+*E1 Backlog v2.0 | 27 Jun 2026 | Reflects shipped: compute_portfolio_greeks, get_position_roc, compute_hv, score_pmcc_candidate, quarterly_archive. Outstanding: get_wheel_state, get_roll_candidates, stress_test, §5.1 EPT, BTC/ROLL scorecard variants, get_win_rate, get_iv_rank.*
