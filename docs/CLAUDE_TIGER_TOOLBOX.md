@@ -25,7 +25,7 @@ runs Python on Cloud Run; tokens are free there.
 
 ## Data freshness protocol (READ BEFORE EVERY COMPUTE STEP)
 
-Tiger MCP tools have **three different freshness profiles**. Mixing them
+Tiger MCP tools have **four different freshness profiles**. Mixing them
 silently produces wrong answers. Before any analytical step, decide which
 freshness tier you actually need and call the matching tool.
 
@@ -34,6 +34,7 @@ freshness tier you actually need and call the matching tool.
 | **Live quote** | Tiger L1 push | sub-second | `get_option_briefs`, `get_option_chain`, `get_option_depth`, `get_option_trade_ticks` |
 | **Position snapshot** | Tiger account cache | seconds–minutes (depends on Tiger's internal refresh) | `get_option_positions`, `get_stock_positions`, `get_account_summary`, `get_prime_assets` |
 | **Underlying spot (equity)** | yfinance (server-side, inside compute_portfolio_greeks) | ~15 min delayed | embedded in `compute_portfolio_greeks` |
+| **Canonical fill history** | Google Sheets "Data Table" tab (or Tiger 90-day fallback) | manual write latency (Tiger ETL pipeline; could be hours-to-days behind real fills) | embedded in `get_position_roc`; quarterly snapshots in `Archive Q<N>-<YYYY>` tabs |
 
 Rules:
 
@@ -61,6 +62,13 @@ Rules:
    source and its latency.** "Net theta ≈ $X/day (yfinance spot ~15 min
    delayed; IV solved from Tiger position marks of unknown age)" is the
    correct level of disclosure.
+6. **For RoC / harvested / juiced math, ALWAYS read `entry_source` and
+   relay it.** `get_position_roc` will tag every response as either
+   `entry_source: "google_sheets"` (canonical full history) or
+   `entry_source: "tiger_mcp_fallback"` (Tiger's 90-day rolling window —
+   positions older than 90 days will have `entry_fill_found: false` and a
+   null `annualised_roc`). If you see the fallback tag, surface that fact
+   when reporting numbers so the user knows the picture may be partial.
 
 If the user runs a project-layer command (e.g., `/md-pacing`, `/md-yield`)
 that needs freshness, the FIRST action of that command MUST be a refresh
@@ -82,7 +90,8 @@ treat that as a charter bug and flag it before running.
 | Per-ticker executions / fills | `get_transactions(symbol, days, limit)` |
 | Deposits / withdrawals history | `get_funding_history` |
 | Daily NAV / equity curve | `get_nav_history(days)` |
-| **Net Δ / Net Θ across the whole option book** | **`compute_portfolio_greeks`** ← new |
+| **Net Δ / Net Θ across the whole option book** | **`compute_portfolio_greeks`** |
+| **Per-position RoC, harvested %, juiced flag** | **`get_position_roc(juiced_only, pot)`** ← new |
 | What expiries are available for XYZ? | `get_option_expirations([symbols])` |
 | Full chain for one expiry | `get_option_chain(symbol, expiry)` |
 | Quote on specific contracts I already know | `get_option_briefs([contracts])` |
@@ -207,6 +216,58 @@ Contract dict shape used by `briefs`/`greeks`/`bars`/`depth`/`ticks`:
   I collecting per day?", "what's my net option exposure?". It is the
   ONLY way to get Greeks on a TBSG account without Tiger throwing 403.
 
+- **`get_position_roc(juiced_only=False, pot="all")`** →
+  per-position RoC analytics for every open SHORT option (CSP + CC).
+  Joins live Tiger position state to entry STO records and computes:
+  days held, DTE at entry, DTE remaining, premium yield on notional,
+  % of premium harvested (theta captured), annualised RoC, and a
+  `juiced` boolean (≥ 65% harvested = candidate to BTC or roll).
+
+  Args:
+    - `juiced_only` (bool): return only positions ≥ 65% harvested.
+    - `pot` (str): `"all"` | `"core"` | `"active"` | `"sidecar"` — filter
+      by pot membership.
+
+  Data sources (in priority order, surfaced as `entry_source`):
+    1. **PRIMARY** — Google Sheets `Data Table` tab (full unbounded fill
+       history since strategy inception). Match key: ticker + strike +
+       expiry + right + STO direction. For rolled positions the **most
+       recent** matching STO row wins.
+    2. **FALLBACK** — Tiger MCP `get_filled_orders(days=90)`. Used
+       automatically when Sheets is unreachable or unconfigured. Tagged
+       `entry_source: "tiger_mcp_fallback"`. Positions older than 90 days
+       will report `entry_fill_found: false`.
+
+  Pot routing (locked, do not invent):
+    - **core** = {MARA, CRCL}
+    - **active** = {BE, COIN, DELL, MSFT, MP, SLB}
+    - **sidecar** = {ECHO, INTC}
+    - **excluded entirely** = {KO, MCD, NVDA, SPY} (never appear in output)
+    - anything else → `pot: "unknown"` (visible in positions list but
+      NOT counted in `aggregates.by_pot`)
+
+  Returns:
+  ```text
+  positions[]:               per-position rows with full RoC payload
+  aggregates:                {by_pot: {core, active, sidecar},
+                              total_notional, total_premium_received,
+                              total_pnl_to_date, portfolio_yield_on_notional,
+                              portfolio_pct_harvested, juiced_count,
+                              total_positions, positions_missing_entry}
+  juiced_positions[]:        subset of positions with juiced=True
+  missing_entry_positions[]: positions where neither source had an entry
+  asof_date:                 today's ISO date used for days-held math
+  entry_source:              "google_sheets" | "tiger_mcp_fallback"
+  juiced_threshold:          0.65 (echoed for transparency)
+  notes[]:                   human-readable caveats / skip reasons
+  ```
+
+  **Use this when the user asks:** "which positions are juiced?",
+  "what's my annualised RoC on MARA?", "how much have I harvested in the
+  core pot?", "are any positions ready to BTC?". Sign convention is
+  short-position-friendly: `pct_harvested = 1.0` means the position has
+  decayed to ~zero (free money to take off the table).
+
 ### Write tools — preview-by-default, confirm explicitly
 
 ALL write tools work in two steps. **Never skip the preview.**
@@ -255,9 +316,10 @@ When the user asks one of these:
 - "Could compute that, but it's not wired to MCP yet. Want me to add a
   Phase E1 follow-up so you can call it from chat? Until then I'd have
   to load positions into context and run BS by hand — slow and lossy."
-- The roadmap order is in `BACKLOG.md` (Phase E1). The first one shipped
-  was `compute_portfolio_greeks` (2026-06-25). Next priorities are
-  `get_portfolio_snapshot`, `get_wheel_state`, `get_roll_candidates`.
+- The roadmap order is in `BACKLOG.md` (Phase E1). Shipped so far:
+  `compute_portfolio_greeks` (2026-06-25) and `get_position_roc` (2026-06-27).
+  Next priorities: `get_wheel_state`, `get_roll_candidates`,
+  `get_win_rate_by_setup`, `stress_book`.
 
 ---
 
@@ -315,6 +377,15 @@ conversation with the user before pushing through.
    - **Project with IBKR connector also attached (e.g. Aegis)** → use
      IBKR's `get_price_snapshot` for clean real-time spot. This is the
      ONLY context where `get_price_snapshot` applies.
+6. **Never compute RoC, harvested %, juiced status, or annualised return
+   manually.** Call `get_position_roc`. The math (yield_on_notional,
+   pct_harvested, annualised_roc, juiced @ 0.65) lives server-side and is
+   the single source of truth. If you recompute in chat with different
+   assumptions you'll drift from what the dashboards say.
+7. **Never invent the entry date of a position.** Either Sheets or Tiger
+   fallback gave you one (entry_fill_found=true) or it didn't. If it
+   didn't, that's data the user has to enter — say so and quote the
+   `missing_entry_positions[]` block; don't guess.
 
 ---
 
@@ -339,6 +410,62 @@ wrong — likely an IV solve failure on a few large positions. Check
 
 ---
 
+## Operational pieces (not tools, but Claude should know they exist)
+
+These are pipelines / artifacts that produce the data the MCP tools read.
+Claude doesn't run them, but should reference them correctly when the
+user mentions them or when a tool's output points back to them.
+
+### Google Sheets "Data Table" — canonical fill history
+
+Every CSP / CC entry, close, and roll the user makes is written to the
+`Data Table` tab of the Income Wheel spreadsheet via the Tiger ETL
+pipeline (`tiger_etl.py`). This is the **unbounded** history — grows
+forever, never rolls. `get_position_roc` reads it as primary source so
+positions older than Tiger's 90-day fill window still get proper entry
+dates and annualised-RoC math.
+
+Schema (the columns that matter for tools):
+`TradeID, Ticker, Date_open, Expiry_Date, Status,
+Option_Strike_Price_(USD), OptPremium, Quantity, Direction, StrategyType,
+Pot, Tiger_Row_Hash`. `Direction ∈ {Sell, OpenShort, Buy, Close}` —
+short-option STO rows are filtered by `Direction in {Sell, OpenShort}`
+AND `TradeType == "OPT"`. The `Pot` column is informational; the tool
+derives pot from ticker via the locked CORE/ACTIVE/SIDECAR mapping.
+
+Access: the Cloud Run runtime service account reads via Application
+Default Credentials. If the user says "the connector isn't using the
+sheet" or you see `entry_source: "tiger_mcp_fallback"`, the cause is
+almost certainly one of (a) the `MCP_INCOME_WHEEL_SHEET_ID` Secret
+Manager secret isn't set to the real spreadsheet id (still on the
+`NOT_SET` sentinel), or (b) the runtime SA email
+(`<project-number>-compute@developer.gserviceaccount.com`) isn't shared
+on the sheet as Viewer.
+
+### Quarterly archive tabs
+
+A scheduled GitHub Action (`.github/workflows/quarterly-archive.yml`)
+snapshots `Data Table` into a permanent `Archive Q<N>-<YYYY>` tab at
+02:00 UTC on the last day of every calendar quarter. Manual triggers
+via `workflow_dispatch` with an optional `quarter_label` input.
+
+Use these tabs for **point-in-time analysis** — "what did the book look
+like at end-Q1?" — never as live data. They're frozen snapshots.
+Tools don't read them by default; reference them by name (`Archive Q2-2026`)
+if the user wants to compare current state to a prior close.
+
+### What Claude does NOT operate
+
+- The Tiger CSV ETL (`tiger_etl.py run_migration`) — this is the user's
+  daily/weekly housekeeping pipeline. Never trigger it from chat.
+- The quarterly archive workflow — runs on cron + manual UI. Never
+  trigger from chat unless the user explicitly asks.
+- Anything that writes to the Sheet (`append_trade`, `update_trade`,
+  `delete_trades`) — these are upstream of the MCP server, not exposed
+  as tools. Sheet edits happen in the Streamlit UI or via ETL.
+
+---
+
 ## Connector troubleshooting (tell the user, don't try to fix it yourself)
 
 | Symptom | What to tell the user |
@@ -347,6 +474,8 @@ wrong — likely an IV solve failure on a few large positions. Check
 | 401 unauthorized on every call | Same — disconnect/reconnect. Owner password persists; you don't need to re-enter. |
 | `IV solve failed` in `skipped[]` for many positions | Likely stale market_price (after-hours). Try again in market hours. |
 | `no spot price for XYZ` in `skipped[]` | yfinance miss. Will be cleaner once Alpaca (Phase E2) lands. |
+| `entry_source: "tiger_mcp_fallback"` and positions are missing entries | Sheets isn't reachable. Either (a) `MCP_INCOME_WHEEL_SHEET_ID` is still `NOT_SET` (operator needs to update the Secret Manager value to the real spreadsheet id, then redeploy), or (b) the runtime SA isn't shared on the sheet. Both must be done — tell the user, don't try to fix from chat. |
+| `missing_entry_positions[]` non-empty even with `entry_source: "google_sheets"` | Schema drift or a position whose STO row was deleted from the sheet. The user has to fix the sheet; the math will recompute on next call. |
 
 ---
 
