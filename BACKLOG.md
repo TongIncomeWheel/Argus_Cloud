@@ -15,71 +15,14 @@
 | `compute_hv` | 27 Jun 2026 | HV30 from yfinance daily closes. Input to PMCC §2 hurdle and §12 scorecard. |
 | `score_pmcc_candidate` | 27 Jun 2026 | Full §12 scorecard server-side. BS Greeks + 5k-path MC distribution + verdict. STO only (v1). |
 | `quarterly_archive` | 27 Jun 2026 | Google Sheets Data Table snapshot at quarter-end. GitHub Actions cron (Mar/Jun/Sep/Dec 30/31). |
+| `get_wheel_state` | 27 Jun 2026 | Per-ticker wheel state — CSP_OPEN / ASSIGNED / CC_OPEN / LEAP_ONLY / MIXED / IDLE. cycle_start_date anchored via Sheets primary, Tiger 90-day fallback. |
+| `earning_power_test` | 27 Jun 2026 | Pure-math §5.1 PMCC roll decision: daily_improvement + payback_days + ROLL/HOLD verdict + drift override. |
+| `get_roll_candidates` | 27 Jun 2026 | Structural-anchor (swing / round / MA / consolidation) + ATR-14 buffer + ±5 strike chain ladder + ranked candidates with mid + net credit + Δ/Θ. FMP daily bars source. |
+| `run_stress_test` | 27 Jun 2026 | Scenarios A (−15% core) / B (−30% core + put assignment + call offset) / D (SPY −20% LEAPS) / B+D combined. Zone classifier + MARA reduction schedule + PMCC hard stop. Live position-driven. |
 
 ---
 
 ## OUTSTANDING — PRIORITY ORDER
-
-### Priority 1 — `get_wheel_state`
-**File:** `tiger_api/wheel_cycles.py`
-**What it does:** Returns per-ticker wheel cycle state — CSP_OPEN / ASSIGNED / CC_OPEN / EXPIRED / IDLE.
-**Why it matters:** Claude currently cannot tell which phase of the wheel each ticker is in without reading raw position data and inferring. This makes `/md-pacing` imprecise.
-**Output schema:**
-```json
-{
-  "ticker": "MARA",
-  "state": "CC_OPEN",
-  "current_positions": [...],
-  "cycle_start_date": "2026-06-05",
-  "days_in_cycle": 22
-}
-```
-
----
-
-### Priority 2 — `get_roll_candidates`
-**File:** `tiger_api/rolls.py`
-**What it does:** Surfaces all open short positions that meet roll criteria — dying leg definition, delta band breach, or juiced flag — with net credit/debit estimate for candidate strikes.
-**Why it matters:** Currently Claude identifies roll candidates manually from Greeks output. This moves the logic server-side.
-**Input:** `pot` filter, `urgency` (immediate / this-week / monitor)
-**Output:** Ranked list of roll candidates with BTC cost, STO credit estimate, net debit/credit, payback days.
-
----
-
-### Priority 3 — Stress Test MCP tool
-**File:** `tiger_api/stress.py`
-**What it does:** Runs the B, D, and B+D combined drawdown scenarios server-side against live positions. Returns NAV impact, excess liquidity after shock, zone classification, and reduction schedule.
-**Why it matters:** Currently Claude computes margin scenarios inline — slow, token-heavy, prone to drift as positions change. Server-side stress test runs against live marks every morning automatically.
-**Output:**
-```json
-{
-  "scenarios": {
-    "A": {"equity_loss": 40023, "buffer_after": 37956, "zone": "watch"},
-    "B": {"equity_loss": 80200, "buffer_after": 0, "zone": "critical"},
-    "D": {"pmcc_loss": 44390, "buffer_after": 33589, "zone": "watch"},
-    "BD": {"total_loss": 153968, "buffer_after": -75989, "zone": "insolvent"}
-  },
-  "current_zone": "watch",
-  "reduction_schedule": [...]
-}
-```
-**Charter integration:** Replaces Claude inline margin math in morning run. `/margin` command calls this directly.
-
----
-
-### Priority 4 — §5.1 Earning Power Test MCP tool
-**What it does:** Given a dying short leg and a proposed replacement, runs the Portfolio Earning Power Test from PMCC Master Doctrine §5.1 server-side.
-**Formula:**
-```
-daily_improvement = (new_theta + new_delta × drift) − (current_theta + current_delta × drift)
-payback_days = roll_debit ÷ daily_improvement
-verdict = ROLL if payback_days < new_DTE × 0.50 else HOLD
-```
-**Why it matters:** Currently computed inline by Claude from Greeks output. Error-prone and token-heavy on a 6-leg array.
-**Input:** current leg Greeks + proposed leg Greeks + roll debit + new DTE + drift assumption
-**Output:** daily_improvement, payback_days, verdict, justification
-
----
 
 ### Priority 5 — `score_pmcc_candidate` BTC/ROLL variants
 **Current state:** `score_pmcc_candidate` is STO-only (v1).
