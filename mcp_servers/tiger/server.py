@@ -900,6 +900,236 @@ def compute_portfolio_greeks(
     }
 
 
+@mcp.tool()
+def get_position_roc(juiced_only: bool = False, pot: str = "all") -> dict:
+    """Per-position RoC for all open short option positions.
+
+    Joins open short option positions to their STO entry records, computes
+    days-held, yield-on-notional, % of premium harvested, and annualised RoC.
+    Flags positions ≥ 65% harvested as `juiced` (= candidates to roll or BTC
+    for the income-wheel playbook).
+
+    Data sources, by priority:
+      PRIMARY:  Google Sheets Data Table (unbounded history since inception).
+                Read via Application Default Credentials — the Cloud Run SA
+                must be a viewer on the spreadsheet. Set the spreadsheet id
+                via env var MCP_INCOME_WHEEL_SHEET_ID (or INCOME_WHEEL_SHEET_ID).
+      FALLBACK: Tiger MCP get_filled_orders(days=90). Used automatically when
+                Sheets is unavailable. Limited to 90 days; older positions
+                will report entry_fill_found=false. Marked with
+                `entry_source: "tiger_mcp_fallback"` so the operator knows
+                why the picture may be incomplete.
+
+    Pot routing:
+      core    = {MARA, CRCL}
+      active  = {BE, COIN, DELL, MSFT, MP, SLB}
+      sidecar = {ECHO, INTC}
+      Tickers in {KO, MCD, NVDA, SPY} are excluded entirely (never appear
+      in any output). Other tickers get pot="unknown" — present in the
+      positions list but not in by_pot aggregates.
+
+    Args:
+      juiced_only: when True, return only positions with pct_harvested >= 0.65
+      pot:         "all" | "core" | "active" | "sidecar"
+
+    Returns:
+      positions[]:               per-position rows with full RoC payload
+      aggregates{}:              by_pot subtotals + portfolio totals + counts
+      juiced_positions[]:        subset of positions with juiced=True
+      missing_entry_positions[]: subset where we couldn't find an entry STO
+      asof_date:                 today's ISO date used for days-held math
+      entry_source:              "google_sheets" | "tiger_mcp_fallback"
+      juiced_threshold:          0.65 (echoed for transparency)
+      notes[]:                   human-readable caveats / data-quality notes
+    """
+    from mcp_servers.tiger import data_table
+
+    asof = date.today()
+    notes: list[str] = []
+
+    # ── 1. Open option positions from Tiger ─────────────────────────────
+    raw_positions = _get_client().get_option_positions()
+    open_positions = [_position_to_dict(p) for p in raw_positions]
+    # We only score SHORT options (qty < 0). Long options aren't part of
+    # the income-wheel playbook this tool serves.
+    open_shorts = [p for p in open_positions if (p.get("quantity") or 0) < 0]
+
+    # ── 2. Try Sheets primary; fall back to Tiger 90d fills ─────────────
+    sheet_rows = data_table.read_data_table()
+    entry_source = "google_sheets" if sheet_rows else "tiger_mcp_fallback"
+    fallback_fills: list[dict] = []
+    if not sheet_rows:
+        try:
+            fallback_fills = [
+                _order_to_dict(o) for o in _get_client().get_filled_orders(days=90)
+            ]
+            notes.append(
+                "Google Sheets unavailable — entry dates from Tiger 90-day "
+                "fill window. Positions older than 90 days will report "
+                "entry_fill_found=false."
+            )
+        except Exception as e:
+            return {
+                "error": "BOTH_SOURCES_UNAVAILABLE",
+                "message": (
+                    "Sheets read failed and Tiger fallback also failed. "
+                    f"Tiger error: {e}"
+                ),
+                "positions": [],
+                "aggregates": {},
+                "asof_date": asof.isoformat(),
+                "entry_source": "none",
+            }
+
+    # ── 3. Walk each open short, find entry, compute RoC ────────────────
+    out: list[dict] = []
+    missing_entry: list[dict] = []
+
+    for p in open_shorts:
+        symbol = (p.get("symbol") or "").upper()
+        if not symbol or symbol in data_table.EXCLUDE_TICKERS:
+            continue
+
+        right = (p.get("right") or "").strip().upper()
+        if right not in ("PUT", "CALL"):
+            continue
+
+        try:
+            strike = float(p.get("strike"))
+            qty = abs(float(p.get("quantity")))
+            avg_cost = float(p.get("avg_cost"))
+            market_price = float(p.get("market_price") or 0.0)
+        except (TypeError, ValueError):
+            notes.append(
+                f"Skipped {symbol} {right} {p.get('strike')} {p.get('expiry')}: "
+                "non-numeric qty/strike/avg_cost/market_price."
+            )
+            continue
+
+        if avg_cost == 0:
+            notes.append(
+                f"Skipped {symbol} {right} {p.get('strike')} {p.get('expiry')}: "
+                "avg_cost=0 — entry premium not recorded."
+            )
+            continue
+
+        expiry_d = data_table._parse_iso_date(p.get("expiry"))
+        if expiry_d is None:
+            notes.append(
+                f"Skipped {symbol} {right} {p.get('strike')}: unparseable expiry "
+                f"{p.get('expiry')!r}."
+            )
+            continue
+        if expiry_d < asof:
+            notes.append(
+                f"Skipped {symbol} {right} {p.get('strike')} {expiry_d.isoformat()}: "
+                "already expired."
+            )
+            continue
+
+        pot_name = data_table.get_pot(symbol)
+        # Pot filter (after pot is computed, before RoC math)
+        if pot != "all" and pot_name != pot:
+            continue
+
+        # ── Look up entry ────────────────────────────────────────────────
+        entry_date_d: Optional[date] = None
+        entry_premium: Optional[float] = None
+        entry_fill_found = False
+
+        if sheet_rows:
+            row = data_table._match_open_row(sheet_rows, symbol, strike, expiry_d, right)
+            if row:
+                entry_date_d = data_table._parse_iso_date(row.get("Date_open"))
+                entry_premium = data_table._to_float(row.get("OptPremium"))
+                entry_fill_found = entry_date_d is not None
+        else:
+            fill = data_table._match_fill_for_position(
+                fallback_fills, symbol, strike, expiry_d, right
+            )
+            if fill:
+                entry_date_d = data_table._parse_iso_date(fill.get("trade_time")) or \
+                               data_table._parse_iso_date(fill.get("order_time"))
+                entry_premium = data_table._to_float(fill.get("avg_fill_price"))
+                entry_fill_found = entry_date_d is not None
+
+        # Build the row even if we couldn't find an entry — caller still
+        # gets yield_on_notional and pct_harvested from avg_cost.
+        if entry_date_d is None:
+            base = {
+                "symbol": symbol,
+                "right": right,
+                "strike": strike,
+                "expiry": expiry_d.isoformat(),
+                "quantity": -int(qty),
+                "pot": pot_name,
+                "entry_date": None,
+                "entry_source": entry_source,
+                "entry_premium": entry_premium,
+                "entry_fill_found": False,
+                "notes": "entry STO not found in either source",
+            }
+            # Still compute the no-time-component fields
+            notional = strike * 100.0 * qty
+            premium_received = avg_cost * 100.0 * qty
+            current_value = market_price * 100.0 * qty
+            pnl_to_date = premium_received - current_value
+            base.update({
+                "days_held": None,
+                "dte_at_entry": None,
+                "dte_remaining": (expiry_d - asof).days,
+                "notional": round(notional, 2),
+                "premium_received": round(premium_received, 2),
+                "current_value": round(current_value, 2),
+                "pnl_to_date": round(pnl_to_date, 2),
+                "yield_on_notional": round(premium_received / notional, 4) if notional > 0 else 0.0,
+                "pct_harvested": round(pnl_to_date / premium_received, 4) if premium_received > 0 else 0.0,
+                "annualised_roc": None,
+                "juiced": (pnl_to_date / premium_received >= data_table.JUICED_THRESHOLD) if premium_received > 0 else False,
+                "juiced_threshold": data_table.JUICED_THRESHOLD,
+            })
+            missing_entry.append(base)
+            out.append(base)
+            continue
+
+        roc = data_table.compute_position_roc(
+            symbol=symbol, strike=strike, expiry=expiry_d, right=right,
+            qty=int(qty), avg_cost=avg_cost, market_price=market_price,
+            entry_date=entry_date_d, today=asof,
+        )
+        out.append({
+            "symbol": symbol,
+            "right": right,
+            "strike": strike,
+            "expiry": expiry_d.isoformat(),
+            "quantity": -int(qty),
+            "pot": pot_name,
+            "entry_source": entry_source,
+            "entry_premium": entry_premium,
+            "entry_fill_found": entry_fill_found,
+            "notes": "",
+            **roc,
+        })
+
+    # ── 4. Optional juiced_only filter (post-compute) ───────────────────
+    if juiced_only:
+        out = [p for p in out if p.get("juiced")]
+
+    aggregates = data_table.aggregate_positions(out)
+    juiced_positions = [p for p in out if p.get("juiced")]
+
+    return {
+        "positions": out,
+        "aggregates": aggregates,
+        "juiced_positions": juiced_positions,
+        "missing_entry_positions": missing_entry,
+        "asof_date": asof.isoformat(),
+        "entry_source": entry_source,
+        "juiced_threshold": data_table.JUICED_THRESHOLD,
+        "notes": notes,
+    }
+
+
 # ── Write tools (Phase 2c) — preview by default, confirm explicitly ──────────
 
 

@@ -130,6 +130,71 @@ def backup_data_table(handler: GSheetHandler, suffix: Optional[str] = None) -> s
 
 
 # ─────────────────────────────────────────────────────────────────
+# Quarterly Archive
+# ─────────────────────────────────────────────────────────────────
+def quarterly_archive(handler: GSheetHandler, quarter_label: Optional[str] = None) -> str:
+    """Snapshot the Data Table as a permanent quarterly archive tab.
+
+    Unlike backup_data_table() which is used before destructive migrations,
+    this creates a permanent dated snapshot for performance review and
+    historical RoC analysis. Tabs are never deleted automatically.
+
+    Args:
+        handler: GSheetHandler instance connected to INCOME_WHEEL_SHEET_ID
+        quarter_label: e.g. "Q2-2026". Auto-derived from current date if None.
+
+    Returns:
+        Name of the archive tab created.
+
+    Tab naming convention: "Archive Q2-2026"
+    If a tab with the same label already exists, it is replaced (idempotent —
+    safe to re-run on the same day).
+    """
+    if quarter_label is None:
+        today = datetime.now()
+        q = (today.month - 1) // 3 + 1
+        quarter_label = f"Q{q}-{today.year}"
+
+    archive_name = f"Archive {quarter_label}"
+
+    try:
+        original_ws = handler.spreadsheet.worksheet('Data Table')
+    except gspread.exceptions.WorksheetNotFound:
+        logger.error("Data Table not found — cannot create quarterly archive")
+        return archive_name
+
+    all_data = original_ws.get_all_values()
+
+    # Idempotent replace: drop the prior same-quarter tab if any.
+    try:
+        existing = handler.spreadsheet.worksheet(archive_name)
+        handler.spreadsheet.del_worksheet(existing)
+        logger.info(f"Deleted existing archive tab: {archive_name}")
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+
+    rows = max(len(all_data) + 10, 100)
+    cols = max(len(all_data[0]) if all_data else 30, 30)
+    archive_ws = handler.spreadsheet.add_worksheet(
+        title=archive_name, rows=rows, cols=cols
+    )
+
+    if all_data:
+        end_col = _col_letter(cols)
+        archive_ws.update(
+            values=all_data,
+            range_name=f'A1:{end_col}{len(all_data)}',
+            value_input_option='RAW',
+        )
+
+    logger.info(
+        f"Quarterly archive created: {archive_name} "
+        f"({len(all_data)} rows, {len(all_data[0]) if all_data else 0} cols)"
+    )
+    return archive_name
+
+
+# ─────────────────────────────────────────────────────────────────
 # Wipe + rebuild Data Table
 # ─────────────────────────────────────────────────────────────────
 def rebuild_data_table(handler: GSheetHandler, argus_rows: list) -> int:
