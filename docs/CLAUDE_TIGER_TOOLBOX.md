@@ -564,14 +564,15 @@ short-option STO rows are filtered by `Direction in {Sell, OpenShort}`
 AND `TradeType == "OPT"`. The `Pot` column is informational; the tool
 derives pot from ticker via the locked CORE/ACTIVE/SIDECAR mapping.
 
-Access: the Cloud Run runtime service account reads via Application
-Default Credentials. If the user says "the connector isn't using the
-sheet" or you see `entry_source: "tiger_mcp_fallback"`, the cause is
-almost certainly one of (a) the `MCP_INCOME_WHEEL_SHEET_ID` Secret
-Manager secret isn't set to the real spreadsheet id (still on the
-`NOT_SET` sentinel), or (b) the runtime SA email
-(`<project-number>-compute@developer.gserviceaccount.com`) isn't shared
-on the sheet as Viewer.
+Access: the MCP server uses the SAME service-account JSON the Streamlit
+Argus deploy uses. The deploy workflow auto-syncs the
+`GOOGLE_SHEETS_CREDENTIALS` + `INCOME_WHEEL_SHEET_ID` GitHub repo secrets
+into Secret Manager on every push, and Cloud Run binds them as env vars.
+If you see `entry_source: "tiger_mcp_fallback"`, the most likely cause
+is one of those two GH secrets is unset — once added at
+`github.com/<repo>/settings/secrets/actions`, the next deploy lights up
+Sheets automatically. No separate service account or manual sheet
+sharing required.
 
 ### Quarterly archive tabs
 
@@ -605,7 +606,7 @@ if the user wants to compare current state to a prior close.
 | 401 unauthorized on every call | Same — disconnect/reconnect. Owner password persists; you don't need to re-enter. |
 | `IV solve failed` in `skipped[]` for many positions | Likely stale market_price (after-hours). Try again in market hours. |
 | `no spot price for XYZ` in `skipped[]` | yfinance miss. Will be cleaner once Alpaca (Phase E2) lands. |
-| `entry_source: "tiger_mcp_fallback"` and positions are missing entries | Sheets isn't reachable. Either (a) `MCP_INCOME_WHEEL_SHEET_ID` is still `NOT_SET` (operator needs to update the Secret Manager value to the real spreadsheet id, then redeploy), or (b) the runtime SA isn't shared on the sheet. Both must be done — tell the user, don't try to fix from chat. |
+| `entry_source: "tiger_mcp_fallback"` and positions are missing entries | Sheets isn't reachable. Most likely the `INCOME_WHEEL_SHEET_ID` or `GOOGLE_SHEETS_CREDENTIALS` GitHub repo secret hasn't been set — the deploy workflow syncs both into Cloud Run on every deploy, so once they're set in `github.com/<repo>/settings/secrets/actions`, the next deploy lights up Sheets. |
 | `missing_entry_positions[]` non-empty even with `entry_source: "google_sheets"` | Schema drift or a position whose STO row was deleted from the sheet. The user has to fix the sheet; the math will recompute on next call. |
 
 ---

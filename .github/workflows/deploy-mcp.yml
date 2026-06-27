@@ -128,60 +128,99 @@ jobs:
             --quiet > /dev/null
           echo "✓ Static OAuth client secret ready"
 
-      # Ensure the Income Wheel Sheet ID secret exists. If missing on
-      # first deploy, create with an empty placeholder so the deploy
-      # succeeds — get_position_roc will fall through to the Tiger MCP
-      # 90-day fallback path until the operator pastes the real id in.
-      # To set it manually:
-      #   echo -n "<sheet-id>" | gcloud secrets versions add \
-      #     mcp-income-wheel-sheet-id --data-file=- --project=tiger-mcp-499603
-      # Also: share the sheet with the runtime SA email as Viewer.
-      - name: Ensure Income Wheel Sheet ID secret exists
+      # Sync the Income Wheel spreadsheet ID + GSheets service account JSON
+      # from GitHub repo secrets into Secret Manager on every deploy.
+      # The same secrets are also used by quarterly-archive.yml — single
+      # source of truth, no separate provisioning step.
+      #
+      # Behaviour:
+      #   - If the GH secret is set → push its value to Secret Manager
+      #     (overwrites prior versions).
+      #   - If the GH secret is NOT set → leave any existing Secret
+      #     Manager version in place; only seed a NOT_SET sentinel if
+      #     the secret has no versions yet so the deploy doesn't fail.
+      #
+      # Either path leaves a valid :latest version, which Cloud Run binds
+      # below. data_table.py treats NOT_SET / empty as unconfigured and
+      # falls back to the Tiger 90-day fill window.
+      - name: Sync GSheets credentials and Sheet ID into Secret Manager
         env:
           PROJECT_NUMBER: "686093261470"
+          GH_SHEET_ID: ${{ secrets.INCOME_WHEEL_SHEET_ID }}
+          GH_GSHEET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
         run: |
           set +e
-          SECRET_NAME="mcp-income-wheel-sheet-id"
           RUN_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
-          if gcloud secrets describe "$SECRET_NAME" --project "$GCP_PROJECT" >/dev/null 2>&1; then
-            # Make sure the secret has at least one version. A bare
-            # `gcloud secrets create` from an empty payload (earlier
-            # buggy attempt) created the container but no version, and
-            # Cloud Run's --set-secrets resolution then 404s on :latest.
-            # If no versions exist, seed one with the NOT_SET sentinel.
-            if ! gcloud secrets versions list "$SECRET_NAME" --project "$GCP_PROJECT" --limit 1 --format='value(name)' | grep -q .; then
-              echo "→ secret $SECRET_NAME exists but has no versions — seeding NOT_SET sentinel"
-              printf "NOT_SET" | gcloud secrets versions add "$SECRET_NAME" \
-                --data-file=- --project "$GCP_PROJECT" --quiet
-            else
-              echo "→ secret $SECRET_NAME already exists with at least one version"
-            fi
-          else
-            echo "→ creating $SECRET_NAME seeded with NOT_SET sentinel"
-            # Non-empty payload is REQUIRED — Secret Manager silently
-            # skips creating a version on empty stdin. data_table.py
-            # treats "NOT_SET" as unconfigured so get_position_roc falls
-            # through to the Tiger 90-day fallback automatically.
-            printf "NOT_SET" | gcloud secrets create "$SECRET_NAME" \
-              --data-file=- \
-              --replication-policy=automatic \
-              --project "$GCP_PROJECT" --quiet
-            echo "::warning::mcp-income-wheel-sheet-id created with NOT_SET sentinel. "\
-              "get_position_roc will use Tiger 90-day fallback until you set the value. "\
-              "To set: echo -n '<sheet-id>' | gcloud secrets versions add mcp-income-wheel-sheet-id --data-file=- --project=$GCP_PROJECT"
-          fi
-          echo "→ grant runtime SA Secret Accessor on $SECRET_NAME"
-          gcloud secrets add-iam-policy-binding "$SECRET_NAME" \
-            --member="serviceAccount:${RUN_SA}" \
-            --role="roles/secretmanager.secretAccessor" \
-            --project="$GCP_PROJECT" \
-            --quiet > /dev/null
+
           echo "→ enable Sheets + Drive APIs (no-op if already enabled)"
           gcloud services enable sheets.googleapis.com drive.googleapis.com \
             --project "$GCP_PROJECT" --quiet > /dev/null
-          echo "✓ Income Wheel Sheet ID secret ready"
-          echo "  Runtime SA email (share the spreadsheet with this as Viewer):"
-          echo "    ${RUN_SA}"
+
+          # ── helper: ensure a secret exists, then write a version ──────
+          # $1 = secret name, $2 = stdin payload (already-validated, non-empty)
+          push_secret_version () {
+            local name="$1"
+            local payload="$2"
+            if gcloud secrets describe "$name" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+              printf '%s' "$payload" | gcloud secrets versions add "$name" \
+                --data-file=- --project "$GCP_PROJECT" --quiet
+            else
+              printf '%s' "$payload" | gcloud secrets create "$name" \
+                --data-file=- --replication-policy=automatic \
+                --project "$GCP_PROJECT" --quiet
+            fi
+            gcloud secrets add-iam-policy-binding "$name" \
+              --member="serviceAccount:${RUN_SA}" \
+              --role="roles/secretmanager.secretAccessor" \
+              --project="$GCP_PROJECT" --quiet > /dev/null
+          }
+
+          # ── INCOME_WHEEL_SHEET_ID ────────────────────────────────────
+          SHEET_SECRET="mcp-income-wheel-sheet-id"
+          if [ -n "$GH_SHEET_ID" ]; then
+            echo "→ syncing INCOME_WHEEL_SHEET_ID GH secret → $SHEET_SECRET"
+            push_secret_version "$SHEET_SECRET" "$GH_SHEET_ID"
+            echo "  ✓ Sheet ID synced from GH secret"
+          else
+            echo "::warning::INCOME_WHEEL_SHEET_ID GH secret not set — "\
+              "get_position_roc will use Tiger 90-day fallback."
+            # Only seed a sentinel if the secret has no versions; never overwrite a real value.
+            if gcloud secrets describe "$SHEET_SECRET" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+              if ! gcloud secrets versions list "$SHEET_SECRET" --project "$GCP_PROJECT" --limit 1 --format='value(name)' | grep -q .; then
+                push_secret_version "$SHEET_SECRET" "NOT_SET"
+              else
+                echo "  → existing secret preserved (set previously)"
+              fi
+            else
+              push_secret_version "$SHEET_SECRET" "NOT_SET"
+            fi
+          fi
+
+          # ── GOOGLE_SHEETS_CREDENTIALS (SA JSON) ───────────────────────
+          CREDS_SECRET="mcp-gsheet-credentials-json"
+          if [ -n "$GH_GSHEET_CREDS" ]; then
+            echo "→ validating GOOGLE_SHEETS_CREDENTIALS JSON"
+            if ! printf '%s' "$GH_GSHEET_CREDS" | python3 -c "import sys, json; json.load(sys.stdin)" 2>/dev/null; then
+              echo "::error::GOOGLE_SHEETS_CREDENTIALS GH secret is not valid JSON"
+              exit 1
+            fi
+            echo "→ syncing GOOGLE_SHEETS_CREDENTIALS GH secret → $CREDS_SECRET"
+            push_secret_version "$CREDS_SECRET" "$GH_GSHEET_CREDS"
+            echo "  ✓ GSheet SA credentials synced from GH secret"
+          else
+            echo "::warning::GOOGLE_SHEETS_CREDENTIALS GH secret not set — "\
+              "MCP will try ADC (Cloud Run runtime SA), then fall through to Tiger fallback."
+            if gcloud secrets describe "$CREDS_SECRET" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+              if ! gcloud secrets versions list "$CREDS_SECRET" --project "$GCP_PROJECT" --limit 1 --format='value(name)' | grep -q .; then
+                push_secret_version "$CREDS_SECRET" "NOT_SET"
+              else
+                echo "  → existing secret preserved (set previously)"
+              fi
+            else
+              push_secret_version "$CREDS_SECRET" "NOT_SET"
+            fi
+          fi
+          echo "✓ Sheet ID + GSheet credentials provisioned"
 
       # gcloud run deploy --source . wants the Dockerfile at the source
       # root, not nested under mcp_servers/tiger/deploy/. Mirror it for
@@ -207,7 +246,7 @@ jobs:
             --timeout 3600 \
             --no-cpu-throttling \
             --set-env-vars MCP_TRANSPORT=streamable-http,MCP_HOST=0.0.0.0,TIGER_LICENSE=TBSG,TIGER_ENV=PROD,MCP_BASE_URL=${SERVICE_URL},MCP_OAUTH_STORAGE=firestore,GCP_PROJECT=${GCP_PROJECT},MCP_OAUTH_CLIENT_ID=argus-tiger-mcp-claude \
-            --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest,MCP_OAUTH_CLIENT_SECRET=mcp-oauth-client-secret:latest,MCP_INCOME_WHEEL_SHEET_ID=mcp-income-wheel-sheet-id:latest \
+            --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest,MCP_OAUTH_CLIENT_SECRET=mcp-oauth-client-secret:latest,MCP_INCOME_WHEEL_SHEET_ID=mcp-income-wheel-sheet-id:latest,MCP_GSHEET_CREDENTIALS_JSON=mcp-gsheet-credentials-json:latest \
             --quiet
 
       - name: Post-deploy sanity checks
