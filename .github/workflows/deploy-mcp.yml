@@ -128,6 +128,46 @@ jobs:
             --quiet > /dev/null
           echo "✓ Static OAuth client secret ready"
 
+      # Ensure the Income Wheel Sheet ID secret exists. If missing on
+      # first deploy, create with an empty placeholder so the deploy
+      # succeeds — get_position_roc will fall through to the Tiger MCP
+      # 90-day fallback path until the operator pastes the real id in.
+      # To set it manually:
+      #   echo -n "<sheet-id>" | gcloud secrets versions add \
+      #     mcp-income-wheel-sheet-id --data-file=- --project=tiger-mcp-499603
+      # Also: share the sheet with the runtime SA email as Viewer.
+      - name: Ensure Income Wheel Sheet ID secret exists
+        env:
+          PROJECT_NUMBER: "686093261470"
+        run: |
+          set +e
+          SECRET_NAME="mcp-income-wheel-sheet-id"
+          RUN_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+          if gcloud secrets describe "$SECRET_NAME" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+            echo "→ secret $SECRET_NAME already exists"
+          else
+            echo "→ creating $SECRET_NAME with empty placeholder"
+            printf "" | gcloud secrets create "$SECRET_NAME" \
+              --data-file=- \
+              --replication-policy=automatic \
+              --project "$GCP_PROJECT" --quiet
+            echo "::warning::mcp-income-wheel-sheet-id created EMPTY. "\
+              "get_position_roc will use Tiger 90-day fallback until you set the value. "\
+              "To set: echo -n '<sheet-id>' | gcloud secrets versions add mcp-income-wheel-sheet-id --data-file=- --project=$GCP_PROJECT"
+          fi
+          echo "→ grant runtime SA Secret Accessor on $SECRET_NAME"
+          gcloud secrets add-iam-policy-binding "$SECRET_NAME" \
+            --member="serviceAccount:${RUN_SA}" \
+            --role="roles/secretmanager.secretAccessor" \
+            --project="$GCP_PROJECT" \
+            --quiet > /dev/null
+          echo "→ enable Sheets + Drive APIs (no-op if already enabled)"
+          gcloud services enable sheets.googleapis.com drive.googleapis.com \
+            --project "$GCP_PROJECT" --quiet > /dev/null
+          echo "✓ Income Wheel Sheet ID secret ready"
+          echo "  Runtime SA email (share the spreadsheet with this as Viewer):"
+          echo "    ${RUN_SA}"
+
       # gcloud run deploy --source . wants the Dockerfile at the source
       # root, not nested under mcp_servers/tiger/deploy/. Mirror it for
       # the duration of this job — the copy is local to the runner and
@@ -152,7 +192,7 @@ jobs:
             --timeout 3600 \
             --no-cpu-throttling \
             --set-env-vars MCP_TRANSPORT=streamable-http,MCP_HOST=0.0.0.0,TIGER_LICENSE=TBSG,TIGER_ENV=PROD,MCP_BASE_URL=${SERVICE_URL},MCP_OAUTH_STORAGE=firestore,GCP_PROJECT=${GCP_PROJECT},MCP_OAUTH_CLIENT_ID=argus-tiger-mcp-claude \
-            --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest,MCP_OAUTH_CLIENT_SECRET=mcp-oauth-client-secret:latest \
+            --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest,MCP_OAUTH_CLIENT_SECRET=mcp-oauth-client-secret:latest,MCP_INCOME_WHEEL_SHEET_ID=mcp-income-wheel-sheet-id:latest \
             --quiet
 
       - name: Post-deploy sanity checks

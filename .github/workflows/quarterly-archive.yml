@@ -1,0 +1,105 @@
+name: Quarterly Archive
+
+# Snapshots the Income Wheel Data Table tab into a permanent
+# 'Archive Q<N>-<YYYY>' tab on the spreadsheet. Runs at 02:00 UTC on the
+# last day of each calendar quarter, or on-demand via workflow_dispatch.
+#
+# REQUIRED REPO SECRETS (one-time setup at github.com/<repo>/settings/secrets):
+#   GOOGLE_SHEETS_CREDENTIALS  Full service account JSON (the same JSON
+#                              you'd otherwise drop at gsheet_credentials.json
+#                              for local Argus runs). The SA must have
+#                              Editor access on the Income Wheel sheet.
+#   INCOME_WHEEL_SHEET_ID      Spreadsheet ID (the long token from the
+#                              sheet URL). Mirrors config.INCOME_WHEEL_SHEET_ID.
+
+on:
+  schedule:
+    # Last day of each calendar quarter at 02:00 UTC.
+    - cron: '0 2 31 3 *'   # Q1 close — Mar 31
+    - cron: '0 2 30 6 *'   # Q2 close — Jun 30
+    - cron: '0 2 30 9 *'   # Q3 close — Sep 30
+    - cron: '0 2 31 12 *'  # Q4 close — Dec 31
+  workflow_dispatch:
+    inputs:
+      quarter_label:
+        description: 'Quarter label e.g. Q2-2026 (leave blank to auto-derive)'
+        required: false
+        default: ''
+
+# Block parallel runs of the same workflow — the archive step writes to
+# a single Google Sheet tab and concurrent runs would race.
+concurrency:
+  group: quarterly-archive
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Only the deps quarterly_archive actually needs — avoids pulling
+      # in the full Argus Streamlit stack just to copy a sheet tab.
+      - name: Install dependencies
+        run: |
+          pip install --quiet \
+            gspread>=5.12.0 \
+            google-auth>=2.20.0 \
+            pandas>=2.0.0 \
+            python-dotenv>=1.0.0
+
+      # GSheetHandler expects gsheet_credentials.json at repo root (see
+      # config.GSHEET_CREDENTIALS_PATH). Materialise the secret to disk
+      # so the existing handler picks it up unchanged.
+      - name: Stage service account credentials
+        env:
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+        run: |
+          if [ -z "$GOOGLE_SHEETS_CREDENTIALS" ]; then
+            echo "::error::GOOGLE_SHEETS_CREDENTIALS secret is empty. "\
+              "Add the SA JSON at github.com/<repo>/settings/secrets/actions."
+            exit 1
+          fi
+          printf '%s' "$GOOGLE_SHEETS_CREDENTIALS" > gsheet_credentials.json
+          # Sanity-check it parses as JSON; don't print the contents.
+          python3 -c "import json; json.load(open('gsheet_credentials.json'))" \
+            || { echo "::error::GOOGLE_SHEETS_CREDENTIALS is not valid JSON"; exit 1; }
+          echo "✓ credentials staged"
+
+      - name: Run quarterly archive
+        env:
+          INCOME_WHEEL_SHEET_ID: ${{ secrets.INCOME_WHEEL_SHEET_ID }}
+          INPUT_QUARTER_LABEL: ${{ github.event.inputs.quarter_label }}
+        run: |
+          if [ -z "$INCOME_WHEEL_SHEET_ID" ]; then
+            echo "::error::INCOME_WHEEL_SHEET_ID secret not set"
+            exit 1
+          fi
+          python - <<'PY'
+          import os
+          from tiger_etl import quarterly_archive
+          from gsheet_handler import GSheetHandler
+          from config import INCOME_WHEEL_SHEET_ID
+
+          label = (os.environ.get("INPUT_QUARTER_LABEL") or "").strip() or None
+          handler = GSheetHandler(INCOME_WHEEL_SHEET_ID)
+          tab = quarterly_archive(handler, quarter_label=label)
+          print(f"Archive complete: {tab}")
+          PY
+
+      # Belt-and-braces: scrub the credentials file even though the runner
+      # is ephemeral. Step never fails the job — cleanup only.
+      - name: Clean up credentials
+        if: always()
+        run: rm -f gsheet_credentials.json
