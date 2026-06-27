@@ -126,6 +126,19 @@ def implied_vol(market_price: float, spot: float, strike: float, t: float, r: fl
     return 0.5 * (lo + hi)
 
 
+def bs_gamma(spot: float, strike: float, t: float, r: float, sigma: float,
+             q: float = 0.0) -> float:
+    """Gamma = ∂²Price/∂spot² — needed for the PMCC §12 scorecard
+    (low / moderate / high classification).
+
+    Symmetric for calls and puts (Black-Scholes property)."""
+    if t <= 0 or sigma <= 0 or spot <= 0 or strike <= 0:
+        return 0.0
+    sqrt_t = math.sqrt(t)
+    d1 = (math.log(spot / strike) + (r - q + 0.5 * sigma * sigma) * t) / (sigma * sqrt_t)
+    return math.exp(-q * t) * _phi(d1) / (spot * sigma * sqrt_t)
+
+
 def bs_delta_theta(spot: float, strike: float, t: float, r: float, sigma: float,
                    is_call: bool, q: float = 0.0) -> tuple:
     """Returns (delta, theta_per_year)."""

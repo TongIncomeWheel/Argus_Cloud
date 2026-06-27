@@ -25,7 +25,7 @@ runs Python on Cloud Run; tokens are free there.
 
 ## Data freshness protocol (READ BEFORE EVERY COMPUTE STEP)
 
-Tiger MCP tools have **three different freshness profiles**. Mixing them
+Tiger MCP tools have **four different freshness profiles**. Mixing them
 silently produces wrong answers. Before any analytical step, decide which
 freshness tier you actually need and call the matching tool.
 
@@ -34,6 +34,7 @@ freshness tier you actually need and call the matching tool.
 | **Live quote** | Tiger L1 push | sub-second | `get_option_briefs`, `get_option_chain`, `get_option_depth`, `get_option_trade_ticks` |
 | **Position snapshot** | Tiger account cache | seconds–minutes (depends on Tiger's internal refresh) | `get_option_positions`, `get_stock_positions`, `get_account_summary`, `get_prime_assets` |
 | **Underlying spot (equity)** | yfinance (server-side, inside compute_portfolio_greeks) | ~15 min delayed | embedded in `compute_portfolio_greeks` |
+| **Canonical fill history** | Google Sheets "Data Table" tab (or Tiger 90-day fallback) | manual write latency (Tiger ETL pipeline; could be hours-to-days behind real fills) | embedded in `get_position_roc`; quarterly snapshots in `Archive Q<N>-<YYYY>` tabs |
 
 Rules:
 
@@ -61,6 +62,13 @@ Rules:
    source and its latency.** "Net theta ≈ $X/day (yfinance spot ~15 min
    delayed; IV solved from Tiger position marks of unknown age)" is the
    correct level of disclosure.
+6. **For RoC / harvested / juiced math, ALWAYS read `entry_source` and
+   relay it.** `get_position_roc` will tag every response as either
+   `entry_source: "google_sheets"` (canonical full history) or
+   `entry_source: "tiger_mcp_fallback"` (Tiger's 90-day rolling window —
+   positions older than 90 days will have `entry_fill_found: false` and a
+   null `annualised_roc`). If you see the fallback tag, surface that fact
+   when reporting numbers so the user knows the picture may be partial.
 
 If the user runs a project-layer command (e.g., `/md-pacing`, `/md-yield`)
 that needs freshness, the FIRST action of that command MUST be a refresh
@@ -82,7 +90,10 @@ treat that as a charter bug and flag it before running.
 | Per-ticker executions / fills | `get_transactions(symbol, days, limit)` |
 | Deposits / withdrawals history | `get_funding_history` |
 | Daily NAV / equity curve | `get_nav_history(days)` |
-| **Net Δ / Net Θ across the whole option book** | **`compute_portfolio_greeks`** ← new |
+| **Net Δ / Net Θ across the whole option book** | **`compute_portfolio_greeks`** |
+| **Per-position RoC, harvested %, juiced flag** | **`get_position_roc(juiced_only, pot)`** |
+| **PMCC §12 scorecard for one candidate** | **`score_pmcc_candidate(symbol, strike, expiry, side, premium, spot, hv30, ...)`** ← new |
+| **HV30 / HV-N realised vol for an underlying** | **`compute_hv(symbol, lookback_days=30)`** ← new |
 | What expiries are available for XYZ? | `get_option_expirations([symbols])` |
 | Full chain for one expiry | `get_option_chain(symbol, expiry)` |
 | Quote on specific contracts I already know | `get_option_briefs([contracts])` |
@@ -207,6 +218,112 @@ Contract dict shape used by `briefs`/`greeks`/`bars`/`depth`/`ticks`:
   I collecting per day?", "what's my net option exposure?". It is the
   ONLY way to get Greeks on a TBSG account without Tiger throwing 403.
 
+- **`get_position_roc(juiced_only=False, pot="all")`** →
+  per-position RoC analytics for every open SHORT option (CSP + CC).
+  Joins live Tiger position state to entry STO records and computes:
+  days held, DTE at entry, DTE remaining, premium yield on notional,
+  % of premium harvested (theta captured), annualised RoC, and a
+  `juiced` boolean (≥ 65% harvested = candidate to BTC or roll).
+
+  Args:
+    - `juiced_only` (bool): return only positions ≥ 65% harvested.
+    - `pot` (str): `"all"` | `"core"` | `"active"` | `"sidecar"` — filter
+      by pot membership.
+
+  Data sources (in priority order, surfaced as `entry_source`):
+    1. **PRIMARY** — Google Sheets `Data Table` tab (full unbounded fill
+       history since strategy inception). Match key: ticker + strike +
+       expiry + right + STO direction. For rolled positions the **most
+       recent** matching STO row wins.
+    2. **FALLBACK** — Tiger MCP `get_filled_orders(days=90)`. Used
+       automatically when Sheets is unreachable or unconfigured. Tagged
+       `entry_source: "tiger_mcp_fallback"`. Positions older than 90 days
+       will report `entry_fill_found: false`.
+
+  Pot routing (locked, do not invent):
+    - **core** = {MARA, CRCL}
+    - **active** = {BE, COIN, DELL, MSFT, MP, SLB}
+    - **sidecar** = {ECHO, INTC}
+    - **excluded entirely** = {KO, MCD, NVDA, SPY} (never appear in output)
+    - anything else → `pot: "unknown"` (visible in positions list but
+      NOT counted in `aggregates.by_pot`)
+
+  Returns:
+  ```text
+  positions[]:               per-position rows with full RoC payload
+  aggregates:                {by_pot: {core, active, sidecar},
+                              total_notional, total_premium_received,
+                              total_pnl_to_date, portfolio_yield_on_notional,
+                              portfolio_pct_harvested, juiced_count,
+                              total_positions, positions_missing_entry}
+  juiced_positions[]:        subset of positions with juiced=True
+  missing_entry_positions[]: positions where neither source had an entry
+  asof_date:                 today's ISO date used for days-held math
+  entry_source:              "google_sheets" | "tiger_mcp_fallback"
+  juiced_threshold:          0.65 (echoed for transparency)
+  notes[]:                   human-readable caveats / skip reasons
+  ```
+
+  **Use this when the user asks:** "which positions are juiced?",
+  "what's my annualised RoC on MARA?", "how much have I harvested in the
+  core pot?", "are any positions ready to BTC?". Sign convention is
+  short-position-friendly: `pct_harvested = 1.0` means the position has
+  decayed to ~zero (free money to take off the table).
+
+- **`compute_hv(symbol, lookback_days=30)`** →
+  annualised realised volatility from yfinance daily closes.
+
+  Returns: `{symbol, lookback_days, hv, sample_size, source, asof_date, notes[]}`.
+  `hv` is a decimal (`0.17` = 17%). Pass it straight as the `hv30` arg to
+  `score_pmcc_candidate`. If the fetch fails or returns too few bars,
+  `hv=0.0` and `notes[]` explains why.
+
+  **Use when:** any time the doctrine wants HV30 (or HV-N) and you don't
+  already have a hot value from FMP or elsewhere. ~250ms latency; safe
+  to call inline at the top of a review.
+
+- **`score_pmcc_candidate(symbol, strike, expiry, side, premium, spot,
+    hv30, risk_free_rate=0.045, n_paths=5000, seed=None)`** →
+  the **PMCC Master Doctrine v3 §12 Trade Evaluation Scorecard**.
+
+  Runs the full §12 block server-side: Greeks (Δ, Θ, vega, gamma) via
+  Black-Scholes from the supplied premium-implied IV; §2 theta hurdle
+  check; 5,000-path geometric Brownian motion simulation; CVaR; verdict
+  with §12 cutoffs. No external API calls inside the tool — pure compute
+  from the inputs Claude pastes in.
+
+  Args:
+    - `side`: `"STO_PUT"` or `"STO_CALL"` (v1 — BTC/ROLL scorecards
+      tracked in BACKLOG)
+    - `premium`: current option mark per share (from `get_option_briefs`
+      or the live chain)
+    - `spot`: current underlying spot (from `mcp__FMP__quote` for SPY,
+      or `mcp__Interactive_Brokers_IBKR__get_price_snapshot` if available)
+    - `hv30`: annualised realised vol (decimal). Use `compute_hv` or
+      compute from FMP chart bars
+    - `seed`: optional, makes the MC reproducible across calls
+
+  Returns (matches the §12 scorecard structure):
+  ```text
+  trade:        {action, symbol, strike, expiry, dte_days, premium}
+  greeks:       {delta, theta_per_day, theta_hurdle, theta_pass,
+                 vega, gamma, gamma_level, iv_solved, daily_1sigma_usd}
+  distribution: {n_paths, hv30, r,
+                 p_profit_50, p_profit_80, p_loss, p_assignment,
+                 expected_pnl, pnl_stdev, cvar_5, max_profit}
+  risk_adjusted:{annualised_return, annualised_vol, sharpe_equiv,
+                 capital_efficiency}
+  verdict:      "pass" | "conditional" | "fail"
+  verdict_reasons[]: list of cutoff messages (theta hurdle, Sharpe,
+                     CVaR/expected ratio, auto-reject reason)
+  capital_at_risk:   strike × 100 (conservative ceiling)
+  ```
+
+  **Use when:** the user asks "score this trade", "should I sell the SPY
+  720P 30 DTE", "run the scorecard on STRIKE EXPIRY". Always paste the
+  scorecard output to the user verbatim — that IS the §12 block in §16
+  output format.
+
 ### Write tools — preview-by-default, confirm explicitly
 
 ALL write tools work in two steps. **Never skip the preview.**
@@ -250,14 +367,18 @@ it via a "Phase E1 follow-up". Do not try to recompute them in chat.
 | CSP candidate scanner (theta_scanner) | `theta_scanner/scan.py` | Python only |
 | PMCC engine (regime, doctrine, scorecard) | `pmcc_engine/` | Python only |
 | Forecast income (theta carry over horizon) | (designed, not built) | Not implemented |
+| §5.1 Earning Power Test (PMCC roll decision math) | (doctrine only) | Not wired — compute in chat from current vs. new leg θ + roll debit |
+| §12 BTC / ROLL scorecard variants | (doctrine only) | `score_pmcc_candidate` is STO-only in v1 |
 
 When the user asks one of these:
 - "Could compute that, but it's not wired to MCP yet. Want me to add a
   Phase E1 follow-up so you can call it from chat? Until then I'd have
   to load positions into context and run BS by hand — slow and lossy."
-- The roadmap order is in `BACKLOG.md` (Phase E1). The first one shipped
-  was `compute_portfolio_greeks` (2026-06-25). Next priorities are
-  `get_portfolio_snapshot`, `get_wheel_state`, `get_roll_candidates`.
+- The roadmap order is in `BACKLOG.md` (Phase E1). Shipped so far:
+  `compute_portfolio_greeks` (2026-06-25), `get_position_roc` (2026-06-27),
+  `score_pmcc_candidate` + `compute_hv` (2026-06-27). Next priorities:
+  `get_wheel_state`, `get_roll_candidates`, BTC/ROLL scorecard variants,
+  §5.1 Earning Power Test as an MCP tool.
 
 ---
 
@@ -315,6 +436,15 @@ conversation with the user before pushing through.
    - **Project with IBKR connector also attached (e.g. Aegis)** → use
      IBKR's `get_price_snapshot` for clean real-time spot. This is the
      ONLY context where `get_price_snapshot` applies.
+6. **Never compute RoC, harvested %, juiced status, or annualised return
+   manually.** Call `get_position_roc`. The math (yield_on_notional,
+   pct_harvested, annualised_roc, juiced @ 0.65) lives server-side and is
+   the single source of truth. If you recompute in chat with different
+   assumptions you'll drift from what the dashboards say.
+7. **Never invent the entry date of a position.** Either Sheets or Tiger
+   fallback gave you one (entry_fill_found=true) or it didn't. If it
+   didn't, that's data the user has to enter — say so and quote the
+   `missing_entry_positions[]` block; don't guess.
 
 ---
 
@@ -339,6 +469,134 @@ wrong — likely an IV solve failure on a few large positions. Check
 
 ---
 
+## PMCC review recipe — §15 sequence mapped to tool calls
+
+The SPY PMCC book lives in the Tiger account. Per the PMCC Master
+Doctrine v3 §15 Review Sequence, every session walks these steps. Below
+is the canonical tool-call recipe for each step — follow it exactly.
+
+**Step 1 — Timestamp.** State SGT + ET. Run a quick `WebSearch` for
+"FOMC CPI earnings this week" to confirm what has already happened.
+
+**Step 2 — Live data pull.** In one round-trip, parallel:
+1. `mcp__FMP__quote("SPY")` → SPY spot (live).
+2. `mcp__FMP__quote("^VIX")` → VIX live + 52w high/low for IVR.
+3. `compute_hv("SPY", lookback_days=30)` → HV30 for §2 hurdle.
+
+Compute IVR inline: `(vix_price - vix_52w_low) / (vix_52w_high - vix_52w_low) × 100`.
+
+**Step 3 — Regime classification.** Vol band from VIX vs 18 (SPY median):
+L<18, M 18-25, H 25-36, X >36. IVR band: <25 Cheap, 25-50 Neutral, 50-75
+Rich, >75 Extreme. State the cell explicitly and the mandated posture
+(§1 grid). Mismatched posture is a flag for the next roll cycle, not an
+immediate action.
+
+**Step 4 — Position marks.**
+1. `get_option_positions()` → full LEAPS + shorts table.
+2. For per-contract live quotes: `get_option_briefs([contracts])` on the
+   shorts where dying-leg math matters.
+3. For per-contract chain Greeks: `get_option_chain(SPY, expiry,
+   include_greeks=True)` then filter to the held strikes.
+
+Per leg, check refresh triggers (§9) for LEAPS and dying/roll triggers
+(§5.3) for shorts. Surface flags: DYING, ROLL, HARVEST, CLOSE, EX-DIV,
+BRICK, REFRESH.
+
+**Step 5 — Aggregate math.**
+- `compute_portfolio_greeks()` → net Δ + net Θ across the entire option
+  book in one call. Already sign-flipped for shorts.
+- theta/delta ratio = `aggregates.net_theta_per_day_usd /
+  aggregates.net_delta_shares` (watch the sign — net delta is shares,
+  net theta is $/day; the ratio is $/share).
+- Array drift = `abs(spot - mean(short strikes)) / spot × 100`.
+- Yield ratio = `Σ|theta_per_day| / Σ(per-short hurdle)`.
+
+**Step 6 — Tripwire check.** All 6 gates from §11. None breached → silent
+day, state theta accrual only.
+
+**Step 7 — Posture vs regime check.** Does the array's current ITM:OTM
+match the regime cell's mandated posture? Mismatch → flag for next roll
+cycle. Do NOT correct on the spot.
+
+**Step 8 — Action or hold.**
+- No trigger → "Hold. Engine earning $X/day. Next trigger: [condition]."
+- Trigger fired → run `score_pmcc_candidate(...)` per candidate strike
+  (top 5 candidates by extrinsic + DTE fit). Paste the scorecard block
+  verbatim. Apply §5.1 Earning Power Test on the new vs. current leg
+  (Claude does this in chat — no MCP tool yet). Spec the ticket only when
+  `verdict in ("pass", "conditional")` AND Earning Power payback < 50% of
+  new DTE.
+
+### What the recipe deliberately does NOT cover
+
+- `score_pmcc_candidate` is **STO-only in v1**. BTC/ROLL scorecards are
+  in BACKLOG. For now, score the new leg only; the BTC side is judged
+  by §5.1 Earning Power math.
+- §5.1 Earning Power Test (`payback_days < new_leg_DTE × 0.5`) has no
+  MCP tool yet — compute in chat from the current vs. new leg's
+  `theta_per_day` and the roll debit.
+- Spot from FMP is real-time; from `compute_portfolio_greeks` it's
+  yfinance ~15-min delayed. If precision matters, prefer FMP. If you
+  already have the Greeks block, the spot inside it is fine for context.
+
+---
+
+## Operational pieces (not tools, but Claude should know they exist)
+
+These are pipelines / artifacts that produce the data the MCP tools read.
+Claude doesn't run them, but should reference them correctly when the
+user mentions them or when a tool's output points back to them.
+
+### Google Sheets "Data Table" — canonical fill history
+
+Every CSP / CC entry, close, and roll the user makes is written to the
+`Data Table` tab of the Income Wheel spreadsheet via the Tiger ETL
+pipeline (`tiger_etl.py`). This is the **unbounded** history — grows
+forever, never rolls. `get_position_roc` reads it as primary source so
+positions older than Tiger's 90-day fill window still get proper entry
+dates and annualised-RoC math.
+
+Schema (the columns that matter for tools):
+`TradeID, Ticker, Date_open, Expiry_Date, Status,
+Option_Strike_Price_(USD), OptPremium, Quantity, Direction, StrategyType,
+Pot, Tiger_Row_Hash`. `Direction ∈ {Sell, OpenShort, Buy, Close}` —
+short-option STO rows are filtered by `Direction in {Sell, OpenShort}`
+AND `TradeType == "OPT"`. The `Pot` column is informational; the tool
+derives pot from ticker via the locked CORE/ACTIVE/SIDECAR mapping.
+
+Access: the Cloud Run runtime service account reads via Application
+Default Credentials. If the user says "the connector isn't using the
+sheet" or you see `entry_source: "tiger_mcp_fallback"`, the cause is
+almost certainly one of (a) the `MCP_INCOME_WHEEL_SHEET_ID` Secret
+Manager secret isn't set to the real spreadsheet id (still on the
+`NOT_SET` sentinel), or (b) the runtime SA email
+(`<project-number>-compute@developer.gserviceaccount.com`) isn't shared
+on the sheet as Viewer.
+
+### Quarterly archive tabs
+
+A scheduled GitHub Action (`.github/workflows/quarterly-archive.yml`)
+snapshots `Data Table` into a permanent `Archive Q<N>-<YYYY>` tab at
+02:00 UTC on the last day of every calendar quarter. Manual triggers
+via `workflow_dispatch` with an optional `quarter_label` input.
+
+Use these tabs for **point-in-time analysis** — "what did the book look
+like at end-Q1?" — never as live data. They're frozen snapshots.
+Tools don't read them by default; reference them by name (`Archive Q2-2026`)
+if the user wants to compare current state to a prior close.
+
+### What Claude does NOT operate
+
+- The Tiger CSV ETL (`tiger_etl.py run_migration`) — this is the user's
+  daily/weekly housekeeping pipeline. Never trigger it from chat.
+- The quarterly archive workflow — runs on cron + manual UI. Never
+  trigger from chat unless the user explicitly asks.
+- Anything that writes to the Sheet (`append_trade`, `update_trade`,
+  `delete_trades`) — these are upstream of the MCP server, not exposed
+  as tools. Sheet edits happen in the Streamlit UI or via ETL.
+
+---
+
 ## Connector troubleshooting (tell the user, don't try to fix it yourself)
 
 | Symptom | What to tell the user |
@@ -347,6 +605,8 @@ wrong — likely an IV solve failure on a few large positions. Check
 | 401 unauthorized on every call | Same — disconnect/reconnect. Owner password persists; you don't need to re-enter. |
 | `IV solve failed` in `skipped[]` for many positions | Likely stale market_price (after-hours). Try again in market hours. |
 | `no spot price for XYZ` in `skipped[]` | yfinance miss. Will be cleaner once Alpaca (Phase E2) lands. |
+| `entry_source: "tiger_mcp_fallback"` and positions are missing entries | Sheets isn't reachable. Either (a) `MCP_INCOME_WHEEL_SHEET_ID` is still `NOT_SET` (operator needs to update the Secret Manager value to the real spreadsheet id, then redeploy), or (b) the runtime SA isn't shared on the sheet. Both must be done — tell the user, don't try to fix from chat. |
+| `missing_entry_positions[]` non-empty even with `entry_source: "google_sheets"` | Schema drift or a position whose STO row was deleted from the sheet. The user has to fix the sheet; the math will recompute on next call. |
 
 ---
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 from datetime import date, datetime
@@ -1127,6 +1128,305 @@ def get_position_roc(juiced_only: bool = False, pot: str = "all") -> dict:
         "entry_source": entry_source,
         "juiced_threshold": data_table.JUICED_THRESHOLD,
         "notes": notes,
+    }
+
+
+# ── PMCC §12 scorecard + HV helpers (Phase E1, PMCC track) ───────────────────
+
+_GAMMA_LOW = 0.005
+_GAMMA_HIGH = 0.015
+
+
+def _gamma_level(gamma: float) -> str:
+    """Classify gamma per §12 Greeks block. Thresholds calibrated for SPY
+    near-the-money — re-tune per-ticker as the doctrine matures."""
+    g = abs(gamma)
+    if g < _GAMMA_LOW:
+        return "low"
+    if g >= _GAMMA_HIGH:
+        return "high"
+    return "moderate"
+
+
+@mcp.tool()
+def compute_hv(symbol: str, lookback_days: int = 30) -> dict:
+    """Annualised historical (realised) volatility from daily closes.
+
+    PMCC §2 calls for HV30 to set the dynamic theta hurdle. This tool
+    pulls daily bars via yfinance and computes:
+      hv = stdev(log returns, ddof=1) × √252
+
+    Use the returned `hv` value directly as the `hv30` arg to
+    `score_pmcc_candidate`.
+
+    Args:
+      symbol: ticker, e.g. "SPY"
+      lookback_days: window of LOG RETURNS (the function fetches one extra
+        close so it can produce N returns from N+1 closes; default 30 = HV30)
+
+    Returns:
+      {symbol, lookback_days, hv, sample_size, source, asof_date, notes[]}
+      `hv` is the annualised decimal vol (0.17 = 17%). 0.0 means the fetch
+      failed or there weren't enough bars.
+    """
+    from tiger_api.montecarlo import realized_vol
+
+    notes: list[str] = []
+    closes: list[float] = []
+    source = "yfinance"
+
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {
+            "symbol": symbol.upper(),
+            "lookback_days": lookback_days,
+            "hv": 0.0,
+            "sample_size": 0,
+            "source": "none",
+            "asof_date": date.today().isoformat(),
+            "notes": ["yfinance not installed — cannot fetch bars."],
+        }
+
+    fetch_days = max(lookback_days + 10, 60)  # extra buffer for weekends/holidays
+    try:
+        t = yf.Ticker(symbol)
+        hist = t.history(period=f"{fetch_days}d", auto_adjust=False)
+        if hist is not None and "Close" in hist.columns:
+            closes = [float(c) for c in hist["Close"].tolist() if c == c]  # drop NaNs
+    except Exception as e:
+        notes.append(f"yfinance fetch failed for {symbol}: {e}")
+
+    if len(closes) < lookback_days + 1:
+        notes.append(
+            f"Only {len(closes)} closes available, need >= {lookback_days + 1}. "
+            "HV may be noisy or zero."
+        )
+
+    hv = realized_vol(closes, window=lookback_days)
+
+    return {
+        "symbol": symbol.upper(),
+        "lookback_days": lookback_days,
+        "hv": _round(hv, 4),
+        "sample_size": len(closes),
+        "source": source,
+        "asof_date": date.today().isoformat(),
+        "notes": notes,
+    }
+
+
+@mcp.tool()
+def score_pmcc_candidate(
+    symbol: str,
+    strike: float,
+    expiry: str,
+    side: str,
+    premium: float,
+    spot: float,
+    hv30: float,
+    risk_free_rate: float = 0.045,
+    n_paths: int = 5000,
+    seed: int | None = None,
+) -> dict:
+    """PMCC Master Doctrine v3 §12 Trade Evaluation Scorecard.
+
+    Runs the full scorecard for a prospective short option leg (STO):
+      • Greeks (Δ, Θ, vega, gamma) via Black-Scholes from the supplied
+        premium-implied IV.
+      • Theta hurdle test (§2): `daily_1sigma × 0.04` = hurdle/day.
+      • Monte Carlo terminal-price distribution (GBM, n_paths default 5000):
+        P(profit ≥ 50%), P(profit ≥ 80%), P(loss), P(assignment),
+        expected P&L, P&L stdev, CVaR (worst 5%).
+      • Risk-adjusted block: annualised return, annualised vol,
+        Sharpe-equivalent, capital efficiency.
+      • Verdict with §12 cutoffs: pass / conditional / fail.
+
+    All math runs server-side — Claude pastes inputs, the tool returns
+    the populated scorecard structure ready for the §16 output block.
+
+    Args:
+      symbol:          underlying ticker, e.g. "SPY"
+      strike:          option strike (per share)
+      expiry:          ISO "YYYY-MM-DD" expiry date
+      side:            "STO_PUT" or "STO_CALL" (v1 — BTC/ROLL scoring tbd)
+      premium:         current option mark per share — used to solve IV
+      spot:            current underlying spot (from FMP quote / IBKR snapshot)
+      hv30:            30-day realised vol (decimal, e.g. 0.17). Get via
+                       `compute_hv("SPY")` if you don't have a hot value.
+      risk_free_rate:  annual r (default 4.5%, ~1Y Treasury)
+      n_paths:         MC sample count (default 5000 per §12)
+      seed:            optional RNG seed for reproducible scorecards
+
+    Returns:
+      {trade, greeks, distribution, risk_adjusted, verdict,
+       capital_at_risk, asof_date, ...}
+    """
+    from tiger_api.greeks import (
+        bs_delta_theta, bs_gamma, bs_vega, implied_vol,
+    )
+    from tiger_api.montecarlo import (
+        mc_terminal_prices, short_option_pnl_distribution, pmcc_verdict,
+    )
+
+    # ── Input validation ────────────────────────────────────────────────
+    side_n = side.strip().upper().replace(" ", "_").replace("-", "_")
+    if side_n not in ("STO_PUT", "STO_CALL"):
+        return {
+            "error": "UNSUPPORTED_SIDE",
+            "message": (
+                f"side={side!r} not supported. v1 scorecard handles STO_PUT and "
+                "STO_CALL only. BTC/ROLL scorecards are tracked in BACKLOG."
+            ),
+        }
+    is_call = (side_n == "STO_CALL")
+    symbol_n = symbol.strip().upper()
+
+    asof = date.today()
+    expiry_d = _parse_tiger_expiry(expiry)
+    if expiry_d is None:
+        return {
+            "error": "BAD_EXPIRY",
+            "message": f"Could not parse expiry {expiry!r}. Use ISO YYYY-MM-DD.",
+        }
+    dte_days = (expiry_d - asof).days
+    if dte_days <= 0:
+        return {
+            "error": "EXPIRED",
+            "message": f"Expiry {expiry_d.isoformat()} is today or past; cannot score.",
+        }
+    t = dte_days / 365.0
+
+    if premium <= 0 or strike <= 0 or spot <= 0 or hv30 <= 0:
+        return {
+            "error": "INVALID_INPUTS",
+            "message": (
+                f"All of premium/strike/spot/hv30 must be > 0 "
+                f"(got premium={premium}, strike={strike}, spot={spot}, hv30={hv30})."
+            ),
+        }
+
+    # ── Greeks block — solve IV from premium, then BS Greeks ────────────
+    iv = implied_vol(
+        market_price=premium, spot=spot, strike=strike, t=t,
+        r=risk_free_rate, is_call=is_call, q=0.0,
+    )
+    if iv is None or iv <= 0:
+        return {
+            "error": "IV_SOLVE_FAILED",
+            "message": (
+                f"Could not solve IV from premium=${premium:.2f} (likely below "
+                "intrinsic or arbitrage). Re-quote the contract and retry."
+            ),
+        }
+
+    delta_long, theta_per_year_long = bs_delta_theta(
+        spot=spot, strike=strike, t=t, r=risk_free_rate, sigma=iv,
+        is_call=is_call, q=0.0,
+    )
+    vega_long = bs_vega(
+        spot=spot, strike=strike, t=t, r=risk_free_rate, sigma=iv, q=0.0,
+    )
+    gamma = bs_gamma(
+        spot=spot, strike=strike, t=t, r=risk_free_rate, sigma=iv, q=0.0,
+    )
+    # Short position: flip delta + theta + vega signs (gamma unchanged for
+    # display, magnitude only — short positions still gamma-positive
+    # exposure-wise on the underlying).
+    delta_short = -delta_long
+    theta_per_day_short = -theta_per_year_long / 365.0
+    vega_short = -vega_long
+
+    # ── §2 theta hurdle — `daily_1σ × 0.04` ─────────────────────────────
+    daily_1sigma_usd = strike * hv30 / math.sqrt(252)
+    theta_hurdle = daily_1sigma_usd * 0.04
+
+    # ── §12 Monte Carlo distribution ────────────────────────────────────
+    terminal_prices = mc_terminal_prices(
+        spot=spot, sigma=hv30, t=t, r=risk_free_rate,
+        n_paths=n_paths, seed=seed,
+    )
+    distribution = short_option_pnl_distribution(
+        terminal_prices=terminal_prices, strike=strike, premium=premium,
+        is_call=is_call,
+    )
+
+    # ── Risk-adjusted block ─────────────────────────────────────────────
+    # Capital at risk for a cash-secured / covered short is strike * 100.
+    # For PMCC short calls covered by a deep-ITM LEAPS this is conservative
+    # (true risk bounded by LEAPS strike) — flag in notes when relevant.
+    capital_at_risk = strike * 100.0
+    expected_pnl = distribution["expected_pnl"]
+    pnl_stdev = distribution["pnl_stdev"]
+
+    annualised_return = 0.0
+    annualised_vol = 0.0
+    if capital_at_risk > 0 and dte_days > 0:
+        annualised_return = (expected_pnl / capital_at_risk) * 365.0 / dte_days
+        # Convert per-trade stdev to annualised stdev via √(365/dte).
+        annualised_vol = (pnl_stdev / capital_at_risk) * math.sqrt(365.0 / dte_days)
+
+    verdict_block = pmcc_verdict(
+        distribution=distribution,
+        theta_per_day=theta_per_day_short,
+        theta_hurdle=theta_hurdle,
+        annualised_return=annualised_return,
+        annualised_vol=annualised_vol,
+    )
+
+    capital_efficiency = expected_pnl / capital_at_risk if capital_at_risk > 0 else 0.0
+
+    return {
+        "trade": {
+            "action": side_n,
+            "symbol": symbol_n,
+            "strike": strike,
+            "expiry": expiry_d.isoformat(),
+            "dte_days": dte_days,
+            "premium": _round(premium, 4),
+        },
+        "greeks": {
+            "delta": _round(delta_short, 4),
+            "theta_per_day": _round(theta_per_day_short, 4),
+            "theta_hurdle": _round(theta_hurdle, 4),
+            "theta_pass": verdict_block["theta_pass"],
+            "vega": _round(vega_short, 4),
+            "gamma": _round(gamma, 6),
+            "gamma_level": _gamma_level(gamma),
+            "iv_solved": _round(iv, 4),
+            "daily_1sigma_usd": _round(daily_1sigma_usd, 4),
+        },
+        "distribution": {
+            "n_paths": n_paths,
+            "hv30": hv30,
+            "r": risk_free_rate,
+            "p_profit_50": _round(distribution["p_profit_50"], 4),
+            "p_profit_80": _round(distribution["p_profit_80"], 4),
+            "p_loss": _round(distribution["p_loss"], 4),
+            "p_assignment": _round(distribution["p_assignment"], 4),
+            "expected_pnl": _round(distribution["expected_pnl"], 2),
+            "pnl_stdev": _round(distribution["pnl_stdev"], 2),
+            "cvar_5": _round(distribution["cvar_5"], 2),
+            "max_profit": _round(distribution["max_profit"], 2),
+        },
+        "risk_adjusted": {
+            "annualised_return": _round(annualised_return, 4),
+            "annualised_vol": _round(annualised_vol, 4),
+            "sharpe_equiv": verdict_block["sharpe_equiv"],
+            "capital_efficiency": _round(capital_efficiency, 6),
+        },
+        "verdict": verdict_block["verdict"],
+        "verdict_reasons": verdict_block["verdict_reasons"],
+        "capital_at_risk": _round(capital_at_risk, 2),
+        "asof_date": asof.isoformat(),
+        "notes": [
+            "MC = geometric Brownian motion, hv30 used as σ. Doctrine §12 "
+            "spec uses HV30 (or IV30 if available). Pass IV30 as hv30 when "
+            "you have it for a tighter distribution.",
+            "PMCC short calls covered by a deep-ITM LEAPS have true risk "
+            "bounded by the LEAPS strike — capital_at_risk reported here is "
+            "the strike×100 conservative ceiling.",
+        ],
     }
 
 
