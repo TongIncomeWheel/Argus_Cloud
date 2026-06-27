@@ -119,25 +119,81 @@ def read_data_table() -> list[dict]:
 # ── Date / number coercion ───────────────────────────────────────────────────
 
 
-def _parse_iso_date(value: Any) -> Optional[date]:
-    """Parse Date_open / Expiry_Date entries to date.
+def _epoch_to_date(value: Any) -> Optional[date]:
+    """Convert a Unix epoch (seconds OR milliseconds) to a date.
 
-    Sheets returns strings; people enter various formats. Try the common ones
-    in order, give up to None."""
+    Tiger's get_filled_orders returns trade_time / order_time as
+    milliseconds since epoch (13-digit ints like 1781110512345). The SDK
+    occasionally hands them through as the bare integer rather than a
+    datetime object, and stringifying then slicing the first 8 chars as
+    %Y%m%d produced the infamous 1781-11-05 bug.
+
+    Heuristic: anything with |n| >= 1e12 is milliseconds (1e12 seconds is
+    year 33,658 — never legitimate as seconds). Below that we treat as
+    seconds. Catches OSError/OverflowError on platforms with narrow
+    fromtimestamp ranges.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    if n == 0:
+        return None
+    seconds = n / 1000.0 if abs(n) >= 1_000_000_000_000 else float(n)
+    try:
+        return datetime.fromtimestamp(seconds).date()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _parse_iso_date(value: Any) -> Optional[date]:
+    """Parse Date_open / Expiry_Date entries (or trade_time / order_time
+    epoch timestamps) to a date.
+
+    Order of attempts:
+      1. None / empty            → None
+      2. datetime / date object  → unwrap directly
+      3. int / float             → epoch (ms or s)
+      4. all-digit string        → epoch (ms or s) — the Tiger SDK
+         sometimes hands back epoch ms as a string. Bypasses the
+         %Y%m%d slice so a 13-digit ms timestamp doesn't become 1781-11-05
+      5. ISO / regional formats  → strptime
+      6. Otherwise               → None
+    """
     if value is None or value == "":
         return None
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, (int, float)):
+        return _epoch_to_date(value)
     s = str(value).strip()
     if not s:
         return None
+    # Date-format attempts first — these are cheap and unambiguous for
+    # 8-digit YYYYMMDD ("20260620"), ISO ("2026-06-20"), regional ("20/06/2026").
+    # Only the bare-int epoch case (which is 10+ digits and would otherwise
+    # be mis-sliced) falls through to the epoch handler below.
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y", "%Y%m%d"):
+        # %Y%m%d is exactly 8 chars; the other regional formats are 10.
+        # Don't slice longer strings — those are epoch candidates, not dates.
+        slice_len = 8 if fmt == "%Y%m%d" else 10
+        if len(s) < slice_len:
+            continue
+        # YYYYMMDD specifically: refuse strings longer than 8 digits to
+        # avoid the 1781-11-05 bug (13-digit ms timestamp slicing into the
+        # first 8 chars and parsing as year 1781).
+        if fmt == "%Y%m%d" and len(s) > 8:
+            continue
         try:
-            return datetime.strptime(s[:10] if "-" in s or "/" in s else s[:8], fmt).date()
+            return datetime.strptime(s[:slice_len], fmt).date()
         except ValueError:
             continue
+    # Fall through: all-digit (possibly negative) string → epoch.
+    body = s[1:] if s.startswith("-") else s
+    if body.isdigit() and len(body) >= 10:
+        return _epoch_to_date(s)
     return None
 
 
