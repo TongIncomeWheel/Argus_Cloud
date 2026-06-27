@@ -1795,6 +1795,434 @@ def earning_power_test(
     }
 
 
+# ── Roll candidate engine (Phase E1, Priority 2) ─────────────────────────────
+
+
+def _select_candidate_expiries(
+    available_expiries: list[str],
+    current_expiry: date,
+    n: int = 2,
+) -> list[date]:
+    """Pick the next N expiries strictly AFTER the current short's expiry."""
+    out: list[date] = []
+    for raw in available_expiries:
+        d = _parse_tiger_expiry(raw)
+        if d is None or d <= current_expiry:
+            continue
+        out.append(d)
+    out.sort()
+    return out[:n]
+
+
+def _filter_strikes_around(target: float, chain_rows: list[dict],
+                            window: int = 5) -> list[dict]:
+    """Keep the window of strikes nearest to target — `window` on each side."""
+    rows_with_strike = []
+    for r in chain_rows:
+        try:
+            s = float(r.get("strike"))
+        except (TypeError, ValueError):
+            continue
+        rows_with_strike.append((s, r))
+    if not rows_with_strike:
+        return []
+    rows_with_strike.sort(key=lambda x: x[0])
+    below = [r for r in rows_with_strike if r[0] < target][-window:]
+    above = [r for r in rows_with_strike if r[0] >= target][:window]
+    keep = below + above
+    return [r[1] for r in keep]
+
+
+@mcp.tool()
+def get_roll_candidates(
+    symbol: str,
+    right: str,
+    strike: float,
+    expiry: str,
+    quantity: int,
+    pot: str = "core",
+    cost_basis: float | None = None,
+) -> dict:
+    """Forward-looking roll candidates for one open short option leg.
+
+    Returns:
+      • The current position's mark (from live Tiger positions)
+      • A structural anchor for the underlying (FMP daily bars, last 250d)
+      • A ranked list of candidate STO legs (2 forward expiries × ±5 strikes
+        around the structural target) with mid, extrinsic, net credit, Δ, Θ
+      • Distance fields so Claude can apply charter rules without recompute
+
+    Architecture: ALL data + structural analysis is server-side. Claude
+    reads the result and applies pot-specific charter rules (delta band,
+    cost basis check, yield gate). PM executes.
+
+    Args:
+      symbol:     ticker, e.g. "MARA"
+      right:      "PUT" or "CALL"
+      strike:     current position strike
+      expiry:     current position expiry, ISO "YYYY-MM-DD"
+      quantity:   negative int = short (e.g. -18)
+      pot:        "core" | "active" — informational; constraint logic in Claude
+      cost_basis: required for Core Pot calls; resistance anchor will be
+                  lifted above cost_basis when supplied
+
+    Returns:
+      current_position{}, structural_anchor{}, candidates[],
+      candidate_expiries_pulled[], strikes_filtered, asof_date, notes[]
+    """
+    from dataclasses import asdict
+    from tiger_api import roll_engine
+
+    asof = date.today()
+    notes: list[str] = []
+
+    symbol_n = symbol.strip().upper()
+    right_n = right.strip().upper()
+    if right_n not in ("PUT", "CALL"):
+        return {"error": "BAD_RIGHT", "message": f"right must be PUT or CALL, got {right!r}"}
+    current_expiry = _parse_tiger_expiry(expiry)
+    if current_expiry is None:
+        return {"error": "BAD_EXPIRY", "message": f"Could not parse expiry {expiry!r}"}
+
+    qty = int(quantity)
+    if qty == 0:
+        return {"error": "ZERO_QUANTITY", "message": "quantity must be non-zero"}
+
+    client = _get_client()
+
+    # 1. Pull the current position so we can show its live mark.
+    open_opts = [_position_to_dict(p) for p in client.get_option_positions()]
+    current_pos = None
+    for p in open_opts:
+        if ((p.get("symbol") or "").upper() == symbol_n
+                and (p.get("right") or "").upper() == right_n):
+            try:
+                if (abs(float(p.get("strike")) - float(strike)) < 0.01
+                        and _parse_tiger_expiry(p.get("expiry")) == current_expiry):
+                    current_pos = p
+                    break
+            except (TypeError, ValueError):
+                continue
+
+    if current_pos is None:
+        return {
+            "error": "POSITION_NOT_FOUND",
+            "message": (
+                f"No open {symbol_n} {right_n} {strike} exp {current_expiry.isoformat()} "
+                "in the book. Confirm symbol, right, strike, expiry from "
+                "get_option_positions() first."
+            ),
+        }
+
+    try:
+        current_mark = float(current_pos.get("market_price") or 0)
+    except (TypeError, ValueError):
+        current_mark = 0.0
+    btc_cost_at_mid = round(current_mark * 100.0 * abs(qty), 2)
+    dte_remaining = (current_expiry - asof).days
+
+    # 2. FMP bars + structural anchor + ATR.
+    try:
+        bars = roll_engine.fetch_fmp_bars(symbol_n, max_bars=250)
+    except roll_engine.FMPError as e:
+        return {
+            "error": "FMP_UNAVAILABLE",
+            "message": f"FMP bars unavailable: {e}. Structural anchor cannot be computed.",
+            "current_position": {
+                "symbol": symbol_n, "right": right_n, "strike": float(strike),
+                "expiry": current_expiry.isoformat(), "quantity": qty,
+                "current_mark": current_mark, "btc_cost_at_mid": btc_cost_at_mid,
+                "dte_remaining": dte_remaining,
+            },
+            "asof_date": asof.isoformat(),
+        }
+
+    spot = bars[-1].close if bars else 0.0
+    atr_14 = roll_engine.atr(bars, period=14)
+    if right_n == "PUT":
+        anchor = roll_engine.find_support(bars, spot, atr_14)
+    else:
+        anchor = roll_engine.find_resistance(bars, spot, atr_14, cost_basis=cost_basis)
+    anchor_d = asdict(anchor)
+    anchor_d["source"] = (
+        f"FMP daily bars {bars[0].date if bars else '?'} to "
+        f"{bars[-1].date if bars else '?'} — {anchor_d['source']}"
+    )
+    if anchor.anchor_type == "none":
+        notes.append(anchor.note or "No structural anchor — strike selection degraded.")
+
+    # 3. Candidate expiries (next two after current).
+    try:
+        expiries_payload = client.get_option_expirations([symbol_n]) or {}
+        avail_raw = expiries_payload.get(symbol_n, [])
+    except Exception as e:
+        return {
+            "error": "EXPIRATIONS_UNAVAILABLE",
+            "message": f"get_option_expirations failed: {e}",
+            "current_position": {
+                "symbol": symbol_n, "right": right_n, "strike": float(strike),
+                "expiry": current_expiry.isoformat(), "quantity": qty,
+                "current_mark": current_mark, "btc_cost_at_mid": btc_cost_at_mid,
+                "dte_remaining": dte_remaining,
+            },
+            "structural_anchor": anchor_d,
+            "asof_date": asof.isoformat(),
+        }
+    candidate_expiry_dates = _select_candidate_expiries(avail_raw, current_expiry, n=2)
+    if not candidate_expiry_dates:
+        return {
+            "error": "NO_FORWARD_EXPIRIES",
+            "message": (
+                f"No expiries after {current_expiry.isoformat()} found for {symbol_n}. "
+                "Tiger may not have listings yet."
+            ),
+            "current_position": {
+                "symbol": symbol_n, "right": right_n, "strike": float(strike),
+                "expiry": current_expiry.isoformat(), "quantity": qty,
+                "current_mark": current_mark, "btc_cost_at_mid": btc_cost_at_mid,
+                "dte_remaining": dte_remaining,
+            },
+            "structural_anchor": anchor_d,
+            "asof_date": asof.isoformat(),
+        }
+
+    target_strike = anchor.target_strike_price or float(strike)
+
+    # 4. Pull chain per candidate expiry, filter to ±5 strikes around target.
+    candidates: list[dict] = []
+    for exp_d in candidate_expiry_dates:
+        exp_iso = exp_d.isoformat()
+        try:
+            chain = client.get_option_chain(
+                symbol=symbol_n, expiry=exp_iso, include_greeks=True,
+            )
+        except Exception as e:
+            notes.append(f"Chain pull failed for {symbol_n} {exp_iso}: {e}")
+            continue
+
+        # Filter to RIGHT side only (PUTs or CALLs)
+        side_rows = [
+            r for r in chain
+            if (r.get("right") or "").upper() == right_n
+        ]
+        windowed = _filter_strikes_around(target_strike, side_rows, window=5)
+
+        for row in windowed:
+            try:
+                row_strike = float(row.get("strike"))
+                bid = float(row.get("bid") or 0)
+                ask = float(row.get("ask") or 0)
+            except (TypeError, ValueError):
+                continue
+            if bid <= 0 and ask <= 0:
+                continue
+            mid = (bid + ask) / 2.0 if bid > 0 and ask > 0 else max(bid, ask)
+            if mid <= 0:
+                continue
+
+            # Extrinsic = mid − intrinsic
+            if right_n == "PUT":
+                intrinsic = max(0.0, row_strike - spot)
+            else:
+                intrinsic = max(0.0, spot - row_strike)
+            extrinsic = round(mid - intrinsic, 4)
+            if extrinsic < 0.05:
+                continue  # discard worthless candidates per spec
+
+            delta_v = _to_float_or_none(row.get("delta"))
+            theta_v = _to_float_or_none(row.get("theta"))
+            iv_v = _to_float_or_none(row.get("implied_vol") or row.get("iv"))
+
+            math_block = roll_engine.roll_math(
+                btc_mid=current_mark, sto_mid=mid, qty=qty,
+            )
+
+            dte = (exp_d - asof).days
+            dist_spot = round((row_strike - spot) / spot * 100.0, 2) if spot > 0 else None
+            dist_anchor = (
+                round((row_strike - anchor.anchor_price) / anchor.anchor_price * 100.0, 2)
+                if anchor.anchor_price else None
+            )
+
+            candidates.append({
+                "expiry": exp_iso,
+                "dte": dte,
+                "strike": row_strike,
+                "right": right_n,
+                "bid": bid,
+                "ask": ask,
+                "mid": round(mid, 4),
+                "extrinsic": extrinsic,
+                "delta": delta_v,
+                "theta_per_day": theta_v,
+                "iv": iv_v,
+                "btc_cost_total": math_block["btc_cost_total"],
+                "sto_recv_total": math_block["sto_recv_total"],
+                "net_credit": math_block["net_credit"],
+                "net_credit_per_lot": math_block["net_credit_per_lot"],
+                "dist_from_spot_pct": dist_spot,
+                "dist_from_anchor_pct": dist_anchor,
+            })
+
+    candidates.sort(key=lambda r: r.get("net_credit") or 0.0, reverse=True)
+
+    return {
+        "current_position": {
+            "symbol": symbol_n,
+            "right": right_n,
+            "strike": float(strike),
+            "expiry": current_expiry.isoformat(),
+            "quantity": qty,
+            "current_mark": current_mark,
+            "btc_cost_at_mid": btc_cost_at_mid,
+            "dte_remaining": dte_remaining,
+            "pot": pot,
+        },
+        "structural_anchor": anchor_d,
+        "spot": round(spot, 4),
+        "candidates": candidates,
+        "candidate_expiries_pulled": [d.isoformat() for d in candidate_expiry_dates],
+        "strikes_filtered": (
+            f"±5 strikes around target ${target_strike:.2f}"
+            if anchor.target_strike_price is not None
+            else "±5 strikes around current strike (anchor degraded)"
+        ),
+        "asof_date": asof.isoformat(),
+        "notes": notes,
+    }
+
+
+# ── Stress test engine (Phase E1, Priority 3) ────────────────────────────────
+
+
+@mcp.tool()
+def run_stress_test() -> dict:
+    """Live-position stress test: Scenarios A / B / D / B+D.
+
+    Scenarios:
+      A  — Core stocks −15% (MARA + CRCL). No put assignment.
+      B  — Core stocks −30% + short-put assignment loss + call premium offset
+           (100% — calls go OTM and decay to zero).
+      D  — SPY −20% on PMCC LEAPS chassis. Short-call premium offset 50%
+           (conservative — calls don't fully expire worthless in a single shock).
+      BD — Combined B + D (worst credible case).
+
+    Inputs are pulled live — no parameters:
+      get_account_summary   → NAV
+      get_prime_assets      → excess liquidity, margin debit, maintain margin
+      get_stock_positions   → MARA + CRCL marks
+      get_option_positions  → short puts, short calls, LEAPS
+      compute_portfolio_greeks → LEAPS deltas (for D + BD)
+      compute_hv("SPY") then yfinance close for SPY spot
+
+    Zone classification:
+      > $60K  safe   |  $40–60K watch  |  $20–40K reduce
+      $0–20K critical |  ≤ $0 insolvent
+
+    Returns: {baseline, scenarios, current_zone, reduction_schedule,
+              pmcc_hard_stop, asof_date, notes[]}
+    """
+    from tiger_api import stress_engine
+
+    asof = date.today()
+    notes: list[str] = []
+    client = _get_client()
+
+    # ── Account state ──────────────────────────────────────────────────
+    assets = client.get_assets()
+    nav = float(assets.nav or 0)
+
+    pa = client.get_prime_assets()
+    pa_d = _safe_attrs(pa)
+    excess_liquidity = _to_float_or_none(pa_d.get("excess_liquidity")) or 0.0
+    margin_debit = _to_float_or_none(pa_d.get("initial_margin")) or 0.0
+    maintain_margin = _to_float_or_none(pa_d.get("maintain_margin")) or 0.0
+
+    # ── Positions ──────────────────────────────────────────────────────
+    stock_positions = [_position_to_dict(p) for p in client.get_stock_positions()]
+    option_positions = [_position_to_dict(p) for p in client.get_option_positions()]
+
+    # ── LEAPS deltas — borrow from compute_portfolio_greeks ────────────
+    leaps_greeks_by_key: dict[str, dict] = {}
+    try:
+        pg = compute_portfolio_greeks()
+        for row in pg.get("positions", []):
+            # Only long calls — LEAPS for the PMCC stress
+            if row.get("right") == "CALL" and (row.get("quantity") or 0) > 0:
+                key = (
+                    f"{(row.get('symbol') or '').upper()}|"
+                    f"{row.get('strike')}|{row.get('expiry')}|CALL"
+                )
+                leaps_greeks_by_key[key] = {"delta": row.get("delta")}
+    except Exception as e:
+        notes.append(
+            f"LEAPS Greeks pull failed: {e}. Scenario D / BD pmcc_loss falls back "
+            "to 0.80 delta default per doctrine."
+        )
+
+    classified = stress_engine.classify_positions(
+        stock_positions, option_positions, leaps_greeks_by_key,
+    )
+
+    # ── Core spot per ticker (for put-assignment math) ─────────────────
+    core_spots: dict[str, float] = {}
+    for p in stock_positions:
+        sym = (p.get("symbol") or "").upper()
+        try:
+            mp = float(p.get("market_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if mp > 0 and sym in stress_engine.CORE_TICKERS:
+            core_spots[sym] = mp
+
+    # ── SPY spot via yfinance (no Tiger spot endpoint) ─────────────────
+    spy_spot = 0.0
+    try:
+        import yfinance as yf
+        t = yf.Ticker("SPY")
+        fast = getattr(t, "fast_info", None)
+        spy_spot = float(
+            (fast and (fast.get("last_price") or fast.get("regular_market_price")))
+            or 0
+        )
+        if spy_spot <= 0:
+            spy_spot = float((t.info or {}).get("regularMarketPrice") or 0)
+    except Exception as e:
+        notes.append(f"yfinance SPY spot fetch failed: {e}. Scenario D defaults SPY=0.")
+
+    # ── Run scenarios ──────────────────────────────────────────────────
+    payload = stress_engine.run_scenarios(
+        nav=nav,
+        excess_liquidity=excess_liquidity,
+        margin_debit=margin_debit,
+        maintain_margin=maintain_margin,
+        classified=classified,
+        spy_spot=spy_spot,
+        core_spots=core_spots,
+    )
+
+    # ── MARA reduction schedule (fires in reduce/critical/insolvent zones) ──
+    current_zone = payload["current_zone"]
+    mara_shares = 0
+    mara_price = 0.0
+    for p in stock_positions:
+        if (p.get("symbol") or "").upper() == "MARA":
+            try:
+                mara_shares = int(float(p.get("quantity") or 0))
+                mara_price = float(p.get("market_price") or 0)
+            except (TypeError, ValueError):
+                continue
+    if current_zone in ("reduce", "critical", "insolvent"):
+        schedule = stress_engine.reduction_schedule_mara(mara_shares, mara_price)
+    else:
+        schedule = []
+
+    payload["reduction_schedule"] = schedule
+    payload["asof_date"] = asof.isoformat()
+    payload["notes"] = notes
+    return payload
+
+
 # ── Write tools (Phase 2c) — preview by default, confirm explicitly ──────────
 
 

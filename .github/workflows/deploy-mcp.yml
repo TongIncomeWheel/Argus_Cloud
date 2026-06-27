@@ -129,9 +129,11 @@ jobs:
           echo "✓ Static OAuth client secret ready"
 
       # Sync the Income Wheel spreadsheet ID + GSheets service account JSON
-      # from GitHub repo secrets into Secret Manager on every deploy.
-      # The same secrets are also used by quarterly-archive.yml — single
-      # source of truth, no separate provisioning step.
+      # + FMP API key from GitHub repo secrets into Secret Manager on every
+      # deploy. INCOME_WHEEL_SHEET_ID and GOOGLE_SHEETS_CREDENTIALS are also
+      # used by quarterly-archive.yml — single source of truth.
+      # FMP_API_KEY powers get_roll_candidates' structural anchor (FMP
+      # daily bars). Same idempotent pattern as the others.
       #
       # Behaviour:
       #   - If the GH secret is set → push its value to Secret Manager
@@ -143,11 +145,12 @@ jobs:
       # Either path leaves a valid :latest version, which Cloud Run binds
       # below. data_table.py treats NOT_SET / empty as unconfigured and
       # falls back to the Tiger 90-day fill window.
-      - name: Sync GSheets credentials and Sheet ID into Secret Manager
+      - name: Sync GSheets credentials, Sheet ID and FMP API key into Secret Manager
         env:
           PROJECT_NUMBER: "686093261470"
           GH_SHEET_ID: ${{ secrets.INCOME_WHEEL_SHEET_ID }}
           GH_GSHEET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          GH_FMP_KEY: ${{ secrets.FMP_API_KEY }}
         run: |
           set +e
           RUN_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
@@ -220,7 +223,27 @@ jobs:
               push_secret_version "$CREDS_SECRET" "NOT_SET"
             fi
           fi
-          echo "✓ Sheet ID + GSheet credentials provisioned"
+
+          # ── FMP_API_KEY (for get_roll_candidates FMP daily bars) ─────
+          FMP_SECRET="mcp-fmp-api-key"
+          if [ -n "$GH_FMP_KEY" ]; then
+            echo "→ syncing FMP_API_KEY GH secret → $FMP_SECRET"
+            push_secret_version "$FMP_SECRET" "$GH_FMP_KEY"
+            echo "  ✓ FMP API key synced from GH secret"
+          else
+            echo "::warning::FMP_API_KEY GH secret not set — "\
+              "get_roll_candidates will return FMP_UNAVAILABLE until you set it."
+            if gcloud secrets describe "$FMP_SECRET" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+              if ! gcloud secrets versions list "$FMP_SECRET" --project "$GCP_PROJECT" --limit 1 --format='value(name)' | grep -q .; then
+                push_secret_version "$FMP_SECRET" "NOT_SET"
+              else
+                echo "  → existing FMP secret preserved (set previously)"
+              fi
+            else
+              push_secret_version "$FMP_SECRET" "NOT_SET"
+            fi
+          fi
+          echo "✓ Sheet ID + GSheet credentials + FMP key provisioned"
 
       # gcloud run deploy --source . wants the Dockerfile at the source
       # root, not nested under mcp_servers/tiger/deploy/. Mirror it for
@@ -246,7 +269,7 @@ jobs:
             --timeout 3600 \
             --no-cpu-throttling \
             --set-env-vars MCP_TRANSPORT=streamable-http,MCP_HOST=0.0.0.0,TIGER_LICENSE=TBSG,TIGER_ENV=PROD,MCP_BASE_URL=${SERVICE_URL},MCP_OAUTH_STORAGE=firestore,GCP_PROJECT=${GCP_PROJECT},MCP_OAUTH_CLIENT_ID=argus-tiger-mcp-claude \
-            --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest,MCP_OAUTH_CLIENT_SECRET=mcp-oauth-client-secret:latest,MCP_INCOME_WHEEL_SHEET_ID=mcp-income-wheel-sheet-id:latest,MCP_GSHEET_CREDENTIALS_JSON=mcp-gsheet-credentials-json:latest \
+            --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest,MCP_OAUTH_CLIENT_SECRET=mcp-oauth-client-secret:latest,MCP_INCOME_WHEEL_SHEET_ID=mcp-income-wheel-sheet-id:latest,MCP_GSHEET_CREDENTIALS_JSON=mcp-gsheet-credentials-json:latest,MCP_FMP_API_KEY=mcp-fmp-api-key:latest \
             --quiet
 
       - name: Post-deploy sanity checks

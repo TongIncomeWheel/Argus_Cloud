@@ -95,7 +95,9 @@ treat that as a charter bug and flag it before running.
 | **PMCC §12 scorecard for one candidate** | **`score_pmcc_candidate(symbol, strike, expiry, side, premium, spot, hv30, ...)`** ← new |
 | **HV30 / HV-N realised vol for an underlying** | **`compute_hv(symbol, lookback_days=30)`** |
 | **Per-ticker wheel state (CSP_OPEN / ASSIGNED / CC_OPEN / LEAP_ONLY)** | **`get_wheel_state(symbols=None, pot="all")`** ← new |
-| **PMCC §5.1 Earning Power Test — ROLL vs HOLD** | **`earning_power_test(current_theta_per_day, current_delta, new_theta_per_day, new_delta, roll_debit, new_dte_days, ...)`** ← new |
+| **PMCC §5.1 Earning Power Test — ROLL vs HOLD** | **`earning_power_test(current_theta_per_day, current_delta, new_theta_per_day, new_delta, roll_debit, new_dte_days, ...)`** |
+| **Forward-looking roll candidates with structural anchor** | **`get_roll_candidates(symbol, right, strike, expiry, quantity, pot, cost_basis)`** ← new |
+| **Margin Health stress test — A / B / D / B+D scenarios** | **`run_stress_test()`** ← new |
 | What expiries are available for XYZ? | `get_option_expirations([symbols])` |
 | Full chain for one expiry | `get_option_chain(symbol, expiry)` |
 | Quote on specific contracts I already know | `get_option_briefs([contracts])` |
@@ -330,6 +332,73 @@ Contract dict shape used by `briefs`/`greeks`/`bars`/`depth`/`ticks`:
   `score_pmcc_candidate` or chain, then feed both with the proposed
   net debit/credit.
 
+- **`get_roll_candidates(symbol, right, strike, expiry, quantity, pot="core",
+    cost_basis=None)`** →
+  forward-looking roll candidate generator. For the named open short
+  option leg, returns the current mark + a structural anchor on the
+  underlying + a ranked candidate list (best net-credit first).
+
+  Server-side pipeline:
+    1. Verify the position is in the live book; capture `current_mark`.
+    2. Pull FMP daily bars (last 250d). Compute ATR-14 and the structural
+       anchor — swing high/low → round number → MA confluence →
+       consolidation / distribution zone. Confidence rated `high` /
+       `medium` / `low` / `none`.
+    3. Apply ATR-derived buffer (0.3% / 0.5% / 0.7%) to produce a target
+       strike price.
+    4. Pick the next 2 expiries after the current short. Pull each chain
+       (Tiger with Greeks). Filter to ±5 strikes around the target.
+    5. Compute mid, extrinsic, net credit, distances per candidate.
+    6. Return ranked list — Claude applies pot-specific charter rules
+       (delta band, cost basis, yield gate). Server does not pick a
+       winner.
+
+  Args:
+    - `right`: `"PUT"` (selling support) or `"CALL"` (selling resistance)
+    - `quantity`: signed int (e.g. `-18` for short 18 contracts)
+    - `pot`: `"core"` | `"active"` — informational; constraints applied by
+      Claude from the charter
+    - `cost_basis`: required for Core Pot calls — resistance anchor will be
+      lifted above cost_basis when supplied
+
+  Returns: `current_position{}`, `structural_anchor{anchor_price,
+  anchor_type, anchor_confidence, atr_14, buffer_pct, target_strike_price,
+  source, note}`, `spot`, `candidates[]`, `candidate_expiries_pulled[]`,
+  `strikes_filtered`, `asof_date`, `notes[]`.
+
+  Error envelopes (does not silently degrade):
+    - `FMP_UNAVAILABLE` — FMP key unset, network failure, or invalid response.
+    - `POSITION_NOT_FOUND` — the named leg isn't in the live book.
+    - `EXPIRATIONS_UNAVAILABLE` — Tiger get_option_expirations failed.
+    - `NO_FORWARD_EXPIRIES` — no expiries listed after `expiry`.
+
+- **`run_stress_test()`** →
+  the Margin Health Block in one call. No parameters — pulls live NAV +
+  excess liquidity + positions + LEAPS deltas (via
+  `compute_portfolio_greeks`) + SPY spot (yfinance) and runs four
+  scenarios:
+    - **A** — Core stocks (MARA + CRCL) −15%. No put assignment.
+    - **B** — Core stocks −30% + short-put assignment loss + short-call
+      premium offset (100% — calls expire worthless).
+    - **D** — SPY −20% on PMCC LEAPS. Short-call offset 50% (conservative
+      — single shock doesn't fully decay covered calls).
+    - **BD** — Combined B + D.
+
+  Zone bands keyed on `excess_liquidity_after_shock`:
+    `> $60K safe` | `$40–60K watch` | `$20–40K reduce` | `$0–20K critical`
+    | `≤ $0 insolvent`.
+
+  Returns `{baseline, scenarios{A,B,D,BD}, current_zone,
+  reduction_schedule, pmcc_hard_stop{spy_close_below, status, spy_spot},
+  asof_date, notes[]}`. `reduction_schedule` populates only when current
+  zone ∈ {reduce, critical, insolvent}; targets MARA in three steps
+  toward floors {13000, 10000, 8000} with margin-relief estimates.
+
+  **Use this when:** the user runs the `/margin` command, asks "are we
+  safe", asks "what happens if SPY drops 20%", or starts the morning
+  Margin Health Block. Quote the relevant scenario rows verbatim — that
+  IS the doctrine output.
+
 - **`score_pmcc_candidate(symbol, strike, expiry, side, premium, spot,
     hv30, risk_free_rate=0.045, n_paths=5000, seed=None)`** →
   the **PMCC Master Doctrine v3 §12 Trade Evaluation Scorecard**.
@@ -416,8 +485,6 @@ it via a "Phase E1 follow-up". Do not try to recompute them in chat.
 | PMCC engine (regime, doctrine, scorecard) | `pmcc_engine/` | Python only |
 | Forecast income (theta carry over horizon) | (designed, not built) | Not implemented |
 | §12 BTC / ROLL scorecard variants | (doctrine only) | `score_pmcc_candidate` is STO-only in v1 |
-| Roll candidate finder (forward-looking) | `tiger_api/rolls.py` | Currently only analyses HISTORIC rolls; forward-looking candidate finder tracked as Priority 2 |
-| Stress test (B / D / B+D scenarios) | `tiger_api/stress.py` | Priority 3 — not yet wired |
 | Win rate by setup bucket | `tiger_api/win_rate.py` | Priority 6 — not yet wired |
 | IV rank / percentile scanner | `tiger_api/iv_scanner.py` | Priority 7 — not yet wired |
 
@@ -426,10 +493,11 @@ When the user asks one of these:
   Phase E1 follow-up so you can call it from chat? Until then I'd have
   to load positions into context and run BS by hand — slow and lossy."
 - The roadmap order is in `BACKLOG.md` (Phase E1). Shipped so far:
-  `compute_portfolio_greeks` (2026-06-25), `get_position_roc` (2026-06-27),
-  `score_pmcc_candidate` + `compute_hv` + `get_wheel_state` +
-  `earning_power_test` (2026-06-27). Next priorities: `get_roll_candidates`,
-  stress test, BTC/ROLL scorecard variants, win rate, IV rank.
+  `compute_portfolio_greeks` (2026-06-25); `get_position_roc`,
+  `score_pmcc_candidate`, `compute_hv`, `get_wheel_state`,
+  `earning_power_test`, `get_roll_candidates`, `run_stress_test`
+  (2026-06-27). Next priorities: BTC/ROLL scorecard variants, win rate,
+  IV rank.
 
 ---
 
