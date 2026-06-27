@@ -255,6 +255,16 @@ jobs:
       - name: Deploy to Cloud Run
         id: deploy
         run: |
+          # Cost-tuned deploy:
+          #   --min-instances=0      → scale to zero when idle (no idle CPU/memory bill).
+          #   no --no-cpu-throttling → request-based billing (CPU charged only during request handling).
+          # Trade-off: first call after long idle has a 3–5s cold start while the
+          # container reloads. Streamable-HTTP transport tolerates this — each
+          # tool call is its own request; there's no persistent session to drop.
+          # OAuth state survives in Firestore so claude.ai never has to re-auth.
+          # If the cold-start ever becomes a real UX issue, bump min-instances
+          # back to 1 (instance stays alive, CPU still throttled when idle —
+          # roughly $3–5/month instead of $70).
           gcloud run deploy "$SERVICE" \
             --source . \
             --region "$GCP_REGION" \
@@ -263,11 +273,10 @@ jobs:
             --port 8080 \
             --memory 512Mi \
             --cpu 1 \
-            --min-instances 1 \
+            --min-instances 0 \
             --max-instances 3 \
             --concurrency 50 \
             --timeout 3600 \
-            --no-cpu-throttling \
             --set-env-vars MCP_TRANSPORT=streamable-http,MCP_HOST=0.0.0.0,TIGER_LICENSE=TBSG,TIGER_ENV=PROD,MCP_BASE_URL=${SERVICE_URL},MCP_OAUTH_STORAGE=firestore,GCP_PROJECT=${GCP_PROJECT},MCP_OAUTH_CLIENT_ID=argus-tiger-mcp-claude \
             --set-secrets TIGER_PRIVATE_KEY_PK8=tiger-private-key-pk8:latest,TIGER_ID=tiger-id:latest,TIGER_ACCOUNT=tiger-account:latest,MCP_BEARER_TOKEN=mcp-bearer-token:latest,MCP_OAUTH_OWNER_PASSWORD=mcp-oauth-owner-password:latest,MCP_OAUTH_CLIENT_SECRET=mcp-oauth-client-secret:latest,MCP_INCOME_WHEEL_SHEET_ID=mcp-income-wheel-sheet-id:latest,MCP_GSHEET_CREDENTIALS_JSON=mcp-gsheet-credentials-json:latest,MCP_FMP_API_KEY=mcp-fmp-api-key:latest \
             --quiet
