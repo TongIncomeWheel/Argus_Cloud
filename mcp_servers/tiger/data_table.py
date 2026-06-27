@@ -57,12 +57,20 @@ def get_pot(symbol: str) -> str:
 
 def _sheet_id() -> Optional[str]:
     """Pick up the Income Wheel sheet id from env. Returns None when unset
-    so callers can fall through to the Tiger MCP fallback path."""
-    return (
+    so callers can fall through to the Tiger MCP fallback path.
+
+    Sentinel "NOT_SET" is also treated as unset — the deploy workflow
+    seeds the Secret Manager entry with this string on first run so the
+    Cloud Run revision can boot before the operator pastes the real id.
+    """
+    raw = (
         os.environ.get("MCP_INCOME_WHEEL_SHEET_ID")
         or os.environ.get("INCOME_WHEEL_SHEET_ID")
-        or None
-    )
+        or ""
+    ).strip()
+    if not raw or raw.upper() == "NOT_SET":
+        return None
+    return raw
 
 
 def _open_sheet(sheet_id: str):
