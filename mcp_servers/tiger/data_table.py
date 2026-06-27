@@ -4,23 +4,26 @@ Used by get_position_roc to read the full unbounded fill history from the
 'Data Table' tab of the Income Wheel sheet. We do NOT import the
 top-level gsheet_handler.py module because it pulls in streamlit,
 local-filesystem backup paths, and a logging setup that fights with
-Cloud Run's stdout. Instead this module talks to gspread directly and
-uses Application Default Credentials (the Cloud Run runtime service
-account), avoiding the need to mount a credentials JSON.
+Cloud Run's stdout. Instead this module talks to gspread directly.
 
-Setup outside the code (manual, one-time per project):
-  1. Enable the Google Sheets API + Drive API on the GCP project.
-  2. Open the Income Wheel sheet in Google Drive and share it with the
-     Cloud Run runtime SA — typically
-     <PROJECT_NUMBER>-compute@developer.gserviceaccount.com — as Viewer.
-  3. Set the env var MCP_INCOME_WHEEL_SHEET_ID (or INCOME_WHEEL_SHEET_ID)
-     on the Cloud Run service to the spreadsheet id.
+Auth path (preferred → fallback):
+  1. **Service-account JSON in env** — `MCP_GSHEET_CREDENTIALS_JSON`
+     contains the same JSON the Streamlit Argus deploy uses for
+     `st.secrets["gsheet_credentials"]`. The deploy workflow syncs the
+     `GOOGLE_SHEETS_CREDENTIALS` GitHub repo secret into Secret Manager
+     on every push; Cloud Run binds it as this env var. Zero manual
+     setup as long as the GH secret is set.
+  2. **Application Default Credentials** — falls back to the Cloud Run
+     runtime SA if the JSON env var is missing or unparseable. Requires
+     manually sharing the sheet with the runtime SA email as Viewer.
+     Only matters when the GH secret isn't set.
 
-If the sheet is not configured or unreachable, callers fall through to
-the Tiger MCP fallback path (get_filled_orders, 90-day window).
+If neither path is configured or the sheet is unreachable, callers fall
+through to the Tiger MCP fallback (get_filled_orders, 90-day window).
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import date, datetime
@@ -73,22 +76,44 @@ def _sheet_id() -> Optional[str]:
     return raw
 
 
-def _open_sheet(sheet_id: str):
-    """Open the spreadsheet via Application Default Credentials.
+_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
-    Raises a regular exception on failure — caller decides whether to fall
-    back to Tiger MCP. We do NOT swallow errors silently; the failure mode
-    is reported in the tool's `entry_source` and `notes` so the operator
-    sees it.
+
+def _open_sheet(sheet_id: str):
+    """Open the spreadsheet using whichever auth path is configured.
+
+    Preferred: read the SA JSON from MCP_GSHEET_CREDENTIALS_JSON env var
+    (synced from the GOOGLE_SHEETS_CREDENTIALS GitHub secret on every
+    deploy). Same credentials the Streamlit Argus app uses.
+
+    Fallback: Application Default Credentials via the Cloud Run runtime
+    SA. Only kicks in when the env var is missing/unparseable; logs the
+    reason at WARNING level so the operator can see why.
+
+    Raises a regular exception on auth failure — caller decides whether
+    to fall back to Tiger MCP.
     """
     import gspread
-    import google.auth
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ]
-    creds, project = google.auth.default(scopes=scopes)
+    creds_json_str = os.environ.get("MCP_GSHEET_CREDENTIALS_JSON", "").strip()
+    if creds_json_str and creds_json_str.upper() != "NOT_SET":
+        try:
+            creds_info = json.loads(creds_json_str)
+            gc = gspread.service_account_from_dict(creds_info)
+            return gc.open_by_key(sheet_id)
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning(
+                "MCP_GSHEET_CREDENTIALS_JSON is set but failed to parse (%s). "
+                "Falling back to Application Default Credentials.", e,
+            )
+
+    # ADC fallback — Cloud Run runtime SA. Only works if the operator
+    # has shared the sheet with <project-number>-compute@developer.gserviceaccount.com.
+    import google.auth
+    creds, _ = google.auth.default(scopes=_SCOPES)
     gc = gspread.authorize(creds)
     return gc.open_by_key(sheet_id)
 
